@@ -1,0 +1,21 @@
+# Additions to the existing cloudflared config on VM 129 (or wherever
+# the jarvis.peermarket.eu tunnel is hosted).
+# Existing config already serves jarvis.peermarket.eu → some local service.
+# These entries must be ADDED to that file (typically /etc/cloudflared/config.yml)
+# under the existing 'ingress:' list, BEFORE any catch-all entry.
+#
+# Phase 0 routes:
+
+  - hostname: jarvis.peermarket.eu
+    path: ^/agent/healthz$
+    service: http://127.0.0.1:8090
+
+# After editing the config:
+#   systemctl restart cloudflared
+#
+# Verification from your laptop:
+#   curl https://jarvis.peermarket.eu/agent/healthz
+#   → {"status":"ok","service":"slack-bridge"}
+#
+# Later phases will add /agent/dashboard, /agent/slack/* (if we ever switch
+# off socket mode), and admin routes.
