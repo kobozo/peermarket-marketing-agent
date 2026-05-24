@@ -11,6 +11,7 @@ from peermarket_agent.config import get_settings
 from peermarket_agent.db.engine import get_engine
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
+from peermarket_agent.mcp_servers.peermarket_readonly import PeermarketReadonly
 
 log = structlog.get_logger(__name__)
 
@@ -24,11 +25,6 @@ async def _sleep_until_next_hour() -> None:
 
 
 async def _run() -> None:
-    # Lazy import: PeermarketReadonly is delivered in T8. Keeping it inside
-    # _run() means pytest collection of this module doesn't fail before T8
-    # lands.
-    from peermarket_agent.mcp_servers.peermarket_readonly import PeermarketReadonly
-
     settings = get_settings()
     engine = get_engine()
     await run_migrations(engine)
