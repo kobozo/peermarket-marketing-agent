@@ -28,7 +28,7 @@ jobs:
             /usr/local/bin/uv sync --all-extras --frozen || /usr/local/bin/uv sync --all-extras
           '
 
-      - name: Write secrets.env from GitHub Secrets
+      - name: Write secrets.env + PEM file from GitHub Secrets
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -37,7 +37,7 @@ jobs:
           AGENT_DB_URL: ${{ secrets.AGENT_DB_URL }}
           PEERMARKET_PROD_DB_READONLY_URL: ${{ secrets.PEERMARKET_PROD_DB_READONLY_URL }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
-          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          GITHUB_APP_PRIVATE_KEY_BODY: ${{ secrets.GH_APP_PRIVATE_KEY }}
           GITHUB_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
           RECRAFT_API_KEY: ${{ secrets.RECRAFT_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -46,6 +46,12 @@ jobs:
           BACKBLAZE_B2_BUCKET: ${{ secrets.BACKBLAZE_B2_BUCKET }}
           BACKBLAZE_B2_ENDPOINT: ${{ secrets.BACKBLAZE_B2_ENDPOINT }}
         run: |
+          # Write PEM to its own file (systemd can't handle multi-line env values)
+          printf '%s' "$GITHUB_APP_PRIVATE_KEY_BODY" | sudo tee /etc/peermarket-agent/github-app.pem >/dev/null
+          sudo chown root:peermarket-agent /etc/peermarket-agent/github-app.pem
+          sudo chmod 0640 /etc/peermarket-agent/github-app.pem
+
+          # secrets.env contains only single-line values (systemd-compatible)
           sudo tee /etc/peermarket-agent/secrets.env >/dev/null <<EOF
           ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
           SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN
@@ -54,7 +60,7 @@ jobs:
           AGENT_DB_URL=$AGENT_DB_URL
           PEERMARKET_PROD_DB_READONLY_URL=$PEERMARKET_PROD_DB_READONLY_URL
           GITHUB_APP_ID=$GITHUB_APP_ID
-          GITHUB_APP_PRIVATE_KEY="$GITHUB_APP_PRIVATE_KEY"
+          GITHUB_APP_PRIVATE_KEY=/etc/peermarket-agent/github-app.pem
           GITHUB_APP_INSTALLATION_ID=$GITHUB_APP_INSTALLATION_ID
           RECRAFT_API_KEY=$RECRAFT_API_KEY
           RESEND_API_KEY=$RESEND_API_KEY
