@@ -4,6 +4,7 @@ Constrained to a fixed aggregate query — never SELECTs PII columns.
 Returns a plain dict for the hourly loop. This will be wrapped in a
 proper MCP stdio server in Phase 1.
 """
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 

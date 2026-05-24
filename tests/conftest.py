@@ -1,4 +1,5 @@
 """Shared pytest fixtures and env scrubbing."""
+
 import os
 
 import pytest
@@ -14,7 +15,17 @@ def _clear_env(monkeypatch):
     for var in list(os.environ):
         if var in _PRESERVE:
             continue
-        if var.startswith(("ANTHROPIC_", "SLACK_", "AGENT_DB_", "GITHUB_APP_",
-                          "PEERMARKET_PROD_", "RECRAFT_", "RESEND_", "BACKBLAZE_")):
+        if var.startswith(
+            (
+                "ANTHROPIC_",
+                "SLACK_",
+                "AGENT_DB_",
+                "GITHUB_APP_",
+                "PEERMARKET_PROD_",
+                "RECRAFT_",
+                "RESEND_",
+                "BACKBLAZE_",
+            )
+        ):
             monkeypatch.delenv(var, raising=False)
     yield

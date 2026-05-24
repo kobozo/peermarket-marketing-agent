@@ -1,4 +1,5 @@
 """Loop A — hourly pulse: heartbeat + peermarket KPI snapshot."""
+
 from datetime import UTC, datetime
 
 import structlog

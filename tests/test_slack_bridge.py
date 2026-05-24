@@ -1,4 +1,5 @@
 """Slack bridge handler tests — no real Slack."""
+
 from unittest.mock import AsyncMock
 
 import pytest
@@ -36,5 +37,6 @@ def test_build_app_returns_async_app(monkeypatch):
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "sig")
     from slack_bolt.async_app import AsyncApp
+
     app = build_app(slack_bot_token="xoxb-test")
     assert isinstance(app, AsyncApp)

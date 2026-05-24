@@ -1,4 +1,5 @@
 """Env-driven configuration for the marketing agent."""
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict

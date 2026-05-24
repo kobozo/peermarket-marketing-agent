@@ -1,4 +1,5 @@
 """Idempotent seed data. Applied on every service start, after migrations."""
+
 from pathlib import Path
 
 import yaml
@@ -40,11 +41,13 @@ async def seed(engine: AsyncEngine) -> None:
                 ),
                 {"n": at["name"], "r": at["risk_tier"], "d": at["default_autonomy"]},
             )
-        await conn.execute(text(
-            "INSERT INTO trust_scores (action_type_id, current_mode) "
-            "SELECT id, default_autonomy FROM action_types "
-            "ON CONFLICT (action_type_id) DO NOTHING"
-        ))
+        await conn.execute(
+            text(
+                "INSERT INTO trust_scores (action_type_id, current_mode) "
+                "SELECT id, default_autonomy FROM action_types "
+                "ON CONFLICT (action_type_id) DO NOTHING"
+            )
+        )
         await conn.execute(
             text(
                 "INSERT INTO brand_voice (id, voice_rules_md) VALUES (1, :v) "

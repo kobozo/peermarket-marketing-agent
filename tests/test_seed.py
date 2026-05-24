@@ -1,4 +1,5 @@
 """Seed data tests."""
+
 import os
 
 import pytest
@@ -31,11 +32,13 @@ async def test_seed_inserts_action_types(engine):
 async def test_seed_creates_trust_scores_for_each_action_type(engine):
     await seed(engine)
     async with engine.connect() as conn:
-        result = await conn.execute(text(
-            "SELECT count(*) FROM action_types a "
-            "LEFT JOIN trust_scores t ON t.action_type_id = a.id "
-            "WHERE t.action_type_id IS NULL"
-        ))
+        result = await conn.execute(
+            text(
+                "SELECT count(*) FROM action_types a "
+                "LEFT JOIN trust_scores t ON t.action_type_id = a.id "
+                "WHERE t.action_type_id IS NULL"
+            )
+        )
         assert result.scalar() == 0  # every action_type has a row
 
 
@@ -43,9 +46,9 @@ async def test_seed_is_idempotent(engine):
     await seed(engine)
     await seed(engine)
     async with engine.connect() as conn:
-        result = await conn.execute(text(
-            "SELECT count(*) FROM action_types WHERE name='tiktok_post_organic'"
-        ))
+        result = await conn.execute(
+            text("SELECT count(*) FROM action_types WHERE name='tiktok_post_organic'")
+        )
         assert result.scalar() == 1
 
 

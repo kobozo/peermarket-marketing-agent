@@ -1,4 +1,5 @@
 """Tests for env-driven configuration."""
+
 import pytest
 from pydantic import ValidationError
 
@@ -7,9 +8,14 @@ from peermarket_agent.config import Settings, get_settings
 
 def test_settings_required_fields_missing_raises(monkeypatch):
     for var in [
-        "ANTHROPIC_API_KEY", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
-        "AGENT_DB_URL", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY",
-        "GITHUB_APP_INSTALLATION_ID", "PEERMARKET_PROD_DB_READONLY_URL",
+        "ANTHROPIC_API_KEY",
+        "SLACK_BOT_TOKEN",
+        "SLACK_APP_TOKEN",
+        "AGENT_DB_URL",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY",
+        "GITHUB_APP_INSTALLATION_ID",
+        "PEERMARKET_PROD_DB_READONLY_URL",
     ]:
         monkeypatch.delenv(var, raising=False)
     get_settings.cache_clear()
@@ -24,7 +30,10 @@ def test_settings_loaded_from_env(monkeypatch):
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "sig-test")
     monkeypatch.setenv("AGENT_DB_URL", "postgresql+asyncpg://x:y@localhost/z")
     monkeypatch.setenv("GITHUB_APP_ID", "12345")
-    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----")
+    monkeypatch.setenv(
+        "GITHUB_APP_PRIVATE_KEY",
+        "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
+    )
     monkeypatch.setenv("GITHUB_APP_INSTALLATION_ID", "67890")
     monkeypatch.setenv("PEERMARKET_PROD_DB_READONLY_URL", "postgresql+asyncpg://r:o@host/peer")
     monkeypatch.setenv("RECRAFT_API_KEY", "rk-test")

@@ -4,6 +4,7 @@ Pattern matches kobozo/secondhand: a list of SQL strings, each safe to
 re-run. No state table is maintained — every statement uses IF NOT EXISTS
 or its equivalent.
 """
+
 import asyncio
 
 import click
@@ -16,12 +17,10 @@ log = structlog.get_logger(__name__)
 
 _STEPS: list[str] = [
     "CREATE EXTENSION IF NOT EXISTS vector",
-
     """CREATE TABLE IF NOT EXISTS schema_version (
         id INT PRIMARY KEY DEFAULT 1,
         applied_at TIMESTAMPTZ DEFAULT NOW()
     )""",
-
     """CREATE TABLE IF NOT EXISTS brand_voice (
         id INT PRIMARY KEY DEFAULT 1,
         voice_rules_md TEXT NOT NULL DEFAULT '',
@@ -30,14 +29,12 @@ _STEPS: list[str] = [
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (id = 1)
     )""",
-
     """CREATE TABLE IF NOT EXISTS action_types (
         id SERIAL PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
         risk_tier TEXT NOT NULL CHECK (risk_tier IN ('low','mid','high')),
         default_autonomy TEXT NOT NULL CHECK (default_autonomy IN ('propose','auto-veto','auto-digest'))
     )""",
-
     """CREATE TABLE IF NOT EXISTS trust_scores (
         action_type_id INT PRIMARY KEY REFERENCES action_types(id),
         window_30d_approval_rate NUMERIC(5,2) NOT NULL DEFAULT 0.0,
@@ -46,7 +43,6 @@ _STEPS: list[str] = [
         current_mode TEXT NOT NULL DEFAULT 'propose'
             CHECK (current_mode IN ('propose','auto-veto','auto-digest'))
     )""",
-
     """CREATE TABLE IF NOT EXISTS drafts (
         id BIGSERIAL PRIMARY KEY,
         action_type_id INT NOT NULL REFERENCES action_types(id),
@@ -63,7 +59,6 @@ _STEPS: list[str] = [
         decided_at TIMESTAMPTZ,
         decided_by TEXT
     )""",
-
     """CREATE TABLE IF NOT EXISTS publications (
         id BIGSERIAL PRIMARY KEY,
         draft_id BIGINT REFERENCES drafts(id),
@@ -72,7 +67,6 @@ _STEPS: list[str] = [
         published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         performance JSONB NOT NULL DEFAULT '{}'
     )""",
-
     """CREATE TABLE IF NOT EXISTS budget_ledger (
         id BIGSERIAL PRIMARY KEY,
         ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -82,7 +76,6 @@ _STEPS: list[str] = [
         reason TEXT NOT NULL DEFAULT '',
         links_to JSONB NOT NULL DEFAULT '{}'
     )""",
-
     """CREATE TABLE IF NOT EXISTS kpis_hourly (
         ts TIMESTAMPTZ NOT NULL,
         source TEXT NOT NULL,
@@ -91,7 +84,6 @@ _STEPS: list[str] = [
         dims JSONB NOT NULL DEFAULT '{}',
         PRIMARY KEY (ts, source, metric_name)
     )""",
-
     """CREATE TABLE IF NOT EXISTS slack_actions (
         id BIGSERIAL PRIMARY KEY,
         slack_ts TEXT,
@@ -103,7 +95,6 @@ _STEPS: list[str] = [
         decided_at TIMESTAMPTZ,
         decided_by_emoji TEXT
     )""",
-
     """CREATE TABLE IF NOT EXISTS strategy_memos (
         id BIGSERIAL PRIMARY KEY,
         week_start_date DATE NOT NULL UNIQUE,
@@ -112,7 +103,6 @@ _STEPS: list[str] = [
         approved_in_thread BOOLEAN NOT NULL DEFAULT FALSE,
         human_response_md TEXT NOT NULL DEFAULT ''
     )""",
-
     """CREATE TABLE IF NOT EXISTS creatives_archive (
         id BIGSERIAL PRIMARY KEY,
         publication_id BIGINT REFERENCES publications(id),
@@ -123,7 +113,6 @@ _STEPS: list[str] = [
         embedding vector(1536),
         performance_summary JSONB NOT NULL DEFAULT '{}'
     )""",
-
     """CREATE TABLE IF NOT EXISTS self_extensions (
         id BIGSERIAL PRIMARY KEY,
         pr_url TEXT NOT NULL,
@@ -134,7 +123,6 @@ _STEPS: list[str] = [
         merged_at TIMESTAMPTZ,
         reverted_at TIMESTAMPTZ
     )""",
-
     """CREATE TABLE IF NOT EXISTS learnings (
         id BIGSERIAL PRIMARY KEY,
         scope TEXT NOT NULL,
@@ -143,7 +131,6 @@ _STEPS: list[str] = [
         confidence INT NOT NULL DEFAULT 50,
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
-
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
@@ -154,10 +141,12 @@ async def run_migrations(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         for step in _STEPS:
             await conn.execute(text(step))
-        await conn.execute(text(
-            "INSERT INTO schema_version (id) VALUES (1) "
-            "ON CONFLICT (id) DO UPDATE SET applied_at = NOW()"
-        ))
+        await conn.execute(
+            text(
+                "INSERT INTO schema_version (id) VALUES (1) "
+                "ON CONFLICT (id) DO UPDATE SET applied_at = NOW()"
+            )
+        )
     log.info("migrations.applied", steps=len(_STEPS))
 
 
@@ -165,6 +154,7 @@ async def run_migrations(engine: AsyncEngine) -> None:
 def cli() -> None:
     """Run migrations against AGENT_DB_URL."""
     from peermarket_agent.db.engine import get_engine
+
     asyncio.run(run_migrations(get_engine()))
 
 

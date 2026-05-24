@@ -1,4 +1,5 @@
 """Peermarket prod read-only client tests — fetches whitelisted KPIs only."""
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

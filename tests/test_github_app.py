@@ -1,4 +1,5 @@
 """GitHub App auth tests — JWT minting + install token exchange."""
+
 import time
 from unittest.mock import AsyncMock
 
@@ -61,6 +62,7 @@ async def test_get_installation_token_calls_correct_endpoint(client, monkeypatch
     fake_post.return_value.raise_for_status = lambda: None
 
     import httpx
+
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
     tok = await client.get_installation_token()
@@ -79,6 +81,7 @@ async def test_get_installation_token_caches_until_expiry(client, monkeypatch):
         "expires_at": "2099-01-01T00:00:00Z",
     }
     import httpx
+
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
     await client.get_installation_token()

@@ -1,4 +1,5 @@
 """Slack bridge — socket-mode listener + FastAPI healthcheck on :8090."""
+
 from __future__ import annotations
 
 import asyncio

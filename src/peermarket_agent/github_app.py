@@ -1,4 +1,5 @@
 """GitHub App authentication — mints short-lived installation tokens."""
+
 import json
 import time
 from dataclasses import dataclass
@@ -46,9 +47,7 @@ class GitHubAppClient:
         # Use lower-level PyJWS so we can keep `iss` as an integer (GitHub
         # accepts it; PyJWT's high-level `encode` enforces a string-only
         # check on `iss`).
-        payload = json.dumps(
-            {"iat": now - 60, "exp": now + 540, "iss": self._app_id}
-        ).encode()
+        payload = json.dumps({"iat": now - 60, "exp": now + 540, "iss": self._app_id}).encode()
         return _jws.encode(payload, self._private_key, algorithm="RS256")
 
     async def get_installation_token(self) -> str:

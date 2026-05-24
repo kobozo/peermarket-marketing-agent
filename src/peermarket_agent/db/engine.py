@@ -1,4 +1,5 @@
 """Async SQLAlchemy engine factory."""
+
 from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine

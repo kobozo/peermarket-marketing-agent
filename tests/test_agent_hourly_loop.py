@@ -1,4 +1,5 @@
 """Hourly Loop A — writes a row to kpis_hourly."""
+
 import os
 from unittest.mock import AsyncMock
 
@@ -31,9 +32,11 @@ async def test_hourly_pulse_writes_heartbeat_row(engine):
     await run_hourly_pulse(engine=engine, peermarket=fake_peermarket)
 
     async with engine.connect() as conn:
-        rows = (await conn.execute(text(
-            "SELECT source, metric_name, value FROM kpis_hourly ORDER BY metric_name"
-        ))).fetchall()
+        rows = (
+            await conn.execute(
+                text("SELECT source, metric_name, value FROM kpis_hourly ORDER BY metric_name")
+            )
+        ).fetchall()
     metrics = {(r[0], r[1]): float(r[2]) for r in rows}
     assert metrics[("agent-internal", "heartbeat")] == 1.0
     assert metrics[("peermarket-prod", "signups")] == 3.0
@@ -47,9 +50,7 @@ async def test_hourly_pulse_writes_heartbeat_when_peermarket_unavailable(engine)
     await run_hourly_pulse(engine=engine, peermarket=fake_peermarket)
 
     async with engine.connect() as conn:
-        rows = (await conn.execute(text(
-            "SELECT source, metric_name FROM kpis_hourly"
-        ))).fetchall()
+        rows = (await conn.execute(text("SELECT source, metric_name FROM kpis_hourly"))).fetchall()
     sources = {(r[0], r[1]) for r in rows}
     # heartbeat still written; peermarket metrics absent
     assert ("agent-internal", "heartbeat") in sources

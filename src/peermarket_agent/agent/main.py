@@ -1,4 +1,5 @@
 """Marketing agent entrypoint — runs migrations, seed, then loops."""
+
 import asyncio
 import contextlib
 from datetime import UTC, datetime, timedelta
