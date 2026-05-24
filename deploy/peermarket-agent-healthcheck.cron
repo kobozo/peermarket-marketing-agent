@@ -1,0 +1,7 @@
+# Pings the slack-bridge healthz endpoint every 5 minutes.
+# Install on VM 129 with:
+#   sudo crontab -u peermarket-agent /opt/peermarket-agent/deploy/peermarket-agent-healthcheck.cron
+#
+# If 3 consecutive pings fail, the failure-handler script (created at deploy time
+# by T15's workflow because it embeds the slack bot token) posts to #agent-emergencies.
+*/5 * * * * /usr/bin/curl -fsS http://127.0.0.1:8090/agent/healthz >/dev/null 2>&1 || /opt/peermarket-agent/deploy/healthcheck-fail.sh
