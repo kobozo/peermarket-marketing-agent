@@ -1,0 +1,84 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, agent-peermarket]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync code to /opt/peermarket-agent
+        run: |
+          sudo rsync -a --delete --exclude .venv --exclude .git \
+            ./ /opt/peermarket-agent/
+          sudo chown -R peermarket-agent:peermarket-agent /opt/peermarket-agent
+
+      - name: Install/refresh deps with uv
+        run: |
+          sudo -u peermarket-agent bash -c '
+            cd /opt/peermarket-agent
+            /usr/local/bin/uv sync --all-extras --frozen || /usr/local/bin/uv sync --all-extras
+          '
+
+      - name: Write secrets.env from GitHub Secrets
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
+          AGENT_DB_URL: ${{ secrets.AGENT_DB_URL }}
+          PEERMARKET_PROD_DB_READONLY_URL: ${{ secrets.PEERMARKET_PROD_DB_READONLY_URL }}
+          GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
+          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          GITHUB_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
+          RECRAFT_API_KEY: ${{ secrets.RECRAFT_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          BACKBLAZE_B2_KEY_ID: ${{ secrets.BACKBLAZE_B2_KEY_ID }}
+          BACKBLAZE_B2_APP_KEY: ${{ secrets.BACKBLAZE_B2_APP_KEY }}
+          BACKBLAZE_B2_BUCKET: ${{ secrets.BACKBLAZE_B2_BUCKET }}
+          BACKBLAZE_B2_ENDPOINT: ${{ secrets.BACKBLAZE_B2_ENDPOINT }}
+        run: |
+          sudo tee /etc/peermarket-agent/secrets.env >/dev/null <<EOF
+          ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+          SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN
+          SLACK_APP_TOKEN=$SLACK_APP_TOKEN
+          SLACK_SIGNING_SECRET=$SLACK_SIGNING_SECRET
+          AGENT_DB_URL=$AGENT_DB_URL
+          PEERMARKET_PROD_DB_READONLY_URL=$PEERMARKET_PROD_DB_READONLY_URL
+          GITHUB_APP_ID=$GITHUB_APP_ID
+          GITHUB_APP_PRIVATE_KEY="$GITHUB_APP_PRIVATE_KEY"
+          GITHUB_APP_INSTALLATION_ID=$GITHUB_APP_INSTALLATION_ID
+          RECRAFT_API_KEY=$RECRAFT_API_KEY
+          RESEND_API_KEY=$RESEND_API_KEY
+          BACKBLAZE_B2_KEY_ID=$BACKBLAZE_B2_KEY_ID
+          BACKBLAZE_B2_APP_KEY=$BACKBLAZE_B2_APP_KEY
+          BACKBLAZE_B2_BUCKET=$BACKBLAZE_B2_BUCKET
+          BACKBLAZE_B2_ENDPOINT=$BACKBLAZE_B2_ENDPOINT
+          EOF
+          sudo chown root:peermarket-agent /etc/peermarket-agent/secrets.env
+          sudo chmod 0640 /etc/peermarket-agent/secrets.env
+
+      - name: Restart services
+        run: |
+          sudo systemctl restart marketing-agent.service slack-bridge.service
+          sleep 5
+          sudo systemctl is-active marketing-agent.service
+          sudo systemctl is-active slack-bridge.service
+
+      - name: Smoke test — healthz
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -fsS http://127.0.0.1:8090/agent/healthz | grep -q '"status":"ok"'; then
+              echo "healthz OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "healthz failed after 5 retries"; exit 1
