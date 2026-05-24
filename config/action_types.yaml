@@ -1,0 +1,33 @@
+# Seed action types — risk tiers and default autonomy modes.
+# Cf. spec §5.7. Auto-applied on every service start.
+action_types:
+  - name: tiktok_post_organic
+    risk_tier: low
+    default_autonomy: propose
+  - name: instagram_reels_organic
+    risk_tier: low
+    default_autonomy: propose
+  - name: email_re_engagement
+    risk_tier: low
+    default_autonomy: propose
+  - name: seo_pr
+    risk_tier: mid
+    default_autonomy: propose
+  - name: utm_pr
+    risk_tier: mid
+    default_autonomy: propose
+  - name: landing_page_pr
+    risk_tier: mid
+    default_autonomy: propose
+  - name: meta_ad_creative
+    risk_tier: high
+    default_autonomy: propose
+  - name: tiktok_ad_creative
+    risk_tier: high
+    default_autonomy: propose
+  - name: budget_shift_within_cap
+    risk_tier: mid
+    default_autonomy: propose
+  - name: reddit_organic_reply
+    risk_tier: high
+    default_autonomy: propose
