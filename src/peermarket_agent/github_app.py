@@ -34,6 +34,13 @@ class GitHubAppClient:
         self._installation_id = installation_id
         self._cached: _CachedToken | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"GitHubAppClient(app_id={self._app_id}, "
+            f"installation_id={self._installation_id}, "
+            f"private_key=***REDACTED***)"
+        )
+
     def _mint_app_jwt(self) -> str:
         now = int(time.time())
         # Use lower-level PyJWS so we can keep `iss` as an integer (GitHub

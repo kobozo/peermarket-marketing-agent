@@ -84,3 +84,12 @@ async def test_get_installation_token_caches_until_expiry(client, monkeypatch):
     await client.get_installation_token()
     await client.get_installation_token()
     assert fake_post.call_count == 1  # cached
+
+
+def test_repr_redacts_private_key(client):
+    representation = repr(client)
+    assert "***REDACTED***" in representation
+    assert "MIIE" not in representation  # no PEM body
+    assert "BEGIN RSA PRIVATE KEY" not in representation
+    assert "app_id=12345" in representation
+    assert "installation_id=67890" in representation
