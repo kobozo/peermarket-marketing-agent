@@ -3,7 +3,7 @@
 # Run as root on the VM. Safe to re-run.
 set -euo pipefail
 
-APT_PKGS=(python3.12 python3.12-venv postgresql-15 postgresql-15-pgvector
+APT_PKGS=(python3.12 python3.12-venv postgresql-16 postgresql-16-pgvector
           ufw age cron git curl jq)
 AGENT_USER=peermarket-agent
 AGENT_HOME=/opt/peermarket-agent
