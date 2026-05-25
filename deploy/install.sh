@@ -28,8 +28,9 @@ install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 \
     "$AGENT_DATA" "$AGENT_DATA/creatives" "$AGENT_DATA/recordings" \
     "$AGENT_DATA/drafts" "$AGENT_DATA/archive" "$AGENT_DATA/backups"
 
-# Secrets dir
-install -d -o root -g root -m 0700 /etc/peermarket-agent
+# Secrets dir — owned root:peermarket-agent so the service user can
+# traverse and read files inside (which are themselves 0640 root:peermarket-agent).
+install -d -o root -g "$AGENT_USER" -m 0750 /etc/peermarket-agent
 touch /etc/peermarket-agent/secrets.env
 chown root:"$AGENT_USER" /etc/peermarket-agent/secrets.env
 chmod 0640 /etc/peermarket-agent/secrets.env
