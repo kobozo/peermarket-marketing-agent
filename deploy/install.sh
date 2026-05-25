@@ -39,8 +39,8 @@ systemctl enable --now postgresql
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$AGENT_DB'" | grep -q 1 \
     || sudo -u postgres createdb "$AGENT_DB"
 sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$AGENT_USER'" | grep -q 1 \
-    || sudo -u postgres psql -c "CREATE ROLE $AGENT_USER LOGIN"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $AGENT_DB TO $AGENT_USER"
+    || sudo -u postgres psql -c "CREATE ROLE \"$AGENT_USER\" LOGIN"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$AGENT_DB\" TO \"$AGENT_USER\""
 sudo -u postgres psql -d "$AGENT_DB" -c "CREATE EXTENSION IF NOT EXISTS vector"
 
 # ufw firewall (allow ssh only; nothing else listens publicly — tunnel handles that)
