@@ -42,6 +42,10 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$AGENT_DB'" 
 sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$AGENT_USER'" | grep -q 1 \
     || sudo -u postgres psql -c "CREATE ROLE \"$AGENT_USER\" LOGIN"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$AGENT_DB\" TO \"$AGENT_USER\""
+# PG15+ default ACL no longer grants CREATE on schema public to PUBLIC.
+# Without this, the role cannot create tables even though it owns the DB.
+sudo -u postgres psql -d "$AGENT_DB" -c "GRANT ALL ON SCHEMA public TO \"$AGENT_USER\""
+sudo -u postgres psql -d "$AGENT_DB" -c "ALTER SCHEMA public OWNER TO \"$AGENT_USER\""
 sudo -u postgres psql -d "$AGENT_DB" -c "CREATE EXTENSION IF NOT EXISTS vector"
 
 # ufw firewall (allow ssh only; nothing else listens publicly — tunnel handles that)
