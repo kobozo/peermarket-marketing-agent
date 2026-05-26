@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     # Recraft (image gen)
     recraft_api_key: str
 
+    # Gemini / Nano Banana (image editing — empty disables it gracefully)
+    gemini_api_key: str = ""
+
     # Resend (email)
     resend_api_key: str
 

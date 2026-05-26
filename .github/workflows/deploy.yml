@@ -45,6 +45,7 @@ jobs:
           GITHUB_APP_PRIVATE_KEY_BODY: ${{ secrets.GH_APP_PRIVATE_KEY }}
           GITHUB_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
           RECRAFT_API_KEY: ${{ secrets.RECRAFT_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           BACKBLAZE_B2_KEY_ID: ${{ secrets.BACKBLAZE_B2_KEY_ID }}
           BACKBLAZE_B2_APP_KEY: ${{ secrets.BACKBLAZE_B2_APP_KEY }}
@@ -69,6 +70,7 @@ jobs:
           GITHUB_APP_PRIVATE_KEY=/etc/peermarket-agent/github-app.pem
           GITHUB_APP_INSTALLATION_ID=$GITHUB_APP_INSTALLATION_ID
           RECRAFT_API_KEY=$RECRAFT_API_KEY
+          GEMINI_API_KEY=$GEMINI_API_KEY
           RESEND_API_KEY=$RESEND_API_KEY
           BACKBLAZE_B2_KEY_ID=$BACKBLAZE_B2_KEY_ID
           BACKBLAZE_B2_APP_KEY=$BACKBLAZE_B2_APP_KEY
