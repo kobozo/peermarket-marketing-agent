@@ -13,6 +13,7 @@ from peermarket_agent.db.engine import get_engine
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
 from peermarket_agent.mcp_servers.peermarket_readonly import PeermarketReadonly
+from peermarket_agent.prompts.brand_voice import sync_to_db as sync_brand_voice
 
 log = structlog.get_logger(__name__)
 
@@ -30,6 +31,7 @@ async def _run() -> None:
     engine = get_engine()
     await run_migrations(engine)
     await seed(engine)
+    await sync_brand_voice(engine)
     peermarket = PeermarketReadonly(settings.peermarket_prod_db_readonly_url)
     log.info("agent.start", env="phase-0")
 
