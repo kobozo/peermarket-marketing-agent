@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # Gemini / Nano Banana (image editing — empty disables it gracefully)
     gemini_api_key: str = ""
 
+    # Meta Marketing API (creates PAUSED ads — empty disables the connector)
+    meta_app_id: str = ""
+    meta_app_secret: str = ""
+    meta_system_user_token: str = ""
+    meta_ad_account_id: str = ""  # 'act_<numeric>'
+
     # Resend (email)
     resend_api_key: str
 
