@@ -64,6 +64,29 @@ async def _produce_copy_for_action(
             f'<title>{meta.title}</title>\n<meta name="description" content="{meta.description}">'
         )
         return "seo", action_args["language"], copy_text, meta.cost_cents
+    elif action_type_name == "meta_ad_creative":
+        from peermarket_agent.prompts.meta_ad_creative import (
+            generate_meta_ad_creative,
+            pick_audience,
+        )
+
+        # If caller didn't specify, randomly pick; else use the provided key
+        audience_key = action_args.get("audience_profile_key") or pick_audience()
+        ad = await generate_meta_ad_creative(
+            claude=claude,
+            brand_voice_md=brand_voice_md,
+            language=action_args["language"],
+            audience_profile_key=audience_key,
+        )
+        copy_text = (
+            f"Audience: {audience_key}\n"
+            f"Headline: {ad.headline}\n"
+            f"Description: {ad.description}\n"
+            f"CTA: {ad.cta_label}\n"
+            f"Suggested daily budget: €{ad.suggested_daily_budget_eur}\n\n"
+            f"Primary text:\n{ad.primary_text}"
+        )
+        return "meta", action_args["language"], copy_text, ad.cost_cents
     else:
         raise ValueError(f"unsupported action_type: {action_type_name!r}")
 
@@ -130,6 +153,11 @@ async def run_draft_command(
 @click.option("--audience", default="dormant_signups", help="(email only)")
 @click.option("--page-path", default=None, help="(seo only)")
 @click.option("--page-subject", default="", help="(seo only)")
+@click.option(
+    "--audience-profile",
+    default=None,
+    help="(meta_ad_creative only) declutterers | trust_conscious_locals; random if omitted",
+)
 def cli(
     action_type: str,
     language: str,
@@ -137,6 +165,7 @@ def cli(
     audience: str,
     page_path: str | None,
     page_subject: str,
+    audience_profile: str | None,
 ) -> None:
     """Generate one draft of the given action type. Persists if brand_score >= 80."""
     settings = get_settings()
@@ -156,6 +185,8 @@ def cli(
             raise click.UsageError("--page-path required for seo_pr")
         kwargs["page_path"] = page_path
         kwargs["page_subject"] = page_subject
+    elif action_type == "meta_ad_creative":
+        kwargs["audience_profile_key"] = audience_profile  # may be None, generator picks
     result = asyncio.run(
         run_draft_command(
             engine=engine,
