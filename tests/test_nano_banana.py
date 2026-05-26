@@ -53,9 +53,7 @@ def _patch_genai_client(monkeypatch, response):
 
 
 async def test_edit_image_returns_png_bytes(monkeypatch):
-    fake_client = _patch_genai_client(
-        monkeypatch, _build_response_with_image(b"NEW_PNG")
-    )
+    fake_client = _patch_genai_client(monkeypatch, _build_response_with_image(b"NEW_PNG"))
     result = await edit_image(
         api_key="x",
         image_bytes=b"OLD_PNG",
@@ -66,12 +64,8 @@ async def test_edit_image_returns_png_bytes(monkeypatch):
 
 
 async def test_edit_image_includes_guardrails_in_prompt(monkeypatch):
-    fake_client = _patch_genai_client(
-        monkeypatch, _build_response_with_image(b"X")
-    )
-    await edit_image(
-        api_key="x", image_bytes=b"Y", prompt="add a brand frame"
-    )
+    fake_client = _patch_genai_client(monkeypatch, _build_response_with_image(b"X"))
+    await edit_image(api_key="x", image_bytes=b"Y", prompt="add a brand frame")
     args, kwargs = fake_client.models.generate_content.call_args
     contents = kwargs.get("contents") or (args[1] if len(args) > 1 else None)
     assert contents is not None
@@ -105,9 +99,7 @@ async def test_edit_image_handles_empty_response(monkeypatch):
 
 async def test_edit_image_handles_sdk_exception(monkeypatch):
     fake_client = MagicMock()
-    fake_client.models.generate_content = MagicMock(
-        side_effect=RuntimeError("nano banana down")
-    )
+    fake_client.models.generate_content = MagicMock(side_effect=RuntimeError("nano banana down"))
     monkeypatch.setattr(
         "peermarket_agent.nano_banana.genai.Client",
         lambda *a, **kw: fake_client,

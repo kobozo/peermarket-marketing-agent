@@ -87,19 +87,13 @@ async def edit_image(
             if inline is not None and inline.data:
                 return inline.data
         # If no image came back, the model might have refused (content policy)
-        text_part = next(
-            (p.text for p in parts if getattr(p, "text", None)), None
-        )
+        text_part = next((p.text for p in parts if getattr(p, "text", None)), None)
         if text_part:
-            raise ImageEditError(
-                f"nano_banana refused to return an image: {text_part[:200]!r}"
-            )
+            raise ImageEditError(f"nano_banana refused to return an image: {text_part[:200]!r}")
         raise ImageEditError("nano_banana response contained no image part")
 
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(_sync_call), timeout=timeout_sec
-        )
+        result = await asyncio.wait_for(asyncio.to_thread(_sync_call), timeout=timeout_sec)
     except TimeoutError as e:
         raise ImageEditError(f"nano_banana timeout after {timeout_sec}s") from e
     except ImageEditError:
