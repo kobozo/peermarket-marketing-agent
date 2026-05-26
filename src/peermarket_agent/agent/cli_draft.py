@@ -26,14 +26,24 @@ from peermarket_agent.slack_notifier import SlackNotifier
 log = structlog.get_logger(__name__)
 
 
+def _human_cta_to_meta_enum(human: str) -> str:
+    mapping = {
+        "Learn More": "LEARN_MORE",
+        "Sign Up": "SIGN_UP",
+        "Shop Now": "SHOP_NOW",
+        "Get Started": "GET_STARTED",
+    }
+    return mapping[human]
+
+
 async def _produce_copy_for_action(
     *,
     claude: ClaudeClient,
     brand_voice_md: str,
     action_type_name: str,
     **action_args: Any,
-) -> tuple[str, str, str, int]:
-    """Return (channel, language, copy_text, generation_cost_cents)."""
+) -> tuple[str, str, str, int, dict]:
+    """Return (channel, language, copy_text, generation_cost_cents, metadata)."""
     if action_type_name == "tiktok_post_organic":
         post = await generate_tiktok_post(
             claude=claude,
@@ -42,7 +52,7 @@ async def _produce_copy_for_action(
             theme=action_args.get("theme", "declutter"),
         )
         copy_text = f"{post.hook}\n\n{post.body}\n\n{post.cta}"
-        return "tiktok", action_args["language"], copy_text, post.cost_cents
+        return "tiktok", action_args["language"], copy_text, post.cost_cents, {}
     elif action_type_name == "email_re_engagement":
         email = await generate_email(
             claude=claude,
@@ -51,7 +61,7 @@ async def _produce_copy_for_action(
             audience=action_args.get("audience", "dormant_signups"),
         )
         copy_text = f"Subject: {email.subject}\n\n{email.body}"
-        return "email", action_args["language"], copy_text, email.cost_cents
+        return "email", action_args["language"], copy_text, email.cost_cents, {}
     elif action_type_name == "seo_pr":
         meta = await generate_seo_meta(
             claude=claude,
@@ -63,7 +73,7 @@ async def _produce_copy_for_action(
         copy_text = (
             f'<title>{meta.title}</title>\n<meta name="description" content="{meta.description}">'
         )
-        return "seo", action_args["language"], copy_text, meta.cost_cents
+        return "seo", action_args["language"], copy_text, meta.cost_cents, {}
     elif action_type_name == "meta_ad_creative":
         from peermarket_agent.prompts.meta_ad_creative import (
             generate_meta_ad_creative,
@@ -86,7 +96,16 @@ async def _produce_copy_for_action(
             f"Suggested daily budget: €{ad.suggested_daily_budget_eur}\n\n"
             f"Primary text:\n{ad.primary_text}"
         )
-        return "meta", action_args["language"], copy_text, ad.cost_cents
+        metadata = {
+            "audience_profile_key": audience_key,
+            "headline": ad.headline,
+            "description": ad.description,
+            "cta_label": ad.cta_label,
+            "cta_type": _human_cta_to_meta_enum(ad.cta_label),
+            "suggested_daily_budget_eur": ad.suggested_daily_budget_eur,
+            "primary_text": ad.primary_text,
+        }
+        return "meta", action_args["language"], copy_text, ad.cost_cents, metadata
     else:
         raise ValueError(f"unsupported action_type: {action_type_name!r}")
 
@@ -106,7 +125,7 @@ async def run_draft_command(
     """
     try:
         brand_voice_md = load_brand_voice()
-        channel, language, copy_text, gen_cost = await _produce_copy_for_action(
+        channel, language, copy_text, gen_cost, metadata = await _produce_copy_for_action(
             claude=claude,
             brand_voice_md=brand_voice_md,
             action_type_name=action_type_name,
@@ -136,6 +155,7 @@ async def run_draft_command(
             generation_cost_cents=gen_cost,
             brand_score=score,
             visual_truthfulness_pass=True,  # text-only in Phase 1a
+            metadata=metadata,
         )
         draft_id = await persist_draft(engine, draft)
         log.info("draft.persisted", action=action_type_name, draft_id=draft_id)

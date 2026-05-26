@@ -131,6 +131,7 @@ _STEPS: list[str] = [
         confidence INT NOT NULL DEFAULT 50,
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",

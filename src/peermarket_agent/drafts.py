@@ -1,6 +1,7 @@
 """Drafts — Draft dataclass + persist helpers + lookups."""
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import Literal
 
 from sqlalchemy import text
@@ -21,6 +22,7 @@ class Draft:
     generation_cost_cents: int  # rounded; Claude tokens cost converted
     brand_score: int  # 0-100, set by brand-quality gate
     visual_truthfulness_pass: bool  # True for text-only drafts
+    metadata: dict = field(default_factory=dict)
 
 
 async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
@@ -41,8 +43,8 @@ async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
                 text(
                     "INSERT INTO drafts "
                     "(action_type_id, channel, language, copy, asset_path, "
-                    " generation_cost_cents, brand_score, visual_truthfulness_pass) "
-                    "VALUES (:atid, :ch, :lang, :copy, :ap, :cost, :bs, :vtp) "
+                    " generation_cost_cents, brand_score, visual_truthfulness_pass, metadata) "
+                    "VALUES (:atid, :ch, :lang, :copy, :ap, :cost, :bs, :vtp, CAST(:meta AS JSONB)) "
                     "RETURNING id"
                 ),
                 {
@@ -54,6 +56,7 @@ async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
                     "cost": draft.generation_cost_cents,
                     "bs": draft.brand_score,
                     "vtp": draft.visual_truthfulness_pass,
+                    "meta": json.dumps(draft.metadata or {}),
                 },
             )
         ).fetchone()

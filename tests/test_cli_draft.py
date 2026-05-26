@@ -175,6 +175,62 @@ async def test_run_draft_seo_persists(prepared_db):
     assert draft_id is not None
 
 
+async def test_run_draft_meta_persists_metadata(prepared_db):
+    """meta_ad_creative drafts should have structured metadata in DB."""
+    fake_claude = AsyncMock()
+    fake_claude.complete = AsyncMock(
+        side_effect=[
+            ClaudeResponse(
+                text=(
+                    '{"primary_text": "PeerMarket is de Belgische marktplaats waar elke verkoper '
+                    "zijn identiteit verifieert. Verkoop veilig en koop met vertrouwen. Plaats "
+                    'vandaag je eerste item gratis.",'
+                    ' "headline": "Verkoop veilig",'
+                    ' "description": "Geverifieerde verkopers",'
+                    ' "cta_label": "Learn More",'
+                    ' "suggested_daily_budget_eur": 10}'
+                ),
+                input_tokens=300,
+                output_tokens=120,
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+            ),
+            ClaudeResponse(
+                text='{"score": 90, "notes": "Spot on."}',
+                input_tokens=300,
+                output_tokens=20,
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+
+    draft_id = await run_draft_command(
+        engine=prepared_db,
+        claude=fake_claude,
+        action_type_name="meta_ad_creative",
+        language="NL",
+        audience_profile_key="declutterers",
+    )
+    assert draft_id is not None
+
+    async with prepared_db.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT channel, metadata FROM drafts WHERE id = :id"),
+                {"id": draft_id},
+            )
+        ).fetchone()
+    assert row[0] == "meta"
+    meta = row[1]
+    assert meta["audience_profile_key"] == "declutterers"
+    assert meta["headline"] == "Verkoop veilig"
+    assert meta["cta_label"] == "Learn More"
+    assert meta["cta_type"] == "LEARN_MORE"
+    assert meta["suggested_daily_budget_eur"] == 10
+    assert "PeerMarket is de Belgische" in meta["primary_text"]
+
+
 async def test_run_draft_credit_low_dms_founder_and_reraises(prepared_db):
     """Anthropic credit-low errors trigger Slack DM and propagate."""
     import httpx
