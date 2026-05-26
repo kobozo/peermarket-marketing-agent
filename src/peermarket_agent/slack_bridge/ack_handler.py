@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from peermarket_agent.config import get_settings
+from peermarket_agent.meta_pipeline import process_approved_meta_draft
 from peermarket_agent.slack_bridge.ack_parser import AckAction
+from peermarket_agent.slack_notifier import SlackNotifier
 
 log = structlog.get_logger(__name__)
 
@@ -66,6 +70,20 @@ async def handle_ack(
         by=decided_by,
         action_type=action_type_name,
     )
+    if action == "approve" and action_type_name == "meta_ad_creative":
+        settings = get_settings()
+        notifier = SlackNotifier(
+            bot_token=settings.slack_bot_token,
+            founder_user_id=settings.slack_founder_user_id,
+        )
+        asyncio.create_task(
+            process_approved_meta_draft(
+                engine=engine,
+                draft_id=draft_id,
+                settings=settings,
+                notifier=notifier,
+            )
+        )
     if action == "approve":
         reply = (
             f"✅ Approved draft #{draft_id} ({action_type_name}). "

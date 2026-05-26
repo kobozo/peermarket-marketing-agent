@@ -126,3 +126,34 @@ async def test_count_drafts_for_action(engine):
     )
     assert await count_drafts_for_action(engine, "tiktok_post_organic") == 3
     assert await count_drafts_for_action(engine, "email_re_engagement") == 1
+
+
+async def test_persist_draft_stores_metadata(engine):
+    metadata = {
+        "audience_profile_key": "declutterers",
+        "headline": "Verkoop veilig",
+        "cta_type": "LEARN_MORE",
+        "suggested_daily_budget_eur": 10,
+    }
+    draft_id = await persist_draft(
+        engine,
+        Draft(
+            action_type_name="meta_ad_creative",
+            channel="meta",
+            language="NL",
+            copy="x",
+            asset_path=None,
+            generation_cost_cents=2,
+            brand_score=88,
+            visual_truthfulness_pass=True,
+            metadata=metadata,
+        ),
+    )
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT metadata FROM drafts WHERE id = :id"),
+                {"id": draft_id},
+            )
+        ).fetchone()
+    assert row[0] == metadata
