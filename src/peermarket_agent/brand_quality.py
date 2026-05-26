@@ -5,8 +5,7 @@ are rejected internally and never reach the drafts table — keeps the
 approval queue free of obvious off-brand content.
 """
 
-import json
-
+from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.claude import ClaudeClient
 
 BRAND_SCORE_THRESHOLD = 80
@@ -42,10 +41,7 @@ async def score_draft(
         temperature=0.0,  # deterministic scoring
         max_tokens=200,
     )
-    try:
-        payload = json.loads(resp.text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Claude returned not valid JSON: {resp.text[:200]!r}") from e
+    payload = parse_claude_json(resp.text)
     score = int(payload["score"])
     score = max(0, min(100, score))
     notes = str(payload.get("notes", ""))

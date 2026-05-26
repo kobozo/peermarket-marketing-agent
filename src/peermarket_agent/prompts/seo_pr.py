@@ -1,9 +1,9 @@
 """SEO PR — meta tag generator. Produces <title> + <meta description> for a page."""
 
-import json
 import math
 from dataclasses import dataclass
 
+from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 _INPUT_CENTS_PER_TOKEN = 0.0003
@@ -57,10 +57,7 @@ async def generate_seo_meta(
         temperature=0.4,
         max_tokens=300,
     )
-    try:
-        payload = json.loads(resp.text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Claude returned not valid JSON: {resp.text[:200]!r}") from e
+    payload = parse_claude_json(resp.text)
     title = payload["title"]
     description = payload["description"]
     if len(title) > 60:
