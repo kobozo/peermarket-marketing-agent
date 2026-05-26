@@ -26,7 +26,11 @@ jobs:
           sudo -u peermarket-agent bash -c '
             cd /opt/peermarket-agent
             /usr/local/bin/uv sync --all-extras --frozen || /usr/local/bin/uv sync --all-extras
+            # Playwright browser binary (idempotent — playwright skips if installed)
+            /opt/peermarket-agent/.venv/bin/playwright install chromium
           '
+          # System libs require root (apt-installs missing libs for Chromium)
+          sudo /opt/peermarket-agent/.venv/bin/playwright install-deps chromium || true
 
       - name: Write secrets.env + PEM file from GitHub Secrets
         env:
