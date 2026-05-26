@@ -4,6 +4,7 @@ Used by the creative pipeline to capture peermarket.eu pages for use as
 Meta/TikTok ad assets. Always headless, always Chromium, no JS evaluation
 beyond what the page itself runs.
 """
+
 import structlog
 from playwright.async_api import (
     Error as PlaywrightError,

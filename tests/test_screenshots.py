@@ -1,4 +1,5 @@
 """Playwright screenshot tests — no real browser."""
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,6 +32,7 @@ def _build_fake_playwright(*, screenshot_bytes=b"PNG_DATA", raises=None):
     class _CM:
         async def __aenter__(self_inner):
             return pw
+
         async def __aexit__(self_inner, *args):
             return None
 
@@ -56,12 +58,14 @@ async def test_screenshot_url_returns_png_bytes(monkeypatch):
 async def test_screenshot_url_passes_viewport(monkeypatch):
     cm, page, browser = _build_fake_playwright()
     captured = {}
+
     async def fake_new_context(**kwargs):
         captured["viewport"] = kwargs.get("viewport")
         # Re-attach the page chain expected by the caller
         ctx = AsyncMock()
         ctx.new_page = AsyncMock(return_value=page)
         return ctx
+
     browser.new_context = fake_new_context
     monkeypatch.setattr(
         "peermarket_agent.screenshots.async_playwright",
@@ -83,6 +87,7 @@ async def test_screenshot_url_full_page_passes_flag(monkeypatch):
 
 async def test_screenshot_url_timeout_raises_screenshot_error(monkeypatch):
     from playwright.async_api import TimeoutError as PWTimeoutError
+
     cm, _, _ = _build_fake_playwright(raises=PWTimeoutError("timeout"))
     monkeypatch.setattr(
         "peermarket_agent.screenshots.async_playwright",
@@ -94,6 +99,7 @@ async def test_screenshot_url_timeout_raises_screenshot_error(monkeypatch):
 
 async def test_screenshot_url_navigation_error_raises_screenshot_error(monkeypatch):
     from playwright.async_api import Error as PWError
+
     cm, _, _ = _build_fake_playwright(raises=PWError("net::ERR_NAME_NOT_RESOLVED"))
     monkeypatch.setattr(
         "peermarket_agent.screenshots.async_playwright",
