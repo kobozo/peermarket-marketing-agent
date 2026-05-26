@@ -6,10 +6,12 @@ Orchestrates: generate → score → persist-if-passing.
 import asyncio
 from typing import Any
 
+import anthropic
 import click
 import structlog
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from peermarket_agent.balance_alert import NUDGE_MESSAGE, is_credit_balance_error
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.config import get_settings
@@ -19,6 +21,7 @@ from peermarket_agent.prompts.brand_voice import load_brand_voice
 from peermarket_agent.prompts.email_re_engagement import generate_email
 from peermarket_agent.prompts.seo_pr import generate_seo_meta
 from peermarket_agent.prompts.tiktok_post import generate_tiktok_post
+from peermarket_agent.slack_notifier import SlackNotifier
 
 log = structlog.get_logger(__name__)
 
@@ -70,44 +73,54 @@ async def run_draft_command(
     engine: AsyncEngine,
     claude: ClaudeClient,
     action_type_name: str,
+    notifier: SlackNotifier | None = None,
     **action_args: Any,
 ) -> int | None:
-    """End-to-end: generate, score, persist if passing. Returns draft id or None."""
-    brand_voice_md = load_brand_voice()
-    channel, language, copy_text, gen_cost = await _produce_copy_for_action(
-        claude=claude,
-        brand_voice_md=brand_voice_md,
-        action_type_name=action_type_name,
-        **action_args,
-    )
-    score, notes = await score_draft(
-        claude=claude,
-        brand_voice_md=brand_voice_md,
-        copy=copy_text,
-    )
-    log.info(
-        "draft.scored",
-        action=action_type_name,
-        score=score,
-        threshold=BRAND_SCORE_THRESHOLD,
-        notes=notes,
-    )
-    if score < BRAND_SCORE_THRESHOLD:
-        log.info("draft.rejected_by_gate", action=action_type_name, score=score)
-        return None
-    draft = Draft(
-        action_type_name=action_type_name,
-        channel=channel,
-        language=language,
-        copy=copy_text,
-        asset_path=None,
-        generation_cost_cents=gen_cost,
-        brand_score=score,
-        visual_truthfulness_pass=True,  # text-only in Phase 1a
-    )
-    draft_id = await persist_draft(engine, draft)
-    log.info("draft.persisted", action=action_type_name, draft_id=draft_id)
-    return draft_id
+    """End-to-end: generate, score, persist if passing. Returns draft id or None.
+
+    On Anthropic credit-balance-low errors, DMs the founder with a topup
+    nudge (if `notifier` is provided) then re-raises.
+    """
+    try:
+        brand_voice_md = load_brand_voice()
+        channel, language, copy_text, gen_cost = await _produce_copy_for_action(
+            claude=claude,
+            brand_voice_md=brand_voice_md,
+            action_type_name=action_type_name,
+            **action_args,
+        )
+        score, notes = await score_draft(
+            claude=claude,
+            brand_voice_md=brand_voice_md,
+            copy=copy_text,
+        )
+        log.info(
+            "draft.scored",
+            action=action_type_name,
+            score=score,
+            threshold=BRAND_SCORE_THRESHOLD,
+            notes=notes,
+        )
+        if score < BRAND_SCORE_THRESHOLD:
+            log.info("draft.rejected_by_gate", action=action_type_name, score=score)
+            return None
+        draft = Draft(
+            action_type_name=action_type_name,
+            channel=channel,
+            language=language,
+            copy=copy_text,
+            asset_path=None,
+            generation_cost_cents=gen_cost,
+            brand_score=score,
+            visual_truthfulness_pass=True,  # text-only in Phase 1a
+        )
+        draft_id = await persist_draft(engine, draft)
+        log.info("draft.persisted", action=action_type_name, draft_id=draft_id)
+        return draft_id
+    except anthropic.BadRequestError as exc:
+        if is_credit_balance_error(exc) and notifier is not None:
+            await notifier.notify_founder(NUDGE_MESSAGE)
+        raise
 
 
 @click.command()
@@ -129,6 +142,10 @@ def cli(
     settings = get_settings()
     engine = get_engine()
     claude = ClaudeClient(api_key=settings.anthropic_api_key)
+    notifier = SlackNotifier(
+        bot_token=settings.slack_bot_token,
+        founder_user_id=settings.slack_founder_user_id,
+    )
     kwargs: dict[str, Any] = {"language": language}
     if action_type == "tiktok_post_organic":
         kwargs["theme"] = theme
@@ -143,6 +160,7 @@ def cli(
         run_draft_command(
             engine=engine,
             claude=claude,
+            notifier=notifier,
             action_type_name=action_type,
             **kwargs,
         )
