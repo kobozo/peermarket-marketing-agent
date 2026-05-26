@@ -13,6 +13,9 @@ from slack_bolt.async_app import AsyncApp
 from uvicorn import Config, Server
 
 from peermarket_agent.config import get_settings
+from peermarket_agent.db.engine import get_engine
+from peermarket_agent.slack_bridge.ack_handler import handle_ack
+from peermarket_agent.slack_bridge.ack_parser import parse_ack
 
 log = structlog.get_logger(__name__)
 
@@ -33,6 +36,15 @@ async def handle_im(event: dict, say) -> None:
     if event.get("bot_id"):
         return
     if event.get("channel_type") != "im":
+        return
+    text_msg = event.get("text") or ""
+    user_id = event.get("user", "unknown")
+    parsed = parse_ack(text_msg)
+    if parsed is not None:
+        action, draft_id = parsed
+        engine = get_engine()
+        result = await handle_ack(engine, action=action, draft_id=draft_id, decided_by=user_id)
+        await say(text=result.reply_text)
         return
     await say(text=_HELLO_TEXT)
 
