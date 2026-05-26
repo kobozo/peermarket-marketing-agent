@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     slack_bot_token: str
     slack_app_token: str
     slack_signing_secret: str = ""
+    slack_founder_user_id: str = ""  # DM target for credit-low + other founder alerts
 
     # Database
     agent_db_url: str  # local Postgres on VM 129

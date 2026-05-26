@@ -1,0 +1,42 @@
+"""Slack notifier tests — no real Slack calls."""
+
+from unittest.mock import AsyncMock
+
+from peermarket_agent.slack_notifier import SlackNotifier
+
+
+async def test_notify_founder_posts_dm(monkeypatch):
+    fake_client = AsyncMock()
+    fake_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(
+        "peermarket_agent.slack_notifier.AsyncWebClient",
+        lambda *a, **kw: fake_client,
+    )
+    notifier = SlackNotifier(bot_token="xoxb-test", founder_user_id="U123")
+    sent = await notifier.notify_founder("hello")
+    assert sent is True
+    fake_client.chat_postMessage.assert_awaited_once_with(channel="U123", text="hello")
+
+
+async def test_notify_founder_no_id_does_nothing(monkeypatch):
+    fake_client = AsyncMock()
+    monkeypatch.setattr(
+        "peermarket_agent.slack_notifier.AsyncWebClient",
+        lambda *a, **kw: fake_client,
+    )
+    notifier = SlackNotifier(bot_token="xoxb-test", founder_user_id="")
+    sent = await notifier.notify_founder("hello")
+    assert sent is False
+    fake_client.chat_postMessage.assert_not_called()
+
+
+async def test_notify_founder_handles_slack_errors(monkeypatch):
+    fake_client = AsyncMock()
+    fake_client.chat_postMessage = AsyncMock(side_effect=RuntimeError("slack down"))
+    monkeypatch.setattr(
+        "peermarket_agent.slack_notifier.AsyncWebClient",
+        lambda *a, **kw: fake_client,
+    )
+    notifier = SlackNotifier(bot_token="xoxb-test", founder_user_id="U123")
+    sent = await notifier.notify_founder("hello")
+    assert sent is False

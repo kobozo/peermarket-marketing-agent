@@ -173,3 +173,46 @@ async def test_run_draft_seo_persists(prepared_db):
         page_subject="who we are",
     )
     assert draft_id is not None
+
+
+async def test_run_draft_credit_low_dms_founder_and_reraises(prepared_db):
+    """Anthropic credit-low errors trigger Slack DM and propagate."""
+    import httpx
+    from anthropic import BadRequestError
+
+    from peermarket_agent.balance_alert import NUDGE_MESSAGE
+
+    fake_claude = AsyncMock()
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(
+        status_code=400,
+        request=request,
+        json={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Your credit balance is too low",
+            },
+        },
+    )
+    fake_claude.complete = AsyncMock(
+        side_effect=BadRequestError(
+            message="Your credit balance is too low",
+            response=response,
+            body={"error": {"message": "Your credit balance is too low"}},
+        )
+    )
+
+    fake_notifier = AsyncMock()
+    fake_notifier.notify_founder = AsyncMock(return_value=True)
+
+    with pytest.raises(BadRequestError):
+        await run_draft_command(
+            engine=prepared_db,
+            claude=fake_claude,
+            notifier=fake_notifier,
+            action_type_name="tiktok_post_organic",
+            language="NL",
+            theme="declutter",
+        )
+    fake_notifier.notify_founder.assert_awaited_once_with(NUDGE_MESSAGE)
