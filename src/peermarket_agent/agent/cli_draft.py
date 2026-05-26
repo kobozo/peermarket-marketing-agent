@@ -69,6 +69,7 @@ async def _produce_copy_for_action(
             generate_meta_ad_creative,
             pick_audience,
         )
+
         # If caller didn't specify, randomly pick; else use the provided key
         audience_key = action_args.get("audience_profile_key") or pick_audience()
         ad = await generate_meta_ad_creative(

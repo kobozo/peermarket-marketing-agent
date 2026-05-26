@@ -5,6 +5,7 @@ description + CTA + suggested daily budget. Audience profile is selected
 by the caller (or randomly rotated by the daily loop). No Meta API calls
 in this module — this is draft-only.
 """
+
 import math
 import random
 from dataclasses import dataclass
@@ -45,10 +46,7 @@ AUDIENCE_PROFILES: dict[str, dict] = {
 
 
 def _cost_cents(resp: ClaudeResponse) -> int:
-    raw = (
-        resp.input_tokens * _INPUT_CENTS_PER_TOKEN
-        + resp.output_tokens * _OUTPUT_CENTS_PER_TOKEN
-    )
+    raw = resp.input_tokens * _INPUT_CENTS_PER_TOKEN + resp.output_tokens * _OUTPUT_CENTS_PER_TOKEN
     return max(1, math.ceil(raw))
 
 
@@ -155,9 +153,7 @@ async def generate_meta_ad_creative(
             f"cta_label not allowed: {cta_label!r} (must be one of {_ALLOWED_CTA_LABELS})"
         )
     if not (5 <= budget <= 20):
-        raise ValueError(
-            f"suggested_daily_budget_eur out of range ({budget} not in 5-20)"
-        )
+        raise ValueError(f"suggested_daily_budget_eur out of range ({budget} not in 5-20)")
 
     return MetaAdCreative(
         primary_text=primary_text,
