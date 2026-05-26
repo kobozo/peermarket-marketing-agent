@@ -1,9 +1,9 @@
 """Email re-engagement — prompt builders + generator."""
 
-import json
 import math
 from dataclasses import dataclass
 
+from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 _INPUT_CENTS_PER_TOKEN = 0.0003
@@ -68,10 +68,7 @@ async def generate_email(
         temperature=0.7,
         max_tokens=600,
     )
-    try:
-        payload = json.loads(resp.text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Claude returned not valid JSON: {resp.text[:200]!r}") from e
+    payload = parse_claude_json(resp.text)
     subject = payload["subject"]
     if len(subject) > 60:
         raise ValueError(f"subject too long ({len(subject)} > 60): {subject!r}")

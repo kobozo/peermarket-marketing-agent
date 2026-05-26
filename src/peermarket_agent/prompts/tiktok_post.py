@@ -1,9 +1,9 @@
 """TikTok organic post — prompt builders + generator."""
 
-import json
 import math
 from dataclasses import dataclass
 
+from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 # Sonnet 4.6 approximate pricing: $3/M input, $15/M output → cents per token.
@@ -71,10 +71,7 @@ async def generate_tiktok_post(
         temperature=0.7,
         max_tokens=400,
     )
-    try:
-        payload = json.loads(resp.text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Claude returned not valid JSON: {resp.text[:200]!r}") from e
+    payload = parse_claude_json(resp.text)
     return TikTokPost(
         hook=payload["hook"],
         body=payload["body"],
