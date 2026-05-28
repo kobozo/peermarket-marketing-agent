@@ -10,9 +10,18 @@ PeerMarket is a Belgian secondhand marketplace whose differentiator is **verifie
 
 ## Languages
 
-- NL (Dutch) and FR (French) are primary, with full parity — every published item gets both versions.
+- NL (Dutch) and FR (French) are primary, with full parity at the **program level** — across published items, we maintain rough parity between NL and FR output. Individual drafts are single-language; pairing happens at publish-time when a campaign goes live, not within a single draft.
 - EN allowed for SEO landing pages and developer-facing surfaces only.
 - Use natural NL/FR. Avoid translation-sounding sentences. A Belgian reader should recognize the dialect.
+
+### Platform-enforced text (out of scope for language evaluation)
+
+Some advertising platforms enforce fixed English strings that cannot be translated:
+
+- **Meta Ads CTA labels** are a fixed enum: `Learn More`, `Sign Up`, `Shop Now`, `Get Started`. These are platform UI labels, not creative copy. Do not penalize an NL or FR ad for using one of these.
+- Targeting IDs, audience profile keys, ad account identifiers are platform metadata, not user-facing text — out of scope.
+
+When scoring a draft, evaluate only the **creative copy** (headline, description, primary text, hook, body, CTA copy that isn't a fixed platform enum). Ignore CTA-label fields that match the Meta enum above and any line beginning with `Audience:`, `Suggested daily budget:`, or `CTA:` followed by a Meta enum value.
 
 ## Tone rules
 
