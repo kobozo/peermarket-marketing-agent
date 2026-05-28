@@ -68,14 +68,14 @@ def build_system_prompt(brand_voice_md: str) -> str:
         "{\n"
         '  "primary_text": "<125-300 chars main ad body>",\n'
         '  "headline": "<≤40 chars>",\n'
-        '  "description": "<≤30 chars>",\n'
+        '  "description": "<≤40 chars>",\n'
         '  "cta_label": "<one of: Learn More | Sign Up | Shop Now | Get Started>",\n'
         '  "suggested_daily_budget_eur": <integer 5-20>\n'
         "}\n\n"
         "Hard constraints:\n"
         "- primary_text 125-300 chars, plain text, no emojis except optionally one in the opener\n"
         "- headline ≤ 40 chars, no exclamation mark\n"
-        "- description ≤ 30 chars (Meta's short subtitle)\n"
+        "- description ≤ 40 chars (Meta's short subtitle; Dutch needs the extra room)\n"
         "- cta_label exactly one of the four allowed values\n"
         "- suggested_daily_budget_eur 5-20 integer (we're testing — start small)\n"
         "- Stay strictly in the requested language; never mix\n"
@@ -146,8 +146,8 @@ async def generate_meta_ad_creative(
         )
     if len(headline) > 40:
         raise ValueError(f"headline too long ({len(headline)} > 40): {headline!r}")
-    if len(description) > 30:
-        raise ValueError(f"description too long ({len(description)} > 30): {description!r}")
+    if len(description) > 40:
+        raise ValueError(f"description too long ({len(description)} > 40): {description!r}")
     if cta_label not in _ALLOWED_CTA_LABELS:
         raise ValueError(
             f"cta_label not allowed: {cta_label!r} (must be one of {_ALLOWED_CTA_LABELS})"

@@ -58,7 +58,7 @@ async def test_generate_meta_ad_creative_happy_path():
     assert result.audience_profile_key == "declutterers"
     assert 125 <= len(result.primary_text) <= 300
     assert len(result.headline) <= 40
-    assert len(result.description) <= 30
+    assert len(result.description) <= 40
     assert result.cost_cents >= 1
 
 
