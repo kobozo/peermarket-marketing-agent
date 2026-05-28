@@ -145,6 +145,7 @@ def _sync_create(
                 Campaign.Field.objective: "OUTCOME_TRAFFIC",
                 Campaign.Field.status: Campaign.Status.paused,
                 Campaign.Field.special_ad_categories: [],
+                "is_adset_budget_sharing_enabled": False,
             },
             fields=[Campaign.Field.id],
         )

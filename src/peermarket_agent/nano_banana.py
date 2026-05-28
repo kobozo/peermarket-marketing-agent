@@ -16,7 +16,7 @@ from google.genai import types
 log = structlog.get_logger(__name__)
 
 # Hard-coded model. Bump version deliberately, not via env override.
-_MODEL = "gemini-2.5-flash-image-preview"
+_MODEL = "gemini-2.5-flash-image"
 
 # Embedded into every prompt. Backstop against synthetic-content generation.
 _EDIT_GUARDRAILS = (
