@@ -41,6 +41,27 @@ Complete. Connector-level creation, activation, verification, and rollback primi
 - `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `148 passed`
 - `git diff --check` → clean
 
+## Initial activation setup follow-up
+
+### RED
+
+- Added a regression where the first SDK initialization attempt raises a diagnostic containing the system-user token, and every rollback initialization attempt fails the same way.
+- Focused tests failed because initial `_init_api` ran outside the activation error boundary and escaped as a raw credential-bearing `RuntimeError`.
+
+### GREEN
+
+- Credential validation and initial SDK initialization now run inside the structured activation boundary with phase `setup`.
+- A setup failure retains the supplied resource IDs, records empty observed statuses when status reads cannot initialize, and captures the sanitized rollback setup diagnostic.
+- The structured `MetaAdsError` is constructed during handling but raised only after leaving the original exception handler, eliminating both explicit `__cause__` and implicit `__context__` credential leakage.
+- Existing parent-to-child activation, explicit status verification, and child-to-parent rollback ordering are unchanged.
+
+### Verification
+
+- `uv run pytest tests/test_meta_ads.py -q` → `18 passed`
+- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
+- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `152 passed`
+- `git diff --check` → clean
+
 ## Concerns
 
 None blocking. Pipeline-level reconciliation and activation invocation remain intentionally deferred to the later orchestration task.

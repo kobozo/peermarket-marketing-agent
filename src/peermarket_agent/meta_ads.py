@@ -380,10 +380,11 @@ def _validate_statuses(statuses: dict[str, dict[str, str]]) -> None:
 
 
 def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationResult:
-    _ensure_enabled(config)
-    _init_api(config)
-    phase = "activate_campaign"
+    phase = "setup"
+    activation_error: MetaAdsError | None = None
     try:
+        _ensure_enabled(config)
+        _init_api(config)
         for name, resource in _resources(ids):
             phase = f"activate_{name}"
             resource.api_update(params={"status": "ACTIVE"})
@@ -398,13 +399,14 @@ def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationRes
     except Exception:
         observed_statuses = _sync_observe_best_effort(config, ids)
         rollback_errors = _sync_pause(config, ids)
-        raise MetaAdsError(
+        activation_error = MetaAdsError(
             "Meta activation failed",
             phase=phase,
             resource_ids=dict(ids),
             observed_statuses=observed_statuses,
             rollback_errors=rollback_errors,
-        ) from None
+        )
+    raise activation_error from None
 
 
 async def activate_meta_ad(

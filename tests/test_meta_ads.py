@@ -483,3 +483,30 @@ async def test_activation_error_survives_rollback_setup_failure(monkeypatch):
         traceback.format_exception(type(error), error, error.__traceback__)
     )
     assert _FULL_CONFIG.system_user_token not in chained_traceback
+
+
+async def test_initial_activation_setup_failure_is_structured_and_sanitized(monkeypatch):
+    def fail_init(config):
+        raise RuntimeError(
+            f"initialization token={_FULL_CONFIG.system_user_token} unavailable"
+        )
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", fail_init)
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(_FULL_CONFIG, ids)
+
+    error = caught.value
+    assert error.phase == "setup"
+    assert error.resource_ids == ids
+    assert error.observed_statuses == {}
+    assert error.rollback_errors == {
+        "setup": "initialization token=[REDACTED] unavailable"
+    }
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    chained_traceback = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert _FULL_CONFIG.system_user_token not in chained_traceback
