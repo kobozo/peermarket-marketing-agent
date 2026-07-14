@@ -56,3 +56,17 @@ Observed GREEN checks:
 ## Concerns
 
 The command has not been run against production Meta resources. Production use still requires the operator to copy the exact stored IDs and should begin with a database read confirming draft 156's frozen budget and current hierarchy. Meta read failures refuse replacement without disclosing raw connector exceptions.
+
+## Review amendment
+
+Follow-up review findings were addressed test-first:
+
+- all locally checkable prerequisites now run before the history/current-ID transition: activation enabled, structurally complete metadata, complete connector configuration, a positive whole-euro frozen budget, terminal status reads, and screenshot/image preparation;
+- invalid frozen cents such as `1050` refuse without status reads, database mutation, or Meta creation, so the connector never receives a rounded value;
+- the prepared image is passed into the post-transition normal pipeline, avoiding a second fallible screenshot/edit operation;
+- every started replacement has one UUID-addressed, timestamped history object containing old IDs/statuses and finalized replacement IDs/state/failure;
+- the finalizer runs in `finally` for handled failures, unexpected connector exceptions, and notification exceptions;
+- handled partial creation failures now return a sanitized operational CLI error rather than a successful exit, while partial current IDs and failure history remain durable;
+- refusal and result Slack messages are best-effort and truthful, while CLI operational errors contain no raw exception text or traceback.
+
+Review RED cases reproduced prerequisite mutation, non-integral budget handling, missing refusal notifications, split history association, successful CLI exit on partial failure, raw unexpected connector errors, and notifier exceptions. The post-review full verification result is recorded in the final handoff.

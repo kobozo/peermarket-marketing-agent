@@ -56,6 +56,21 @@ class TerminalReplacementResult:
     failure: dict | None
 
 
+class TerminalReplacementOperationalError(RuntimeError):
+    """Sanitized post-transition replacement failure for operator surfaces."""
+
+
+_REPLACEMENT_METADATA_KEYS = {
+    "audience_profile_key",
+    "headline",
+    "description",
+    "cta_type",
+    "primary_text",
+    "suggested_daily_budget_eur",
+}
+_REPLACEMENT_TEXT_METADATA_KEYS = _REPLACEMENT_METADATA_KEYS - {"suggested_daily_budget_eur"}
+
+
 def _meta_config(settings: Settings) -> MetaConfig:
     return MetaConfig(
         app_id=settings.meta_app_id,
@@ -64,6 +79,16 @@ def _meta_config(settings: Settings) -> MetaConfig:
         ad_account_id=settings.meta_ad_account_id,
         page_id=settings.meta_page_id,
     )
+
+
+async def _refuse_terminal_replacement(
+    notifier: SlackNotifier, draft_id: int, message: str
+) -> None:
+    try:
+        await notifier.notify_founder(f"⚠️ Draft #{draft_id}: {message} No replacement was started.")
+    except Exception:
+        log.exception("meta_pipeline.replacement_refusal_notification_failed", draft_id=draft_id)
+    raise ValueError(message)
 
 
 async def replace_terminal_meta_draft(
@@ -80,7 +105,11 @@ async def replace_terminal_meta_draft(
         for value in expected_ids.values()
     )
     if not valid_ids:
-        raise ValueError("replacement IDs must contain exact non-empty current Meta IDs")
+        await _refuse_terminal_replacement(
+            notifier,
+            draft_id,
+            "refusing replacement: IDs must contain exact non-empty current Meta IDs",
+        )
     async with engine.begin() as lock_connection:
         await lock_connection.execute(
             text(
@@ -92,21 +121,76 @@ async def replace_terminal_meta_draft(
         draft = await _fetch_meta_draft(engine, draft_id)
         publication = await get_meta_publication(engine, draft_id)
         if draft is None or draft[0] != "approved":
-            raise ValueError(f"refusing replacement: draft #{draft_id} is not approved")
-        if publication is None or publication.external_ids != expected_ids:
-            raise ValueError(
-                "refusing replacement: supplied IDs are not the exact stored current IDs"
+            await _refuse_terminal_replacement(
+                notifier, draft_id, f"refusing replacement: draft #{draft_id} is not approved"
             )
-        if publication.approved_budget_cents is None:
-            raise ValueError("refusing replacement: approved budget is not frozen")
+        if publication is None or publication.external_ids != expected_ids:
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                "refusing replacement: supplied IDs are not the exact stored current IDs",
+            )
+        metadata = draft[1]
+        if not settings.meta_auto_activate:
+            await _refuse_terminal_replacement(
+                notifier, draft_id, "refusing replacement: automatic Meta activation is disabled"
+            )
+        if (
+            not _REPLACEMENT_METADATA_KEYS.issubset(metadata)
+            or any(
+                not isinstance(metadata[key], str) or not metadata[key].strip()
+                for key in _REPLACEMENT_TEXT_METADATA_KEYS
+            )
+            or not isinstance(metadata["suggested_daily_budget_eur"], int)
+            or isinstance(metadata["suggested_daily_budget_eur"], bool)
+            or metadata["suggested_daily_budget_eur"] <= 0
+        ):
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                "refusing replacement: draft metadata is structurally incomplete",
+            )
+        budget_cents = publication.approved_budget_cents
+        if budget_cents is None or budget_cents <= 0:
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                "refusing replacement: approved budget is not frozen and positive",
+            )
+        if budget_cents % 100:
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                "refusing replacement: frozen budget must be an exact whole euro",
+            )
+        config = _meta_config(settings)
+        if any(
+            not value
+            for value in (
+                config.app_id,
+                config.app_secret,
+                config.system_user_token,
+                config.ad_account_id,
+                config.page_id,
+            )
+        ):
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                "refusing replacement: Meta connector configuration is incomplete",
+            )
         try:
-            statuses = await get_meta_ad_statuses(_meta_config(settings), expected_ids)
+            statuses = await get_meta_ad_statuses(config, expected_ids)
         except (MetaAdsDisabled, MetaAdsError) as error:
-            raise ValueError(
-                f"refusing replacement: unable to read every Meta status: {error}"
-            ) from None
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                f"refusing replacement: unable to read every Meta status: {error}",
+            )
         except Exception:
-            raise ValueError("refusing replacement: unable to read every Meta status") from None
+            await _refuse_terminal_replacement(
+                notifier, draft_id, "refusing replacement: unable to read every Meta status"
+            )
         terminal = set(statuses) == {"campaign", "ad_set", "ad"} and all(
             set(resource_status) >= {"status", "effective_status"}
             and resource_status["status"] in _TERMINAL_META_STATUSES
@@ -114,31 +198,126 @@ async def replace_terminal_meta_draft(
             for resource_status in statuses.values()
         )
         if not terminal:
-            raise ValueError(
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
                 "refusing replacement: stored Meta hierarchy is not entirely terminal "
-                f"(ARCHIVED/DELETED): {json.dumps(statuses, sort_keys=True)}"
+                f"(ARCHIVED/DELETED): {json.dumps(statuses, sort_keys=True)}",
             )
-        await begin_meta_terminal_replacement(engine, draft_id, expected_ids, statuses)
-        await _process_approved_meta_draft(
-            engine=engine, draft_id=draft_id, settings=settings, notifier=notifier
-        )
-        await record_meta_replacement_result(engine, draft_id)
-        current = await get_meta_publication(engine, draft_id)
-        if current is None:
-            raise RuntimeError("replacement publication disappeared")
-        result = TerminalReplacementResult(
-            old_ids=expected_ids,
-            terminal_statuses=statuses,
-            current_ids=current.external_ids,
-            state=current.state or "unknown",
-            failure=current.failure,
-        )
-        await notifier.notify_founder(
-            f"Meta terminal replacement for draft #{draft_id}: archived hierarchy "
-            f"{json.dumps(expected_ids, sort_keys=True)}; current replacement "
-            f"{json.dumps(current.external_ids, sort_keys=True)}; state={result.state}; "
-            f"failure={json.dumps(result.failure, sort_keys=True) if result.failure else 'none'}."
-        )
+        try:
+            screenshot_bytes = await screenshot_url(
+                _LANDING_PAGE, viewport_width=1080, viewport_height=1080
+            )
+            prepared_image = screenshot_bytes
+            try:
+                prepared_image = await edit_image(
+                    api_key=settings.gemini_api_key,
+                    image_bytes=screenshot_bytes,
+                    prompt=_BRAND_FRAME_PROMPT,
+                )
+            except (ImageEditDisabled, ImageEditError):
+                prepared_image = screenshot_bytes
+        except Exception:
+            await _refuse_terminal_replacement(
+                notifier,
+                draft_id,
+                "refusing replacement: unable to prepare replacement image",
+            )
+
+        attempt_id = await begin_meta_terminal_replacement(engine, draft_id, expected_ids, statuses)
+        operational_failure: dict | None = None
+        result: TerminalReplacementResult | None = None
+        try:
+            try:
+                await _process_approved_meta_draft(
+                    engine=engine,
+                    draft_id=draft_id,
+                    settings=settings,
+                    notifier=notifier,
+                    prepared_image=prepared_image,
+                )
+            except Exception:
+                operational_failure = {
+                    "phase": "unexpected",
+                    "message": "unexpected replacement pipeline failure",
+                }
+            current = await get_meta_publication(engine, draft_id)
+            if current is None:
+                operational_failure = {
+                    "phase": "unexpected",
+                    "message": "replacement publication disappeared",
+                }
+            elif (
+                operational_failure is None
+                and current.state == "creating"
+                and not current.external_ids
+            ):
+                operational_failure = {
+                    "phase": "unexpected",
+                    "message": "replacement pipeline produced no current resources",
+                }
+            elif operational_failure is None and (current.state == "failed" or current.failure):
+                operational_failure = current.failure or {
+                    "phase": "pipeline",
+                    "message": "replacement pipeline reported failure",
+                }
+            if operational_failure is not None:
+                await upsert_meta_publication(
+                    engine,
+                    MetaPublication(
+                        draft_id=draft_id,
+                        state="failed",
+                        failure=operational_failure,
+                        approved_budget_cents=budget_cents,
+                    ),
+                )
+                current = await get_meta_publication(engine, draft_id)
+            assert current is not None
+            result = TerminalReplacementResult(
+                old_ids=expected_ids,
+                terminal_statuses=statuses,
+                current_ids=current.external_ids,
+                state=current.state or "unknown",
+                failure=current.failure,
+            )
+            try:
+                await notifier.notify_founder(
+                    f"Meta terminal replacement for draft #{draft_id}: archived hierarchy "
+                    f"{json.dumps(expected_ids, sort_keys=True)}; current replacement "
+                    f"{json.dumps(current.external_ids, sort_keys=True)}; state={result.state}; "
+                    f"failure={json.dumps(result.failure, sort_keys=True) if result.failure else 'none'}."
+                )
+            except Exception:
+                if operational_failure is None:
+                    operational_failure = {
+                        "phase": "notify",
+                        "message": "replacement result notification failed",
+                    }
+        finally:
+            current = await get_meta_publication(engine, draft_id)
+            final_state = (
+                "failed" if operational_failure else (current.state if current else "failed")
+            )
+            final_failure = operational_failure or (
+                current.failure if current else {"phase": "unexpected"}
+            )
+            await record_meta_replacement_result(
+                engine,
+                draft_id,
+                attempt_id,
+                state=final_state or "failed",
+                failure=final_failure,
+            )
+        if operational_failure:
+            phase = operational_failure.get("phase", "operational")
+            current_ids = result.current_ids if result is not None else {}
+            raise TerminalReplacementOperationalError(
+                f"terminal replacement failed during {phase}; archived IDs "
+                f"{json.dumps(expected_ids, sort_keys=True)}; current IDs "
+                f"{json.dumps(current_ids, sort_keys=True)}; attempt state failed; "
+                "inspect stored replacement history"
+            )
+        assert result is not None
         return result
 
 
@@ -309,6 +488,7 @@ async def _process_approved_meta_draft(
     draft_id: int,
     settings: Settings,
     notifier: SlackNotifier,
+    prepared_image: bytes | None = None,
 ) -> None:
     """End-to-end pipeline. Best-effort. Never raises connector failures."""
     log.info("meta_pipeline.start", draft_id=draft_id)
@@ -393,40 +573,43 @@ async def _process_approved_meta_draft(
         ids = existing_ids
         ads_manager_url = publication.ads_manager_url
     else:
-        try:
-            screenshot_bytes = await screenshot_url(
-                _LANDING_PAGE, viewport_width=1080, viewport_height=1080
-            )
-        except ScreenshotError as e:
-            log.exception("meta_pipeline.screenshot_failed", draft_id=draft_id)
-            await _record_failure(
-                engine,
-                draft_id=draft_id,
-                phase="screenshot",
-                budget_cents=budget_cents,
-                error=e,
-            )
-            await notifier.notify_founder(
-                f"⚠️ Approved draft #{draft_id} but couldn't screenshot peermarket.eu: {e}. "
-                "Draft remains approved; retry after fixing screenshot capture."
-            )
-            return
+        if prepared_image is not None:
+            image_bytes = prepared_image
+        else:
+            try:
+                screenshot_bytes = await screenshot_url(
+                    _LANDING_PAGE, viewport_width=1080, viewport_height=1080
+                )
+            except ScreenshotError as e:
+                log.exception("meta_pipeline.screenshot_failed", draft_id=draft_id)
+                await _record_failure(
+                    engine,
+                    draft_id=draft_id,
+                    phase="screenshot",
+                    budget_cents=budget_cents,
+                    error=e,
+                )
+                await notifier.notify_founder(
+                    f"⚠️ Approved draft #{draft_id} but couldn't screenshot peermarket.eu: {e}. "
+                    "Draft remains approved; retry after fixing screenshot capture."
+                )
+                return
 
-        image_bytes = screenshot_bytes
-        try:
-            image_bytes = await edit_image(
-                api_key=settings.gemini_api_key,
-                image_bytes=screenshot_bytes,
-                prompt=_BRAND_FRAME_PROMPT,
-            )
-        except ImageEditDisabled:
-            log.info("meta_pipeline.nano_banana_disabled", draft_id=draft_id)
-        except ImageEditError as e:
-            log.exception("meta_pipeline.image_edit_failed", draft_id=draft_id)
-            await notifier.notify_founder(
-                f"⚠️ Approved draft #{draft_id}, screenshot OK, but image-edit failed: {e}. "
-                "Falling back to raw screenshot, continuing with Meta push."
-            )
+            image_bytes = screenshot_bytes
+            try:
+                image_bytes = await edit_image(
+                    api_key=settings.gemini_api_key,
+                    image_bytes=screenshot_bytes,
+                    prompt=_BRAND_FRAME_PROMPT,
+                )
+            except ImageEditDisabled:
+                log.info("meta_pipeline.nano_banana_disabled", draft_id=draft_id)
+            except ImageEditError as e:
+                log.exception("meta_pipeline.image_edit_failed", draft_id=draft_id)
+                await notifier.notify_founder(
+                    f"⚠️ Approved draft #{draft_id}, screenshot OK, but image-edit failed: {e}. "
+                    "Falling back to raw screenshot, continuing with Meta push."
+                )
 
         meta_config = _meta_config(settings)
         try:

@@ -242,15 +242,24 @@ async def test_terminal_replacement_atomically_archives_and_clears_current_ids(d
         ),
     )
 
-    await begin_meta_terminal_replacement(engine, draft_id, ids, statuses)
+    attempt_id = await begin_meta_terminal_replacement(engine, draft_id, ids, statuses)
 
     stored = await get_meta_publication(engine, draft_id)
     assert stored is not None
     assert stored.external_ids == {}
     assert stored.approved_budget_cents == 1000
-    assert stored.replacement_history == [
-        {"old_ids": ids, "terminal_statuses": statuses, "replacement_ids": {}, "state": "creating"}
-    ]
+    assert len(stored.replacement_history) == 1
+    assert {
+        key: stored.replacement_history[0][key]
+        for key in ("attempt_id", "old_ids", "terminal_statuses", "replacement_ids", "state")
+    } == {
+        "attempt_id": attempt_id,
+        "old_ids": ids,
+        "terminal_statuses": statuses,
+        "replacement_ids": {},
+        "state": "creating",
+    }
+    assert stored.replacement_history[0]["started_at"]
 
 
 async def test_terminal_replacement_requires_exact_current_ids_without_write(database_engine):

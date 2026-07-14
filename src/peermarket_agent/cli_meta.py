@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from peermarket_agent.config import Settings, get_settings
 from peermarket_agent.db.engine import get_engine
 from peermarket_agent.meta_pipeline import (
+    TerminalReplacementOperationalError,
     process_approved_meta_draft,
     replace_terminal_meta_draft,
 )
@@ -148,7 +149,7 @@ def replace_terminal_draft_command(
                 expected_ids=ids,
             )
         )
-    except ValueError as error:
+    except (ValueError, TerminalReplacementOperationalError) as error:
         raise click.ClickException(str(error)) from error
     click.echo(f"Draft #{draft_id} terminal replacement attempt completed.")
     click.echo(f"Archived IDs: {json.dumps(result.old_ids, sort_keys=True)}")

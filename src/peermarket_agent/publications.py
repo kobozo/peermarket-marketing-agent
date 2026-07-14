@@ -2,7 +2,8 @@
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -111,9 +112,13 @@ async def begin_meta_terminal_replacement(
     draft_id: int,
     expected_ids: dict[str, str],
     terminal_statuses: dict[str, dict[str, str]],
-) -> None:
+) -> str:
     """Archive the exact current hierarchy and clear it in one guarded transition."""
+    attempt_id = str(uuid4())
     history_entry = {
+        "attempt_id": attempt_id,
+        "started_at": datetime.now(UTC).isoformat(),
+        "finished_at": None,
         "old_ids": expected_ids,
         "terminal_statuses": terminal_statuses,
         "replacement_ids": {},
@@ -139,18 +144,37 @@ async def begin_meta_terminal_replacement(
         )
         if result.rowcount != 1:
             raise ValueError("refusing replacement: stored Meta IDs changed")
+    return attempt_id
 
 
-async def record_meta_replacement_result(engine: AsyncEngine, draft_id: int) -> None:
-    """Snapshot the replacement's current reconciliation state in durable history."""
+async def record_meta_replacement_result(
+    engine: AsyncEngine,
+    draft_id: int,
+    attempt_id: str,
+    *,
+    state: str,
+    failure: dict | None,
+) -> None:
+    """Finalize one identified replacement attempt in place."""
     async with engine.begin() as connection:
         await connection.execute(
             text(
                 "UPDATE publications SET replacement_history = "
-                "COALESCE(replacement_history, '[]'::JSONB) || jsonb_build_array("
-                "jsonb_build_object('replacement_ids', COALESCE(external_ids, '{}'::JSONB), "
-                "'state', state, 'failure', failure)), updated_at = NOW() "
+                "COALESCE((SELECT jsonb_agg(CASE WHEN item.value->>'attempt_id' = :attempt_id "
+                "THEN item.value || jsonb_build_object("
+                "'replacement_ids', COALESCE(publications.external_ids, '{}'::JSONB), "
+                "'state', CAST(:state AS TEXT), 'failure', CAST(:failure AS JSONB), "
+                "'finished_at', CAST(:finished_at AS TEXT)) ELSE item.value END "
+                "ORDER BY item.ordinality) "
+                "FROM jsonb_array_elements(COALESCE(publications.replacement_history, '[]'::JSONB)) "
+                "WITH ORDINALITY AS item(value, ordinality)), '[]'::JSONB), updated_at = NOW() "
                 "WHERE draft_id = :draft_id"
             ),
-            {"draft_id": draft_id},
+            {
+                "draft_id": draft_id,
+                "attempt_id": attempt_id,
+                "state": state,
+                "failure": json.dumps(failure) if failure is not None else None,
+                "finished_at": datetime.now(UTC).isoformat(),
+            },
         )
