@@ -29,7 +29,11 @@ async def get_meta_publication(
         row = (
             await connection.execute(
                 text(
-                    "SELECT draft_id, state, external_ids, external_statuses, failure, "
+                    "SELECT draft_id, state, "
+                    "CASE WHEN external_id IS NOT NULL "
+                    "THEN jsonb_build_object('ad_id', external_id) "
+                    "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB) "
+                    "AS external_ids, external_statuses, failure, "
                     "approved_budget_cents, ads_manager_url, published_at AS created_at, "
                     "updated_at FROM publications WHERE draft_id = :draft_id"
                 ),

@@ -149,6 +149,25 @@ async def test_upsert_populates_json_fields_on_legacy_publication(database_engin
 
 
 @pytest.mark.asyncio
+async def test_get_maps_legacy_external_id_to_ad_id(database_engine):
+    """The former external_id was the published ad object, not its ancestors."""
+    engine, draft_id = database_engine
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO publications (draft_id, channel, external_id) "
+                "VALUES (:draft_id, 'meta', 'legacy-ad-4')"
+            ),
+            {"draft_id": draft_id},
+        )
+
+    stored = await get_meta_publication(engine, draft_id)
+
+    assert stored is not None
+    assert stored.external_ids == {"ad_id": "legacy-ad-4"}
+
+
+@pytest.mark.asyncio
 async def test_upsert_merges_external_ids_instead_of_replacing_them():
     engine = _Engine()
     publication = MetaPublication(
