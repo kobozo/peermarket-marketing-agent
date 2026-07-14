@@ -53,6 +53,44 @@ def test_settings_loaded_from_env(monkeypatch):
     assert s.timezone == "Europe/Brussels"
 
 
+def test_meta_auto_activate_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("META_AUTO_ACTIVATE", raising=False)
+
+    assert Settings.model_fields["meta_auto_activate"].default is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("true", True), ("1", True), ("false", False), ("0", False)],
+)
+def test_meta_auto_activate_parses_boolean_env(monkeypatch, value, expected):
+    monkeypatch.setenv("META_AUTO_ACTIVATE", value)
+
+    assert (
+        Settings.model_validate(
+            {
+                "anthropic_api_key": "sk-ant-test",
+                "slack_bot_token": "xoxb-test",
+                "slack_app_token": "xapp-test",
+                "agent_db_url": "postgresql+asyncpg://x:y@localhost/z",
+                "peermarket_prod_db_readonly_url": "postgresql+asyncpg://r:o@host/peer",
+                "github_app_id": 1,
+                "github_app_private_key": (
+                    "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----"
+                ),
+                "github_app_installation_id": 1,
+                "recraft_api_key": "rk",
+                "resend_api_key": "re",
+                "backblaze_b2_key_id": "kid",
+                "backblaze_b2_app_key": "akey",
+                "backblaze_b2_bucket": "bucket",
+                "backblaze_b2_endpoint": "endpoint",
+            }
+        ).meta_auto_activate
+        is expected
+    )
+
+
 def test_settings_cached(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")

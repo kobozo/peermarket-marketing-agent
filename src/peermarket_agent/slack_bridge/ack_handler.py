@@ -85,10 +85,7 @@ async def handle_ack(
             )
         )
     if action == "approve":
-        reply = (
-            f"✅ Approved draft #{draft_id} ({action_type_name}). "
-            "Trust score for this action type updated."
-        )
+        reply = f"✅ Approved draft #{draft_id} ({action_type_name})."
     else:
         reply = f"❌ Rejected draft #{draft_id} ({action_type_name}). Next time I'll try harder."
     return AckResult(success=True, reply_text=reply)

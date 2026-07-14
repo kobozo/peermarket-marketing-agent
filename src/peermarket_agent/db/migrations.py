@@ -132,6 +132,96 @@ _STEPS: list[str] = [
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
     "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_statuses JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS failure JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS approved_budget_cents INT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS ads_manager_url TEXT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+    """UPDATE publications
+       SET external_ids = jsonb_build_object('ad_id', external_id)
+           || COALESCE(external_ids, '{}'::JSONB)
+       WHERE external_id IS NOT NULL""",
+    """UPDATE publications AS keeper
+       SET external_id = (
+               SELECT source.external_id FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.external_id IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           state = (
+               SELECT source.state FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.state IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           external_ids = COALESCE((
+               SELECT jsonb_object_agg(item.key, item.value ORDER BY source.id)
+               FROM publications AS source
+               CROSS JOIN LATERAL jsonb_each(COALESCE(source.external_ids, '{}'::JSONB)) AS item
+               WHERE source.draft_id = keeper.draft_id
+           ), '{}'::JSONB),
+           external_statuses = COALESCE((
+               SELECT jsonb_object_agg(item.key, item.value ORDER BY source.id)
+               FROM publications AS source
+               CROSS JOIN LATERAL jsonb_each(
+                   COALESCE(source.external_statuses, '{}'::JSONB)
+               ) AS item
+               WHERE source.draft_id = keeper.draft_id
+           ), '{}'::JSONB),
+           failure = (
+               SELECT source.failure FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.failure IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           approved_budget_cents = (
+               SELECT source.approved_budget_cents FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id
+                   AND source.approved_budget_cents IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           ads_manager_url = (
+               SELECT source.ads_manager_url FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.ads_manager_url IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           performance = COALESCE((
+               SELECT jsonb_object_agg(item.key, item.value ORDER BY source.id)
+               FROM publications AS source
+               CROSS JOIN LATERAL jsonb_each(COALESCE(source.performance, '{}'::JSONB)) AS item
+               WHERE source.draft_id = keeper.draft_id
+           ), '{}'::JSONB),
+           updated_at = (
+               SELECT MAX(source.updated_at) FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id
+           )
+       WHERE keeper.draft_id IS NOT NULL
+         AND keeper.id = (
+             SELECT MIN(candidate.id) FROM publications AS candidate
+             WHERE candidate.draft_id = keeper.draft_id
+         )
+         AND EXISTS (
+             SELECT 1 FROM publications AS duplicate
+             WHERE duplicate.draft_id = keeper.draft_id AND duplicate.id <> keeper.id
+         )""",
+    """UPDATE creatives_archive AS creative
+       SET publication_id = survivor.id
+       FROM publications AS duplicate
+       JOIN publications AS survivor
+         ON survivor.id = (
+             SELECT MIN(candidate.id) FROM publications AS candidate
+             WHERE candidate.draft_id = duplicate.draft_id
+         )
+       WHERE creative.publication_id = duplicate.id
+         AND duplicate.draft_id IS NOT NULL
+         AND duplicate.id <> survivor.id""",
+    """DELETE FROM publications AS duplicate
+       WHERE duplicate.draft_id IS NOT NULL
+         AND duplicate.id <> (
+             SELECT MIN(survivor.id) FROM publications AS survivor
+             WHERE survivor.draft_id = duplicate.draft_id
+         )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_draft_id_unique "
+    "ON publications (draft_id) WHERE draft_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
