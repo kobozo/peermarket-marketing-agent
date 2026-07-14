@@ -446,3 +446,40 @@ async def test_activation_error_redacts_short_credentials_without_corrupting_wor
     assert caught.value.rollback_errors == {
         "ad": "app_secret=[REDACTED]; token=[REDACTED]; status stays readable"
     }
+
+
+async def test_activation_error_survives_rollback_setup_failure(monkeypatch):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(monkeypatch, statuses, fail_on="ad_set")
+    init_calls = 0
+
+    def fail_rollback_init(config):
+        nonlocal init_calls
+        init_calls += 1
+        if init_calls == 3:
+            raise RuntimeError(
+                f"rollback token={_FULL_CONFIG.system_user_token} could not initialize"
+            )
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", fail_rollback_init)
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(_FULL_CONFIG, ids)
+
+    error = caught.value
+    assert error.phase == "activate_ad_set"
+    assert error.resource_ids == ids
+    assert error.observed_statuses == statuses
+    assert error.rollback_errors == {
+        "setup": "rollback token=[REDACTED] could not initialize"
+    }
+    assert error.__cause__ is None
+    chained_traceback = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert _FULL_CONFIG.system_user_token not in chained_traceback

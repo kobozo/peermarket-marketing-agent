@@ -314,11 +314,22 @@ async def get_meta_ad_statuses(
 
 
 def _sync_pause(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
-    _ensure_enabled(config)
-    _init_api(config)
     errors: dict[str, str] = {}
-    for name, resource in reversed(_resources(ids)):
+    try:
+        _ensure_enabled(config)
+        _init_api(config)
+    except Exception as exc:
+        errors["setup"] = _redact_credentials(str(exc), config)
+        return errors
+
+    resource_specs = [
+        ("ad", Ad, "ad_id"),
+        ("ad_set", AdSet, "ad_set_id"),
+        ("campaign", Campaign, "campaign_id"),
+    ]
+    for name, resource_type, id_key in resource_specs:
         try:
+            resource = resource_type(ids[id_key])
             resource.api_update(params={"status": "PAUSED"})
         except Exception as exc:  # rollback must continue through every ancestor
             errors[name] = _redact_credentials(str(exc), config)

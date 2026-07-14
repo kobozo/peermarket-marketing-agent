@@ -64,3 +64,23 @@ None blocking. Pipeline-level reconciliation and activation invocation remain in
 - `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
 - `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `150 passed`
 - `git diff --check` → clean
+
+## Rollback setup follow-up
+
+### RED
+
+- Added a regression where ad-set activation fails, status observation succeeds, and rollback API initialization then raises a diagnostic containing the system-user token.
+- Focused tests failed because the rollback initialization exception escaped, replaced the required structured activation `MetaAdsError`, retained implicit exception context, and exposed the credential.
+
+### GREEN
+
+- Rollback credential/API initialization is now contained as a sanitized `rollback_errors["setup"]` entry, preserving the original activation phase, IDs, and observed statuses.
+- Resource construction and pause updates now execute independently in ad → ad set → campaign order, so a constructor or update failure is sanitized and does not prevent remaining rollback attempts.
+- The final structured activation error remains raised with suppressed chaining, so rollback setup diagnostics cannot reintroduce a credential-bearing cause or traceback.
+
+### Verification
+
+- `uv run pytest tests/test_meta_ads.py -q` → `17 passed`
+- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
+- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `151 passed`
+- `git diff --check` → clean
