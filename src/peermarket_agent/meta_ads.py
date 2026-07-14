@@ -161,7 +161,7 @@ def _sync_create(
                 AdSet.Field.name: f"{name} — adset",
                 AdSet.Field.campaign_id: campaign_id,
                 AdSet.Field.daily_budget: daily_budget_eur * 100,
-                AdSet.Field.billing_event: "LINK_CLICKS",
+                AdSet.Field.billing_event: "IMPRESSIONS",
                 AdSet.Field.optimization_goal: "LINK_CLICKS",
                 AdSet.Field.bid_strategy: "LOWEST_COST_WITHOUT_CAP",
                 AdSet.Field.targeting: _TARGETING_TEMPLATES[audience_profile_key],
