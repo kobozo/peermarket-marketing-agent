@@ -27,6 +27,7 @@ class MetaConfig:
     app_secret: str
     system_user_token: str
     ad_account_id: str  # 'act_<numeric>'
+    page_id: str
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ _TARGETING_TEMPLATES = {
         "age_min": 28,
         "age_max": 55,
         "geo_locations": {"countries": ["BE"]},
+        "targeting_automation": {"advantage_audience": 0},
         "locales": [5, 24],  # Dutch (5), French (24) — Meta locale IDs for Belgium
         "publisher_platforms": ["facebook", "instagram"],
         "facebook_positions": ["feed", "story"],
@@ -92,6 +94,7 @@ _TARGETING_TEMPLATES = {
         "age_min": 35,
         "age_max": 65,
         "geo_locations": {"countries": ["BE"]},
+        "targeting_automation": {"advantage_audience": 0},
         "locales": [5, 24],
         "publisher_platforms": ["facebook", "instagram"],
         "facebook_positions": ["feed"],
@@ -108,13 +111,15 @@ def _ensure_enabled(config: MetaConfig) -> None:
             "app_secret": config.app_secret,
             "system_user_token": config.system_user_token,
             "ad_account_id": config.ad_account_id,
+            "page_id": config.page_id,
         }.items()
         if not v
     ]
     if missing:
         raise MetaAdsDisabled(
             f"Meta connector disabled — missing credentials: {missing}. "
-            "Set META_APP_ID, META_APP_SECRET, META_SYSTEM_USER_TOKEN, META_AD_ACCOUNT_ID."
+            "Set META_APP_ID, META_APP_SECRET, META_SYSTEM_USER_TOKEN, "
+            "META_AD_ACCOUNT_ID, META_PAGE_ID."
         )
 
 
@@ -185,7 +190,7 @@ def _sync_create(
                 AdSet.Field.name: f"{name} — adset",
                 AdSet.Field.campaign_id: campaign_id,
                 AdSet.Field.daily_budget: daily_budget_eur * 100,
-                AdSet.Field.billing_event: "LINK_CLICKS",
+                AdSet.Field.billing_event: "IMPRESSIONS",
                 AdSet.Field.optimization_goal: "LINK_CLICKS",
                 AdSet.Field.bid_strategy: "LOWEST_COST_WITHOUT_CAP",
                 AdSet.Field.targeting: _TARGETING_TEMPLATES[audience_profile_key],
@@ -224,6 +229,7 @@ def _sync_create(
             params={
                 AdCreative.Field.name: f"{name} — creative",
                 AdCreative.Field.object_story_spec: {
+                    "page_id": config.page_id,
                     "link_data": link_data,
                 },
             },
@@ -257,9 +263,20 @@ def _sync_create(
             status="PAUSED",
         )
     except FacebookRequestError as e:
+        details = [e.api_error_message() or e.get_message()]
+        if e.api_error_code() is not None:
+            details.append(f"code={e.api_error_code()}")
+        if e.api_error_subcode() is not None:
+            details.append(f"subcode={e.api_error_subcode()}")
+        body = e.body()
+        api_error = body.get("error", {}) if isinstance(body, dict) else {}
+        if user_title := api_error.get("error_user_title"):
+            details.append(f"user_title={user_title}")
+        if user_message := api_error.get("error_user_msg"):
+            details.append(f"user_message={user_message}")
         rollback_errors = _sync_pause(config, resource_ids)
         raise MetaAdsError(
-            f"Meta API error: {_redact_credentials(e.api_error_message() or str(e), config)}",
+            f"Meta API error: {_redact_credentials('; '.join(details), config)}",
             phase=phase,
             resource_ids=resource_ids,
             rollback_errors=rollback_errors,

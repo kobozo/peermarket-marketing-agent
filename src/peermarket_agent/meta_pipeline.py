@@ -333,6 +333,7 @@ async def _process_approved_meta_draft(
             app_secret=settings.meta_app_secret,
             system_user_token=settings.meta_system_user_token,
             ad_account_id=settings.meta_ad_account_id,
+            page_id=settings.meta_page_id,
         )
         try:
             result = await create_meta_ad_paused(
@@ -398,6 +399,7 @@ async def _process_approved_meta_draft(
         app_secret=settings.meta_app_secret,
         system_user_token=settings.meta_system_user_token,
         ad_account_id=settings.meta_ad_account_id,
+        page_id=settings.meta_page_id,
     )
     try:
         activation = await activate_meta_ad(meta_config, ids)

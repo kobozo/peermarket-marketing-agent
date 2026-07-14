@@ -46,6 +46,7 @@ def _make_settings(**overrides) -> Settings:
         meta_system_user_token="mtok",
         meta_ad_account_id="act_999",
         meta_auto_activate=True,
+        meta_page_id="61592144690879",
         resend_api_key="re",
         backblaze_b2_key_id="kid",
         backblaze_b2_app_key="akey",
@@ -192,6 +193,7 @@ async def test_full_happy_path(monkeypatch, engine_with_meta_draft):
     assert create_kwargs["cta_type"] == "LEARN_MORE"
     assert create_kwargs["audience_profile_key"] == "declutterers"
     assert create_kwargs["daily_budget_eur"] == 10
+    assert create_kwargs["config"].page_id == "61592144690879"
     assert f"draft-{draft_id}" in create_kwargs["landing_page_url"]
     assert "utm_source=meta" in create_kwargs["landing_page_url"]
 
