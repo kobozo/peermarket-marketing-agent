@@ -47,6 +47,7 @@ async def test_handle_approve_updates_status_and_replies(engine_with_draft):
     assert result.success is True
     assert f"Approved draft #{draft_id}" in result.reply_text
     assert "tiktok_post_organic" in result.reply_text
+    assert "Trust score" not in result.reply_text
 
     async with engine.connect() as conn:
         row = (
