@@ -229,6 +229,13 @@ async def _process_approved_meta_draft(
     if draft_status != "approved":
         log.warning("meta_pipeline.draft_not_approved", draft_id=draft_id, status=draft_status)
         return
+    if not settings.meta_auto_activate:
+        log.warning("meta_pipeline.auto_activation_disabled", draft_id=draft_id)
+        await notifier.notify_founder(
+            f"⚠️ Refusing to push draft #{draft_id}: automatic Meta activation is disabled. "
+            "Set META_AUTO_ACTIVATE=true through the deployment workflow to enable it."
+        )
+        return
 
     metadata_budget_cents = int(metadata["suggested_daily_budget_eur"]) * 100
     publication = await get_meta_publication(engine, draft_id)

@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     meta_app_secret: str = ""
     meta_system_user_token: str = ""
     meta_ad_account_id: str = ""  # 'act_<numeric>'
+    meta_auto_activate: bool = False
 
     # Resend (email)
     resend_api_key: str

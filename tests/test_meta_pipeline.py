@@ -45,6 +45,7 @@ def _make_settings(**overrides) -> Settings:
         meta_app_secret="msec",
         meta_system_user_token="mtok",
         meta_ad_account_id="act_999",
+        meta_auto_activate=True,
         resend_api_key="re",
         backblaze_b2_key_id="kid",
         backblaze_b2_app_key="akey",
@@ -53,6 +54,34 @@ def _make_settings(**overrides) -> Settings:
     )
     base.update(overrides)
     return Settings(**base)
+
+
+async def test_pipeline_refuses_automatic_activation_when_disabled(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    screenshot_mock = AsyncMock()
+    create_mock = AsyncMock()
+    activate_mock = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.screenshot_url", screenshot_mock)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create_mock)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.activate_meta_ad", activate_mock)
+    notifier = AsyncMock()
+    notifier.notify_founder = AsyncMock(return_value=True)
+
+    await process_approved_meta_draft(
+        engine=engine,
+        draft_id=draft_id,
+        settings=_make_settings(meta_auto_activate=False),
+        notifier=notifier,
+    )
+
+    screenshot_mock.assert_not_awaited()
+    create_mock.assert_not_awaited()
+    activate_mock.assert_not_awaited()
+    assert await get_meta_publication(engine, draft_id) is None
+    notifier.notify_founder.assert_awaited_once()
+    assert "automatic Meta activation is disabled" in notifier.notify_founder.await_args.args[0]
 
 
 @pytest.fixture

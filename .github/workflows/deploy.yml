@@ -10,7 +10,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: agent_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AGENT_DB_URL: postgresql+asyncpg://postgres:test@localhost:5432/agent_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras
+      - run: uv run pytest -q
+
   deploy:
+    needs: test
     runs-on: [self-hosted, agent-peermarket]
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +80,7 @@ jobs:
           META_APP_SECRET: ${{ secrets.META_APP_SECRET }}
           META_SYSTEM_USER_TOKEN: ${{ secrets.META_SYSTEM_USER_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          META_AUTO_ACTIVATE: ${{ vars.META_AUTO_ACTIVATE || 'false' }}
         run: |
           # Write PEM to its own file (systemd can't handle multi-line env values)
           printf '%s' "$GITHUB_APP_PRIVATE_KEY_BODY" | sudo tee /etc/peermarket-agent/github-app.pem >/dev/null
@@ -84,6 +110,7 @@ jobs:
           META_APP_SECRET=$META_APP_SECRET
           META_SYSTEM_USER_TOKEN=$META_SYSTEM_USER_TOKEN
           META_AD_ACCOUNT_ID=$META_AD_ACCOUNT_ID
+          META_AUTO_ACTIVATE=$META_AUTO_ACTIVATE
           EOF
           sudo chown root:peermarket-agent /etc/peermarket-agent/secrets.env
           sudo chmod 0640 /etc/peermarket-agent/secrets.env
