@@ -75,9 +75,7 @@ async def test_migrations_are_idempotent(engine):
 
 
 async def test_migrations_reconcile_duplicate_draft_publications_before_unique_index(engine):
-    unique_index_step = next(
-        step for step in _STEPS if "idx_publications_draft_id_unique" in step
-    )
+    unique_index_step = next(step for step in _STEPS if "idx_publications_draft_id_unique" in step)
     async with engine.begin() as conn:
         for step in _STEPS:
             if step == unique_index_step:
@@ -106,7 +104,7 @@ async def test_migrations_reconcile_duplicate_draft_publications_before_unique_i
                     "INSERT INTO publications "
                     "(draft_id, channel, external_id, external_ids, performance) "
                     "VALUES (:draft_id, 'meta', 'legacy-ad-4', "
-                    "'{\"campaign_id\": \"campaign-1\"}', '{\"clicks\": 2}') "
+                    '\'{"campaign_id": "campaign-1"}\', \'{"clicks": 2}\') '
                     "RETURNING id"
                 ),
                 {"draft_id": draft_id},
@@ -119,8 +117,8 @@ async def test_migrations_reconcile_duplicate_draft_publications_before_unique_i
                     "(draft_id, channel, state, external_ids, external_statuses, "
                     "approved_budget_cents, ads_manager_url, performance) VALUES "
                     "(:draft_id, 'meta', 'created', "
-                    "'{\"ad_set_id\": \"ad-set-2\"}', "
-                    "'{\"campaign\": {\"configured_status\": \"PAUSED\"}}', "
+                    '\'{"ad_set_id": "ad-set-2"}\', '
+                    '\'{"campaign": {"configured_status": "PAUSED"}}\', '
                     "500, 'https://ads.example.test/campaign-1', "
                     "'{\"spend_cents\": 25}') RETURNING id"
                 ),
@@ -140,11 +138,15 @@ async def test_migrations_reconcile_duplicate_draft_publications_before_unique_i
 
     async with engine.connect() as conn:
         rows = (
-            await conn.execute(
-                text("SELECT * FROM publications WHERE draft_id = :draft_id"),
-                {"draft_id": draft_id},
+            (
+                await conn.execute(
+                    text("SELECT * FROM publications WHERE draft_id = :draft_id"),
+                    {"draft_id": draft_id},
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         creative_publication_id = (
             await conn.execute(text("SELECT publication_id FROM creatives_archive"))
         ).scalar_one()
@@ -164,9 +166,7 @@ async def test_migrations_reconcile_duplicate_draft_publications_before_unique_i
         "ad_set_id": "ad-set-2",
         "ad_id": "legacy-ad-4",
     }
-    assert rows[0]["external_statuses"] == {
-        "campaign": {"configured_status": "PAUSED"}
-    }
+    assert rows[0]["external_statuses"] == {"campaign": {"configured_status": "PAUSED"}}
     assert rows[0]["state"] == "created"
     assert rows[0]["approved_budget_cents"] == 500
     assert rows[0]["ads_manager_url"] == "https://ads.example.test/campaign-1"

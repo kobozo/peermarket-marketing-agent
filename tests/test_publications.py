@@ -123,10 +123,7 @@ async def test_upsert_populates_json_fields_on_legacy_publication(database_engin
     engine, draft_id = database_engine
     async with engine.begin() as connection:
         await connection.execute(
-            text(
-                "INSERT INTO publications (draft_id, channel) "
-                "VALUES (:draft_id, 'meta')"
-            ),
+            text("INSERT INTO publications (draft_id, channel) VALUES (:draft_id, 'meta')"),
             {"draft_id": draft_id},
         )
 
@@ -143,9 +140,7 @@ async def test_upsert_populates_json_fields_on_legacy_publication(database_engin
     stored = await get_meta_publication(engine, draft_id)
     assert stored is not None
     assert stored.external_ids == {"campaign_id": "campaign-1"}
-    assert stored.external_statuses == {
-        "campaign": {"configured_status": "PAUSED"}
-    }
+    assert stored.external_statuses == {"campaign": {"configured_status": "PAUSED"}}
 
 
 @pytest.mark.asyncio

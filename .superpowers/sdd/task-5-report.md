@@ -37,3 +37,20 @@ unrelated files; all Python files changed by Task 5 satisfy the formatter.
 
 No repository variable was changed, no branch was pushed, and no deployment or
 production reconciliation was attempted.
+
+## Review Blocker Follow-up
+
+The three previously reported formatter failures were resolved by running Ruff
+format only on `src/peermarket_agent/publications.py`,
+`tests/test_migrations.py`, and `tests/test_publications.py`. Diff inspection
+confirmed mechanical wrapping, method-chain layout, and equivalent string quote
+changes only; behavior and SQL content are unchanged.
+
+Fresh post-format verification:
+
+- `uv run ruff format --check src tests`: `70 files already formatted`.
+- `uv run ruff check src tests`: passed.
+- Full suite with the local disposable pgvector DSN: `188 passed in 13.84s`.
+- Both workflow YAML files parsed successfully and deployment contract
+  assertions passed.
+- `git diff --check`: passed.

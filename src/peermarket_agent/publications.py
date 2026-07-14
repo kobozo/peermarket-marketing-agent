@@ -21,25 +21,27 @@ class MetaPublication:
     updated_at: datetime | None = field(default=None, compare=False)
 
 
-async def get_meta_publication(
-    engine: AsyncEngine, draft_id: int
-) -> MetaPublication | None:
+async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublication | None:
     """Return the publication recorded for a draft, if one exists."""
     async with engine.connect() as connection:
         row = (
-            await connection.execute(
-                text(
-                    "SELECT draft_id, state, "
-                    "CASE WHEN external_id IS NOT NULL "
-                    "THEN jsonb_build_object('ad_id', external_id) "
-                    "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB) "
-                    "AS external_ids, external_statuses, failure, "
-                    "approved_budget_cents, ads_manager_url, published_at AS created_at, "
-                    "updated_at FROM publications WHERE draft_id = :draft_id"
-                ),
-                {"draft_id": draft_id},
+            (
+                await connection.execute(
+                    text(
+                        "SELECT draft_id, state, "
+                        "CASE WHEN external_id IS NOT NULL "
+                        "THEN jsonb_build_object('ad_id', external_id) "
+                        "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB) "
+                        "AS external_ids, external_statuses, failure, "
+                        "approved_budget_cents, ads_manager_url, published_at AS created_at, "
+                        "updated_at FROM publications WHERE draft_id = :draft_id"
+                    ),
+                    {"draft_id": draft_id},
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
     if row is None:
         return None
     values = dict(row)
@@ -48,9 +50,7 @@ async def get_meta_publication(
     return MetaPublication(**values)
 
 
-async def upsert_meta_publication(
-    engine: AsyncEngine, publication: MetaPublication
-) -> None:
+async def upsert_meta_publication(engine: AsyncEngine, publication: MetaPublication) -> None:
     """Persist progress while merging identifiers retained from earlier attempts."""
     async with engine.begin() as connection:
         await connection.execute(
@@ -78,16 +78,16 @@ async def upsert_meta_publication(
                 "state": publication.state,
                 "external_ids": json.dumps(publication.external_ids or {}),
                 "external_statuses": json.dumps(publication.external_statuses or {}),
-                "failure": json.dumps(publication.failure) if publication.failure is not None else None,
+                "failure": json.dumps(publication.failure)
+                if publication.failure is not None
+                else None,
                 "approved_budget_cents": publication.approved_budget_cents,
                 "ads_manager_url": publication.ads_manager_url,
             },
         )
 
 
-async def mark_meta_publication_active(
-    engine: AsyncEngine, draft_id: int, statuses: dict
-) -> None:
+async def mark_meta_publication_active(engine: AsyncEngine, draft_id: int, statuses: dict) -> None:
     """Mark a reconciled Meta hierarchy active and clear any prior failure."""
     async with engine.begin() as connection:
         await connection.execute(
