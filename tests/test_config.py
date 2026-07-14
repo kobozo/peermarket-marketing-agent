@@ -42,12 +42,14 @@ def test_settings_loaded_from_env(monkeypatch):
     monkeypatch.setenv("BACKBLAZE_B2_APP_KEY", "akey")
     monkeypatch.setenv("BACKBLAZE_B2_BUCKET", "peermarket-agent-backups")
     monkeypatch.setenv("BACKBLAZE_B2_ENDPOINT", "s3.eu-central-003.backblazeb2.com")
+    monkeypatch.setenv("META_PAGE_ID", "61592144690879")
     get_settings.cache_clear()
     s = get_settings()
     assert s.anthropic_api_key == "sk-ant-test"
     assert s.slack_bot_token == "xoxb-test"
     assert s.github_app_id == 12345
     assert s.github_app_installation_id == 67890
+    assert s.meta_page_id == "61592144690879"
     assert s.timezone == "Europe/Brussels"
 
 
