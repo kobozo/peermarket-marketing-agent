@@ -17,6 +17,7 @@ class MetaPublication:
     failure: dict | None = None
     approved_budget_cents: int | None = None
     ads_manager_url: str | None = None
+    replacement_history: list[dict] = field(default_factory=list)
     created_at: datetime | None = field(default=None, compare=False)
     updated_at: datetime | None = field(default=None, compare=False)
 
@@ -33,7 +34,7 @@ async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublic
                         "THEN jsonb_build_object('ad_id', external_id) "
                         "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB) "
                         "AS external_ids, external_statuses, failure, "
-                        "approved_budget_cents, ads_manager_url, published_at AS created_at, "
+                        "approved_budget_cents, ads_manager_url, replacement_history, published_at AS created_at, "
                         "updated_at FROM publications WHERE draft_id = :draft_id"
                     ),
                     {"draft_id": draft_id},
@@ -47,6 +48,7 @@ async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublic
     values = dict(row)
     values["external_ids"] = values["external_ids"] or {}
     values["external_statuses"] = values["external_statuses"] or {}
+    values["replacement_history"] = values.get("replacement_history") or []
     return MetaPublication(**values)
 
 
@@ -101,4 +103,54 @@ async def mark_meta_publication_active(engine: AsyncEngine, draft_id: int, statu
                 "draft_id": draft_id,
                 "external_statuses": json.dumps(statuses or {}),
             },
+        )
+
+
+async def begin_meta_terminal_replacement(
+    engine: AsyncEngine,
+    draft_id: int,
+    expected_ids: dict[str, str],
+    terminal_statuses: dict[str, dict[str, str]],
+) -> None:
+    """Archive the exact current hierarchy and clear it in one guarded transition."""
+    history_entry = {
+        "old_ids": expected_ids,
+        "terminal_statuses": terminal_statuses,
+        "replacement_ids": {},
+        "state": "creating",
+    }
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(
+                "UPDATE publications SET external_id = NULL, external_ids = '{}'::JSONB, "
+                "external_statuses = '{}'::JSONB, state = 'creating', failure = NULL, "
+                "ads_manager_url = NULL, replacement_history = "
+                "COALESCE(replacement_history, '[]'::JSONB) || CAST(:entry AS JSONB), "
+                "updated_at = NOW() WHERE draft_id = :draft_id AND "
+                "(CASE WHEN external_id IS NOT NULL THEN jsonb_build_object('ad_id', external_id) "
+                "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB)) = "
+                "CAST(:expected_ids AS JSONB)"
+            ),
+            {
+                "draft_id": draft_id,
+                "expected_ids": json.dumps(expected_ids),
+                "entry": json.dumps([history_entry]),
+            },
+        )
+        if result.rowcount != 1:
+            raise ValueError("refusing replacement: stored Meta IDs changed")
+
+
+async def record_meta_replacement_result(engine: AsyncEngine, draft_id: int) -> None:
+    """Snapshot the replacement's current reconciliation state in durable history."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE publications SET replacement_history = "
+                "COALESCE(replacement_history, '[]'::JSONB) || jsonb_build_array("
+                "jsonb_build_object('replacement_ids', COALESCE(external_ids, '{}'::JSONB), "
+                "'state', state, 'failure', failure)), updated_at = NOW() "
+                "WHERE draft_id = :draft_id"
+            ),
+            {"draft_id": draft_id},
         )

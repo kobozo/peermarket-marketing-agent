@@ -78,6 +78,16 @@ def test_reconcile_cli_requires_every_resource_id():
     assert "Missing option '--adset-id'" in result.output
 
 
+def test_terminal_replacement_cli_is_explicit_and_requires_every_resource_id():
+    result = CliRunner().invoke(
+        cli,
+        ["replace-terminal-draft", "--draft-id", "156", "--campaign-id", "campaign-1"],
+    )
+    assert result.exit_code == 2
+    assert "Missing option '--adset-id'" in result.output
+    assert "--budget" not in CliRunner().invoke(cli, ["replace-terminal-draft", "--help"]).output
+
+
 @pytest.mark.parametrize("option", ["--campaign-id", "--adset-id", "--creative-id", "--ad-id"])
 @pytest.mark.parametrize("value", ["", "   "])
 def test_reconcile_cli_rejects_empty_resource_ids(option, value):

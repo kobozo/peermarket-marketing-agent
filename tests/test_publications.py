@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.publications import (
     MetaPublication,
+    begin_meta_terminal_replacement,
     get_meta_publication,
     mark_meta_publication_active,
     upsert_meta_publication,
@@ -224,3 +225,45 @@ async def test_mark_active_persists_statuses_and_clears_failure():
     assert "failure = NULL" in sql
     assert params["draft_id"] == 156
     assert params["external_statuses"] == '{"campaign": {"configured_status": "ACTIVE"}}'
+
+
+async def test_terminal_replacement_atomically_archives_and_clears_current_ids(database_engine):
+    engine, draft_id = database_engine
+    ids = {"campaign_id": "c-old", "ad_set_id": "s-old", "creative_id": "cr-old", "ad_id": "a-old"}
+    statuses = {
+        "campaign": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+        "ad_set": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+        "ad": {"status": "DELETED", "effective_status": "DELETED"},
+    }
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+
+    await begin_meta_terminal_replacement(engine, draft_id, ids, statuses)
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored is not None
+    assert stored.external_ids == {}
+    assert stored.approved_budget_cents == 1000
+    assert stored.replacement_history == [
+        {"old_ids": ids, "terminal_statuses": statuses, "replacement_ids": {}, "state": "creating"}
+    ]
+
+
+async def test_terminal_replacement_requires_exact_current_ids_without_write(database_engine):
+    engine, draft_id = database_engine
+    ids = {"campaign_id": "c-old", "ad_set_id": "s-old", "creative_id": "cr-old", "ad_id": "a-old"}
+    await upsert_meta_publication(
+        engine, MetaPublication(draft_id=draft_id, state="failed", external_ids=ids)
+    )
+
+    with pytest.raises(ValueError, match="stored Meta IDs changed"):
+        await begin_meta_terminal_replacement(engine, draft_id, {**ids, "ad_id": "wrong"}, {})
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored is not None
+    assert stored.external_ids == ids
+    assert stored.replacement_history == []

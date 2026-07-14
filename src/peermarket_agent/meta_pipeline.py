@@ -1,6 +1,7 @@
 """Approved Meta draft to durable, activated publication."""
 
 import json
+from dataclasses import dataclass
 
 import structlog
 from sqlalchemy import text
@@ -13,6 +14,7 @@ from peermarket_agent.meta_ads import (
     MetaConfig,
     activate_meta_ad,
     create_meta_ad_paused,
+    get_meta_ad_statuses,
     pause_meta_ad,
 )
 from peermarket_agent.nano_banana import (
@@ -22,7 +24,9 @@ from peermarket_agent.nano_banana import (
 )
 from peermarket_agent.publications import (
     MetaPublication,
+    begin_meta_terminal_replacement,
     get_meta_publication,
+    record_meta_replacement_result,
     upsert_meta_publication,
 )
 from peermarket_agent.screenshots import ScreenshotError, screenshot_url
@@ -40,6 +44,102 @@ _BRAND_FRAME_PROMPT = (
 )
 _LANDING_PAGE = "https://peermarket.eu/"
 _META_RECONCILIATION_ID_KEYS = {"campaign_id", "ad_set_id", "creative_id", "ad_id"}
+_TERMINAL_META_STATUSES = {"ARCHIVED", "DELETED"}
+
+
+@dataclass(frozen=True)
+class TerminalReplacementResult:
+    old_ids: dict[str, str]
+    terminal_statuses: dict[str, dict[str, str]]
+    current_ids: dict[str, str]
+    state: str
+    failure: dict | None
+
+
+def _meta_config(settings: Settings) -> MetaConfig:
+    return MetaConfig(
+        app_id=settings.meta_app_id,
+        app_secret=settings.meta_app_secret,
+        system_user_token=settings.meta_system_user_token,
+        ad_account_id=settings.meta_ad_account_id,
+        page_id=settings.meta_page_id,
+    )
+
+
+async def replace_terminal_meta_draft(
+    *,
+    engine: AsyncEngine,
+    draft_id: int,
+    settings: Settings,
+    notifier: SlackNotifier,
+    expected_ids: dict[str, str],
+) -> TerminalReplacementResult:
+    """Explicitly replace one exact, entirely terminal Meta hierarchy."""
+    valid_ids = set(expected_ids) == _META_RECONCILIATION_ID_KEYS and all(
+        isinstance(value, str) and value and value == value.strip()
+        for value in expected_ids.values()
+    )
+    if not valid_ids:
+        raise ValueError("replacement IDs must contain exact non-empty current Meta IDs")
+    async with engine.begin() as lock_connection:
+        await lock_connection.execute(
+            text(
+                "SELECT pg_advisory_xact_lock("
+                "hashtext('peermarket_meta_pipeline'), hashint8(:draft_id))"
+            ),
+            {"draft_id": draft_id},
+        )
+        draft = await _fetch_meta_draft(engine, draft_id)
+        publication = await get_meta_publication(engine, draft_id)
+        if draft is None or draft[0] != "approved":
+            raise ValueError(f"refusing replacement: draft #{draft_id} is not approved")
+        if publication is None or publication.external_ids != expected_ids:
+            raise ValueError(
+                "refusing replacement: supplied IDs are not the exact stored current IDs"
+            )
+        if publication.approved_budget_cents is None:
+            raise ValueError("refusing replacement: approved budget is not frozen")
+        try:
+            statuses = await get_meta_ad_statuses(_meta_config(settings), expected_ids)
+        except (MetaAdsDisabled, MetaAdsError) as error:
+            raise ValueError(
+                f"refusing replacement: unable to read every Meta status: {error}"
+            ) from None
+        except Exception:
+            raise ValueError("refusing replacement: unable to read every Meta status") from None
+        terminal = set(statuses) == {"campaign", "ad_set", "ad"} and all(
+            set(resource_status) >= {"status", "effective_status"}
+            and resource_status["status"] in _TERMINAL_META_STATUSES
+            and resource_status["effective_status"] in _TERMINAL_META_STATUSES
+            for resource_status in statuses.values()
+        )
+        if not terminal:
+            raise ValueError(
+                "refusing replacement: stored Meta hierarchy is not entirely terminal "
+                f"(ARCHIVED/DELETED): {json.dumps(statuses, sort_keys=True)}"
+            )
+        await begin_meta_terminal_replacement(engine, draft_id, expected_ids, statuses)
+        await _process_approved_meta_draft(
+            engine=engine, draft_id=draft_id, settings=settings, notifier=notifier
+        )
+        await record_meta_replacement_result(engine, draft_id)
+        current = await get_meta_publication(engine, draft_id)
+        if current is None:
+            raise RuntimeError("replacement publication disappeared")
+        result = TerminalReplacementResult(
+            old_ids=expected_ids,
+            terminal_statuses=statuses,
+            current_ids=current.external_ids,
+            state=current.state or "unknown",
+            failure=current.failure,
+        )
+        await notifier.notify_founder(
+            f"Meta terminal replacement for draft #{draft_id}: archived hierarchy "
+            f"{json.dumps(expected_ids, sort_keys=True)}; current replacement "
+            f"{json.dumps(current.external_ids, sort_keys=True)}; state={result.state}; "
+            f"failure={json.dumps(result.failure, sort_keys=True) if result.failure else 'none'}."
+        )
+        return result
 
 
 async def _fetch_meta_draft(engine: AsyncEngine, draft_id: int) -> tuple[str, dict] | None:
@@ -328,13 +428,7 @@ async def _process_approved_meta_draft(
                 "Falling back to raw screenshot, continuing with Meta push."
             )
 
-        meta_config = MetaConfig(
-            app_id=settings.meta_app_id,
-            app_secret=settings.meta_app_secret,
-            system_user_token=settings.meta_system_user_token,
-            ad_account_id=settings.meta_ad_account_id,
-            page_id=settings.meta_page_id,
-        )
+        meta_config = _meta_config(settings)
         try:
             result = await create_meta_ad_paused(
                 config=meta_config,
