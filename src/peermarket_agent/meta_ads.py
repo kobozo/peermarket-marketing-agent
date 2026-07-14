@@ -61,6 +61,7 @@ _TARGETING_TEMPLATES = {
         "age_min": 28,
         "age_max": 55,
         "geo_locations": {"countries": ["BE"]},
+        "targeting_automation": {"advantage_audience": 0},
         "locales": [5, 24],  # Dutch (5), French (24) — Meta locale IDs for Belgium
         "publisher_platforms": ["facebook", "instagram"],
         "facebook_positions": ["feed", "story"],
@@ -70,6 +71,7 @@ _TARGETING_TEMPLATES = {
         "age_min": 35,
         "age_max": 65,
         "geo_locations": {"countries": ["BE"]},
+        "targeting_automation": {"advantage_audience": 0},
         "locales": [5, 24],
         "publisher_platforms": ["facebook", "instagram"],
         "facebook_positions": ["feed"],
