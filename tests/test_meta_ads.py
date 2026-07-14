@@ -272,6 +272,27 @@ async def test_create_paused_ad_uses_supported_billing_event(monkeypatch):
     assert params["optimization_goal"] == "LINK_CLICKS"
 
 
+@pytest.mark.parametrize("audience_profile", ["declutterers", "trust_conscious_locals"])
+async def test_create_paused_ad_explicitly_disables_advantage_audience(
+    monkeypatch, audience_profile
+):
+    fake = _patch_meta_sdk(monkeypatch)
+    await create_paused_ad(
+        config=_FULL_CONFIG,
+        name="x",
+        primary_text="x" * 150,
+        headline="x",
+        description="x",
+        cta_type="LEARN_MORE",
+        landing_page_url="https://x",
+        image_bytes=None,
+        audience_profile_key=audience_profile,
+        daily_budget_eur=5,
+    )
+    targeting = fake.create_ad_set.call_args.kwargs["params"]["targeting"]
+    assert targeting["targeting_automation"] == {"advantage_audience": 0}
+
+
 async def test_create_paused_ad_raises_meta_ads_error_on_api_failure(monkeypatch):
     _patch_meta_sdk(monkeypatch, raise_on="campaign")
     with pytest.raises(MetaAdsError, match="Meta API error"):
