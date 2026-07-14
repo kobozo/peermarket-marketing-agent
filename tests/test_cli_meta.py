@@ -78,6 +78,31 @@ def test_reconcile_cli_requires_every_resource_id():
     assert "Missing option '--adset-id'" in result.output
 
 
+@pytest.mark.parametrize("option", ["--campaign-id", "--adset-id", "--creative-id", "--ad-id"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_reconcile_cli_rejects_empty_resource_ids(option, value):
+    args = [
+        "reconcile-draft",
+        "--draft-id",
+        "156",
+        "--campaign-id",
+        "campaign-1",
+        "--adset-id",
+        "adset-1",
+        "--creative-id",
+        "creative-1",
+        "--ad-id",
+        "ad-1",
+    ]
+    args[args.index(option) + 1] = value
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 2
+    assert f"Invalid value for '{option}'" in result.output
+    assert "must be a non-empty ID" in result.output
+
+
 async def test_dry_run_displays_state_and_status_without_writing_or_dispatching(monkeypatch):
     publication = MetaPublication(
         draft_id=42,
@@ -245,3 +270,34 @@ async def test_published_draft_with_incomplete_ids_is_not_downgraded(monkeypatch
         )
 
     assert await get_meta_publication(engine, draft_id) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_ids",
+    [
+        {key: value for key, value in IDS.items() if key != "creative_id"},
+        {**IDS, "pixel_id": "pixel-1"},
+        {**IDS, "creative_id": ""},
+        {**IDS, "creative_id": "   "},
+        {**IDS, "creative_id": 123},
+    ],
+)
+async def test_locked_pipeline_rejects_malformed_reconciliation_ids_without_writes(
+    monkeypatch, disposable_draft, invalid_ids
+):
+    engine, draft_id = disposable_draft
+    internal = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline._process_approved_meta_draft", internal)
+
+    with pytest.raises(ValueError, match="reconciliation IDs must contain exactly"):
+        await reconcile_draft(
+            engine=engine,
+            draft_id=draft_id,
+            supplied_ids=invalid_ids,
+            settings=object(),
+            notifier=object(),
+            dry_run=False,
+        )
+
+    assert await get_meta_publication(engine, draft_id) is None
+    internal.assert_not_awaited()

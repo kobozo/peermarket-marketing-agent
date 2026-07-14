@@ -15,6 +15,14 @@ from peermarket_agent.publications import (
 from peermarket_agent.slack_notifier import SlackNotifier
 
 
+def _non_empty_id(_context: click.Context, parameter: click.Parameter, value: str | None) -> str:
+    if value is None or not value.strip():
+        raise click.BadParameter("must be a non-empty ID", param=parameter)
+    if value != value.strip():
+        raise click.BadParameter("must not have leading or trailing whitespace", param=parameter)
+    return value
+
+
 async def reconcile_draft(
     *,
     engine: AsyncEngine,
@@ -61,10 +69,10 @@ def cli() -> None:
 
 @cli.command("reconcile-draft")
 @click.option("--draft-id", required=True, type=click.IntRange(min=1))
-@click.option("--campaign-id", required=True, type=str)
-@click.option("--adset-id", required=True, type=str)
-@click.option("--creative-id", required=True, type=str)
-@click.option("--ad-id", required=True, type=str)
+@click.option("--campaign-id", required=True, type=str, callback=_non_empty_id)
+@click.option("--adset-id", required=True, type=str, callback=_non_empty_id)
+@click.option("--creative-id", required=True, type=str, callback=_non_empty_id)
+@click.option("--ad-id", required=True, type=str, callback=_non_empty_id)
 @click.option("--dry-run", is_flag=True, help="Validate and display stored state only.")
 def reconcile_draft_command(
     draft_id: int,

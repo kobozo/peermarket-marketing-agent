@@ -38,3 +38,16 @@
   teardown. It never resets the shared `public` schema.
 - A run without `AGENT_DB_URL` cannot execute the repository's DB-backed full
   suite; this is an environment prerequisite, not hidden by the task tests.
+
+## Important-finding follow-up
+
+- The production entrypoint now validates the reconciliation mapping while
+  holding its per-draft advisory lock and before any publication read/write.
+- The mapping must contain exactly `campaign_id`, `ad_set_id`, `creative_id`,
+  and `ad_id`; every value must be a non-empty, whitespace-trimmed string.
+- Missing, extra, blank, whitespace-padded, and non-string values are rejected
+  without publication changes or Meta processing.
+- Click validates every explicit resource-ID option before settings/database
+  setup and returns a clear usage error for empty or whitespace values.
+- Follow-up RED: 13 failures covered all four empty CLI options plus malformed
+  direct-wrapper mappings. Follow-up GREEN focused run: `35 passed`.

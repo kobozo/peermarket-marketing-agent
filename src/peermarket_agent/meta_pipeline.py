@@ -39,6 +39,7 @@ _BRAND_FRAME_PROMPT = (
     "synthesize people, products, or transactions."
 )
 _LANDING_PAGE = "https://peermarket.eu/"
+_META_RECONCILIATION_ID_KEYS = {"campaign_id", "ad_set_id", "creative_id", "ad_id"}
 
 
 async def _fetch_meta_draft(engine: AsyncEngine, draft_id: int) -> tuple[str, dict] | None:
@@ -150,6 +151,15 @@ async def process_approved_meta_draft(
             {"draft_id": draft_id},
         )
         if reconciliation_ids is not None:
+            valid_mapping = set(reconciliation_ids) == _META_RECONCILIATION_ID_KEYS and all(
+                isinstance(value, str) and bool(value.strip()) and value == value.strip()
+                for value in reconciliation_ids.values()
+            )
+            if not valid_mapping:
+                raise ValueError(
+                    "reconciliation IDs must contain exactly campaign_id, ad_set_id, "
+                    "creative_id, and ad_id with non-empty stripped string values"
+                )
             draft = await _fetch_meta_draft(engine, draft_id)
             if draft is None:
                 raise ValueError(
