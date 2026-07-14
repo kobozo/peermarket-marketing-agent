@@ -228,6 +228,38 @@ async def test_create_paused_ad_raises_meta_ads_error_on_api_failure(monkeypatch
         )
 
 
+async def test_create_failure_retains_created_ids_and_rolls_back(monkeypatch):
+    _patch_meta_sdk(monkeypatch, raise_on="ad")
+    pause_mock = MagicMock(return_value={})
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_pause", pause_mock)
+
+    with pytest.raises(MetaAdsError) as caught:
+        await create_meta_ad_paused(
+            config=_FULL_CONFIG,
+            name="x",
+            primary_text="x" * 150,
+            headline="x",
+            description="x",
+            cta_type="LEARN_MORE",
+            landing_page_url="https://x",
+            image_bytes=None,
+            audience_profile_key="declutterers",
+            daily_budget_eur=5,
+        )
+
+    assert caught.value.phase == "create_ad"
+    assert caught.value.resource_ids == {
+        "campaign_id": "c1",
+        "ad_set_id": "as1",
+        "creative_id": "cr1",
+    }
+    assert caught.value.rollback_errors == {}
+    pause_mock.assert_called_once_with(
+        _FULL_CONFIG,
+        {"campaign_id": "c1", "ad_set_id": "as1", "creative_id": "cr1"},
+    )
+
+
 async def test_create_paused_ad_all_resources_status_paused(monkeypatch):
     fake = _patch_meta_sdk(monkeypatch)
     await create_meta_ad_paused(
@@ -272,8 +304,7 @@ def _patch_resources(
             calls.append(("update", self.resource_type, self.resource_id, status))
             if status == "ACTIVE" and fail_on == self.resource_type:
                 raise RuntimeError(
-                    activation_error_message
-                    or f"failed to activate {self.resource_type}"
+                    activation_error_message or f"failed to activate {self.resource_type}"
                 )
             if status == "PAUSED" and rollback_fail_on == self.resource_type:
                 raise RuntimeError(
@@ -475,21 +506,15 @@ async def test_activation_error_survives_rollback_setup_failure(monkeypatch):
     assert error.phase == "activate_ad_set"
     assert error.resource_ids == ids
     assert error.observed_statuses == statuses
-    assert error.rollback_errors == {
-        "setup": "rollback token=[REDACTED] could not initialize"
-    }
+    assert error.rollback_errors == {"setup": "rollback token=[REDACTED] could not initialize"}
     assert error.__cause__ is None
-    chained_traceback = "".join(
-        traceback.format_exception(type(error), error, error.__traceback__)
-    )
+    chained_traceback = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     assert _FULL_CONFIG.system_user_token not in chained_traceback
 
 
 async def test_initial_activation_setup_failure_is_structured_and_sanitized(monkeypatch):
     def fail_init(config):
-        raise RuntimeError(
-            f"initialization token={_FULL_CONFIG.system_user_token} unavailable"
-        )
+        raise RuntimeError(f"initialization token={_FULL_CONFIG.system_user_token} unavailable")
 
     monkeypatch.setattr("peermarket_agent.meta_ads._init_api", fail_init)
     ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
@@ -501,12 +526,8 @@ async def test_initial_activation_setup_failure_is_structured_and_sanitized(monk
     assert error.phase == "setup"
     assert error.resource_ids == ids
     assert error.observed_statuses == {}
-    assert error.rollback_errors == {
-        "setup": "initialization token=[REDACTED] unavailable"
-    }
+    assert error.rollback_errors == {"setup": "initialization token=[REDACTED] unavailable"}
     assert error.__cause__ is None
     assert error.__context__ is None
-    chained_traceback = "".join(
-        traceback.format_exception(type(error), error, error.__traceback__)
-    )
+    chained_traceback = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     assert _FULL_CONFIG.system_user_token not in chained_traceback

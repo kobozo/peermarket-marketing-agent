@@ -17,7 +17,7 @@ from peermarket_agent.meta_ads import (
     MetaAdsDisabled,
     MetaAdsError,
 )
-from peermarket_agent.meta_pipeline import process_approved_meta_draft
+from peermarket_agent.meta_pipeline import _mark_published, process_approved_meta_draft
 from peermarket_agent.nano_banana import ImageEditDisabled
 from peermarket_agent.publications import (
     MetaPublication,
@@ -229,6 +229,75 @@ async def test_existing_publication_reconciles_without_creating_resources(
     assert activate_mock.await_args.args[1] == ids
 
 
+async def test_retry_uses_frozen_approved_budget(monkeypatch, engine_with_meta_draft):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id,
+            state="created",
+            external_ids=ids,
+            approved_budget_cents=1000,
+        ),
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE drafts SET metadata = jsonb_set(metadata, "
+                "'{suggested_daily_budget_eur}', '99'::jsonb) WHERE id = :id"
+            ),
+            {"id": draft_id},
+        )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.activate_meta_ad",
+        AsyncMock(
+            return_value=MetaActivationResult(
+                campaign={"status": "ACTIVE", "effective_status": "ACTIVE"},
+                ad_set={"status": "ACTIVE", "effective_status": "ACTIVE"},
+                ad={"status": "ACTIVE", "effective_status": "ACTIVE"},
+            )
+        ),
+    )
+    notifier = AsyncMock()
+
+    await process_approved_meta_draft(
+        engine=engine, draft_id=draft_id, settings=_make_settings(), notifier=notifier
+    )
+
+    assert "Budget: €10/day" in notifier.notify_founder.await_args.args[0]
+    assert "€99" not in notifier.notify_founder.await_args.args[0]
+
+
+async def test_legacy_publication_freezes_budget_before_activation(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+    await upsert_meta_publication(
+        engine, MetaPublication(draft_id=draft_id, state="created", external_ids=ids)
+    )
+
+    async def activate_after_budget_is_frozen(config, resource_ids):
+        stored = await get_meta_publication(engine, draft_id)
+        assert stored is not None
+        assert stored.approved_budget_cents == 1000
+        return MetaActivationResult(
+            campaign={"status": "ACTIVE", "effective_status": "ACTIVE"},
+            ad_set={"status": "ACTIVE", "effective_status": "ACTIVE"},
+            ad={"status": "ACTIVE", "effective_status": "ACTIVE"},
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.activate_meta_ad",
+        AsyncMock(side_effect=activate_after_budget_is_frozen),
+    )
+
+    await process_approved_meta_draft(
+        engine=engine, draft_id=draft_id, settings=_make_settings(), notifier=AsyncMock()
+    )
+
+
 async def test_activation_failure_retains_ids_diagnostics_and_approved_status(
     monkeypatch, engine_with_meta_draft
 ):
@@ -338,6 +407,8 @@ async def test_finalization_failure_retains_reconciliation_state(
         "peermarket_agent.meta_pipeline._mark_published",
         AsyncMock(side_effect=RuntimeError("database unavailable")),
     )
+    pause_mock = AsyncMock(return_value={"ad": "pause rejected"})
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.pause_meta_ad", pause_mock, raising=False)
     notifier = AsyncMock()
 
     await process_approved_meta_draft(
@@ -348,7 +419,79 @@ async def test_finalization_failure_retains_reconciliation_state(
     assert stored is not None
     assert stored.external_ids == ids
     assert stored.failure["phase"] == "finalize"
+    assert stored.failure["rollback_complete"] is False
+    assert stored.failure["rollback_errors"] == {"ad": "pause rejected"}
+    pause_mock.assert_awaited_once()
+    assert pause_mock.await_args.args[1] == ids
     notifier.notify_founder.assert_awaited_once()
+    assert "Rollback incomplete" in notifier.notify_founder.await_args.args[0]
+
+
+async def test_mark_published_rejects_non_approved_draft(engine_with_meta_draft):
+    engine, draft_id, _ = engine_with_meta_draft
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(draft_id=draft_id, state="created", external_ids={"ad_id": "ad1"}),
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE drafts SET status = 'rejected' WHERE id = :id"), {"id": draft_id}
+        )
+
+    with pytest.raises(RuntimeError, match="approved"):
+        await _mark_published(engine, draft_id, {"ad": {"status": "ACTIVE"}})
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored is not None
+    assert stored.state == "created"
+
+
+async def test_partial_creation_failure_persists_ids_and_retry_refuses_duplicate(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.screenshot_url", AsyncMock(return_value=b"raw")
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.edit_image", AsyncMock(return_value=b"framed")
+    )
+    create_mock = AsyncMock(
+        side_effect=MetaAdsError(
+            "creation failed",
+            phase="create_ad",
+            resource_ids={
+                "campaign_id": "c1",
+                "ad_set_id": "as1",
+                "creative_id": "cr1",
+            },
+            rollback_errors={"ad_set": "pause rejected"},
+        )
+    )
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create_mock)
+    notifier = AsyncMock()
+
+    await process_approved_meta_draft(
+        engine=engine, draft_id=draft_id, settings=_make_settings(), notifier=notifier
+    )
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored is not None
+    assert stored.external_ids == {
+        "campaign_id": "c1",
+        "ad_set_id": "as1",
+        "creative_id": "cr1",
+    }
+
+    create_mock.reset_mock()
+    await process_approved_meta_draft(
+        engine=engine, draft_id=draft_id, settings=_make_settings(), notifier=notifier
+    )
+    create_mock.assert_not_awaited()
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored is not None
+    assert stored.failure["rollback_complete"] is False
+    assert stored.failure["rollback_errors"] == {"ad_set": "pause rejected"}
+    assert "Rollback complete: no" in notifier.notify_founder.await_args.args[0]
 
 
 async def test_nano_banana_disabled_falls_back_to_raw_screenshot(

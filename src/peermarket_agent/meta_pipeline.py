@@ -13,6 +13,7 @@ from peermarket_agent.meta_ads import (
     MetaConfig,
     activate_meta_ad,
     create_meta_ad_paused,
+    pause_meta_ad,
 )
 from peermarket_agent.nano_banana import (
     ImageEditDisabled,
@@ -112,13 +113,15 @@ async def _mark_published(
         )
         if result.rowcount != 1:
             raise RuntimeError("publication disappeared before finalization")
-        await connection.execute(
+        draft_result = await connection.execute(
             text(
                 "UPDATE drafts SET status = 'published' "
                 "WHERE id = :draft_id AND status = 'approved'"
             ),
             {"draft_id": draft_id},
         )
+        if draft_result.rowcount != 1:
+            raise RuntimeError("draft was not approved during publication finalization")
 
 
 def _build_landing_url(draft_id: int) -> str:
@@ -180,8 +183,13 @@ async def _process_approved_meta_draft(
         log.warning("meta_pipeline.draft_not_approved", draft_id=draft_id, status=draft_status)
         return
 
-    budget_cents = int(metadata["suggested_daily_budget_eur"]) * 100
+    metadata_budget_cents = int(metadata["suggested_daily_budget_eur"]) * 100
     publication = await get_meta_publication(engine, draft_id)
+    budget_cents = (
+        publication.approved_budget_cents
+        if publication is not None and publication.approved_budget_cents is not None
+        else metadata_budget_cents
+    )
     if publication is None:
         await upsert_meta_publication(
             engine,
@@ -192,23 +200,36 @@ async def _process_approved_meta_draft(
             ),
         )
         publication = await get_meta_publication(engine, draft_id)
+    elif publication.approved_budget_cents is None:
+        await upsert_meta_publication(
+            engine,
+            MetaPublication(
+                draft_id=draft_id,
+                state=publication.state,
+                approved_budget_cents=budget_cents,
+            ),
+        )
 
     existing_ids = publication.external_ids if publication else {}
     if existing_ids:
         required_ids = {"campaign_id", "ad_set_id", "ad_id"}
         if not required_ids.issubset(existing_ids):
-            error = MetaAdsError(
-                "stored Meta hierarchy is incomplete",
-                phase="reconcile_ids",
-                resource_ids=existing_ids,
-            )
-            details = await _record_failure(
-                engine,
-                draft_id=draft_id,
-                phase="reconcile_ids",
-                budget_cents=budget_cents,
-                error=error,
-            )
+            details = publication.failure or {
+                "phase": "reconcile_ids",
+                "rollback_complete": False,
+                "rollback_errors": {"reconcile": "stored Meta hierarchy is incomplete"},
+            }
+            if publication.failure is None:
+                await upsert_meta_publication(
+                    engine,
+                    MetaPublication(
+                        draft_id=draft_id,
+                        state="failed",
+                        external_ids=existing_ids,
+                        failure=details,
+                        approved_budget_cents=budget_cents,
+                    ),
+                )
             await notifier.notify_founder(
                 f"⚠️ Draft #{draft_id} has incomplete stored Meta IDs; no duplicate "
                 f"resources were created. Rollback complete: "
@@ -270,7 +291,7 @@ async def _process_approved_meta_draft(
                 landing_page_url=_build_landing_url(draft_id),
                 image_bytes=image_bytes,
                 audience_profile_key=metadata["audience_profile_key"],
-                daily_budget_eur=metadata["suggested_daily_budget_eur"],
+                daily_budget_eur=budget_cents // 100,
             )
         except MetaAdsDisabled as e:
             log.exception("meta_pipeline.meta_create_disabled", draft_id=draft_id)
@@ -353,21 +374,31 @@ async def _process_approved_meta_draft(
     }
     try:
         await _mark_published(engine, draft_id, statuses)
-    except Exception as error:
+    except Exception:
         log.exception("meta_pipeline.finalize_failed", draft_id=draft_id)
+        rollback_errors = await pause_meta_ad(meta_config, ids)
+        failure = MetaAdsError(
+            "database finalization failed after Meta activation",
+            phase="finalize",
+            resource_ids=ids,
+            observed_statuses=statuses,
+            rollback_errors=rollback_errors,
+        )
         await _record_failure(
             engine,
             draft_id=draft_id,
             phase="finalize",
             budget_cents=budget_cents,
-            error=error,
+            error=failure,
             ids=ids,
             statuses=statuses,
             ads_manager_url=ads_manager_url,
         )
+        rollback_state = "Rollback complete" if not rollback_errors else "Rollback incomplete"
         await notifier.notify_founder(
             f"⚠️ Meta activated draft #{draft_id}, but database finalization failed. "
-            "Stored IDs and observed statuses were retained; draft remains approved for retry."
+            f"{rollback_state}; stored IDs and observed statuses were retained. "
+            "Draft remains approved for retry."
         )
         return
     observed_state = activation.ad.get("effective_status", activation.ad.get("status", "ACTIVE"))
@@ -375,6 +406,6 @@ async def _process_approved_meta_draft(
         f"📣 *Meta ad active for draft #{draft_id}*\n"
         f"Open in Ads Manager: {ads_manager_url}\n"
         f"State: {observed_state} · Audience: {metadata['audience_profile_key']} · "
-        f"Budget: €{metadata['suggested_daily_budget_eur']}/day"
+        f"Budget: €{budget_cents / 100:g}/day"
     )
     log.info("meta_pipeline.success", draft_id=draft_id, ad_id=ids["ad_id"])

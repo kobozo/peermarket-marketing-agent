@@ -159,6 +159,8 @@ def _sync_create(
         )
     _init_api(config)
     account = AdAccount(config.ad_account_id)
+    phase = "create_campaign"
+    resource_ids: dict[str, str] = {}
 
     try:
         # 1) Campaign — paused, traffic objective, no special ad categories
@@ -173,9 +175,11 @@ def _sync_create(
             fields=[Campaign.Field.id],
         )
         campaign_id = campaign["id"]
+        resource_ids["campaign_id"] = campaign_id
         log.info("meta_ads.campaign_created", campaign_id=campaign_id)
 
         # 2) AdSet — targeting + budget in cents
+        phase = "create_ad_set"
         adset = account.create_ad_set(
             params={
                 AdSet.Field.name: f"{name} — adset",
@@ -190,11 +194,13 @@ def _sync_create(
             fields=[AdSet.Field.id],
         )
         adset_id = adset["id"]
+        resource_ids["ad_set_id"] = adset_id
         log.info("meta_ads.adset_created", adset_id=adset_id)
 
         # 3) Image upload (optional)
         image_hash: str | None = None
         if image_bytes:
+            phase = "upload_image"
             b64 = base64.b64encode(image_bytes).decode("ascii")
             image = account.create_ad_image(
                 params={"bytes": b64},
@@ -204,6 +210,7 @@ def _sync_create(
             log.info("meta_ads.image_uploaded", image_hash=image_hash)
 
         # 4) Creative
+        phase = "create_creative"
         link_data: dict = {
             "message": primary_text,
             "link": landing_page_url,
@@ -223,9 +230,11 @@ def _sync_create(
             fields=[AdCreative.Field.id],
         )
         creative_id = creative["id"]
+        resource_ids["creative_id"] = creative_id
         log.info("meta_ads.creative_created", creative_id=creative_id)
 
         # 5) Ad
+        phase = "create_ad"
         ad = account.create_ad(
             params={
                 Ad.Field.name: name,
@@ -236,6 +245,7 @@ def _sync_create(
             fields=[Ad.Field.id],
         )
         ad_id = ad["id"]
+        resource_ids["ad_id"] = ad_id
         log.info("meta_ads.ad_created", ad_id=ad_id)
 
         return MetaAdResult(
@@ -247,7 +257,13 @@ def _sync_create(
             status="PAUSED",
         )
     except FacebookRequestError as e:
-        raise MetaAdsError(f"Meta API error: {e.api_error_message() or e}") from e
+        rollback_errors = _sync_pause(config, resource_ids)
+        raise MetaAdsError(
+            f"Meta API error: {_redact_credentials(e.api_error_message() or str(e), config)}",
+            phase=phase,
+            resource_ids=resource_ids,
+            rollback_errors=rollback_errors,
+        ) from None
 
 
 async def create_meta_ad_paused(
@@ -295,9 +311,7 @@ def _resources(ids: dict[str, str]) -> list[tuple[str, object]]:
         raise MetaAdsError(f"missing Meta resource ID: {exc.args[0]}") from exc
 
 
-def _sync_get_statuses(
-    config: MetaConfig, ids: dict[str, str]
-) -> dict[str, dict[str, str]]:
+def _sync_get_statuses(config: MetaConfig, ids: dict[str, str]) -> dict[str, dict[str, str]]:
     _ensure_enabled(config)
     _init_api(config)
     return {
@@ -328,6 +342,8 @@ def _sync_pause(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
         ("campaign", Campaign, "campaign_id"),
     ]
     for name, resource_type, id_key in resource_specs:
+        if id_key not in ids:
+            continue
         try:
             resource = resource_type(ids[id_key])
             resource.api_update(params={"status": "PAUSED"})
@@ -359,9 +375,7 @@ async def pause_meta_ad(config: MetaConfig, ids: dict[str, str]) -> dict[str, st
     return await asyncio.to_thread(_sync_pause, config, ids)
 
 
-def _sync_observe_best_effort(
-    config: MetaConfig, ids: dict[str, str]
-) -> dict[str, dict[str, str]]:
+def _sync_observe_best_effort(config: MetaConfig, ids: dict[str, str]) -> dict[str, dict[str, str]]:
     try:
         return _sync_get_statuses(config, ids)
     except Exception:
@@ -374,9 +388,7 @@ def _validate_statuses(statuses: dict[str, dict[str, str]]) -> None:
         configured = status.get("status")
         effective = status.get("effective_status")
         if configured != "ACTIVE" or effective not in accepted_effective_statuses:
-            raise MetaAdsError(
-                f"Meta {resource_name} did not reach an active or review state"
-            )
+            raise MetaAdsError(f"Meta {resource_name} did not reach an active or review state")
 
 
 def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationResult:
@@ -409,8 +421,6 @@ def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationRes
     raise activation_error from None
 
 
-async def activate_meta_ad(
-    config: MetaConfig, ids: dict[str, str]
-) -> MetaActivationResult:
+async def activate_meta_ad(config: MetaConfig, ids: dict[str, str]) -> MetaActivationResult:
     """Activate parent-to-child, verify status, and roll back on failure."""
     return await asyncio.to_thread(_sync_activate, config, ids)
