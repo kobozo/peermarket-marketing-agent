@@ -132,6 +132,15 @@ _STEPS: list[str] = [
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
     "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_statuses JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS failure JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS approved_budget_cents INT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS ads_manager_url TEXT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_draft_id_unique "
+    "ON publications (draft_id) WHERE draft_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",

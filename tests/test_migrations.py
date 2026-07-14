@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from peermarket_agent.db.migrations import run_migrations
+from peermarket_agent.db.migrations import _STEPS, run_migrations
 
 REQUIRED_TABLES = {
     "schema_version",
@@ -23,6 +23,24 @@ REQUIRED_TABLES = {
     "self_extensions",
     "learnings",
 }
+
+
+def test_publications_migration_adds_reconciliation_columns_and_unique_draft_index():
+    migration_sql = "\n".join(_STEPS).lower()
+
+    for column in (
+        "state",
+        "external_ids",
+        "external_statuses",
+        "failure",
+        "approved_budget_cents",
+        "ads_manager_url",
+        "updated_at",
+    ):
+        assert f"alter table publications add column if not exists {column}" in migration_sql
+
+    assert "create unique index if not exists" in migration_sql
+    assert "on publications (draft_id) where draft_id is not null" in migration_sql
 
 
 @pytest.fixture
