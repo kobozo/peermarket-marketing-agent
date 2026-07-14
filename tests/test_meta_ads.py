@@ -253,6 +253,25 @@ async def test_create_paused_ad_passes_daily_budget_in_cents(monkeypatch):
     assert call_kwargs.get("daily_budget") == 1000
 
 
+async def test_create_paused_ad_uses_supported_billing_event(monkeypatch):
+    fake = _patch_meta_sdk(monkeypatch)
+    await create_paused_ad(
+        config=_FULL_CONFIG,
+        name="x",
+        primary_text="x" * 150,
+        headline="x",
+        description="x",
+        cta_type="LEARN_MORE",
+        landing_page_url="https://x",
+        image_bytes=None,
+        audience_profile_key="declutterers",
+        daily_budget_eur=5,
+    )
+    params = fake.create_ad_set.call_args.kwargs["params"]
+    assert params["billing_event"] == "IMPRESSIONS"
+    assert params["optimization_goal"] == "LINK_CLICKS"
+
+
 async def test_create_paused_ad_raises_meta_ads_error_on_api_failure(monkeypatch):
     _patch_meta_sdk(monkeypatch, raise_on="campaign")
     with pytest.raises(MetaAdsError, match="Meta API error"):
