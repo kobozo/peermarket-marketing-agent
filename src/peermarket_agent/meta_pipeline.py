@@ -138,6 +138,7 @@ async def process_approved_meta_draft(
     draft_id: int,
     settings: Settings,
     notifier: SlackNotifier,
+    reconciliation_ids: dict[str, str] | None = None,
 ) -> None:
     """Serialize one draft's lifecycle so concurrent retries cannot duplicate it."""
     async with engine.begin() as lock_connection:
@@ -148,6 +149,42 @@ async def process_approved_meta_draft(
             ),
             {"draft_id": draft_id},
         )
+        if reconciliation_ids is not None:
+            draft = await _fetch_meta_draft(engine, draft_id)
+            if draft is None:
+                raise ValueError(
+                    f"refusing reconciliation: draft #{draft_id} does not exist "
+                    "or is not a Meta ad draft"
+                )
+            draft_status, _ = draft
+            if draft_status not in {"approved", "published"}:
+                raise ValueError(
+                    f"refusing reconciliation: draft #{draft_id} has status "
+                    f"{draft_status!r}, expected 'approved'"
+                )
+            publication = await get_meta_publication(engine, draft_id)
+            stored_ids = publication.external_ids if publication is not None else {}
+            for key, supplied_value in reconciliation_ids.items():
+                stored_value = stored_ids.get(key)
+                if stored_value is not None and stored_value != supplied_value:
+                    raise ValueError(
+                        f"refusing reconciliation: supplied {key} {supplied_value!r} "
+                        f"conflicts with stored value {stored_value!r}"
+                    )
+            if draft_status == "published" and not (reconciliation_ids.keys() <= stored_ids.keys()):
+                raise ValueError(
+                    f"refusing reconciliation: draft #{draft_id} is already published "
+                    "but its stored Meta IDs are incomplete"
+                )
+            if not reconciliation_ids.keys() <= stored_ids.keys():
+                await upsert_meta_publication(
+                    engine,
+                    MetaPublication(
+                        draft_id=draft_id,
+                        state="created",
+                        external_ids=reconciliation_ids,
+                    ),
+                )
         await _process_approved_meta_draft(
             engine=engine,
             draft_id=draft_id,
