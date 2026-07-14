@@ -102,7 +102,7 @@ async def test_full_happy_path(monkeypatch, engine_with_meta_draft):
             status="PAUSED",
         )
     )
-    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_paused_ad", create_mock)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create_mock)
 
     notifier = AsyncMock()
     notifier.notify_founder = AsyncMock(return_value=True)
@@ -119,7 +119,7 @@ async def test_full_happy_path(monkeypatch, engine_with_meta_draft):
     edit_mock.assert_awaited_once()
     # edit_image got raw screenshot bytes
     assert edit_mock.await_args.kwargs["image_bytes"] == b"raw-png-bytes"
-    # create_paused_ad got the framed bytes + structured metadata
+    # create_meta_ad_paused got the framed bytes + structured metadata
     create_kwargs = create_mock.await_args.kwargs
     assert create_kwargs["image_bytes"] == b"framed-png-bytes"
     assert create_kwargs["primary_text"] == metadata["primary_text"]
@@ -161,7 +161,7 @@ async def test_nano_banana_disabled_falls_back_to_raw_screenshot(
             status="PAUSED",
         )
     )
-    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_paused_ad", create_mock)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create_mock)
 
     notifier = AsyncMock()
     notifier.notify_founder = AsyncMock(return_value=True)
@@ -191,7 +191,7 @@ async def test_screenshot_failure_dms_founder_and_aborts(monkeypatch, engine_wit
     edit_mock = AsyncMock()
     monkeypatch.setattr("peermarket_agent.meta_pipeline.edit_image", edit_mock)
     create_mock = AsyncMock()
-    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_paused_ad", create_mock)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create_mock)
 
     notifier = AsyncMock()
     notifier.notify_founder = AsyncMock(return_value=True)
@@ -223,7 +223,7 @@ async def test_meta_disabled_dms_founder(monkeypatch, engine_with_meta_draft):
         AsyncMock(return_value=b"framed"),
     )
     monkeypatch.setattr(
-        "peermarket_agent.meta_pipeline.create_paused_ad",
+        "peermarket_agent.meta_pipeline.create_meta_ad_paused",
         AsyncMock(side_effect=MetaAdsDisabled("missing credentials")),
     )
 

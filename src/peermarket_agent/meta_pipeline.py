@@ -9,7 +9,7 @@ from peermarket_agent.meta_ads import (
     MetaAdsDisabled,
     MetaAdsError,
     MetaConfig,
-    create_paused_ad,
+    create_meta_ad_paused,
 )
 from peermarket_agent.nano_banana import (
     ImageEditDisabled,
@@ -112,7 +112,7 @@ async def process_approved_meta_draft(
         ad_account_id=settings.meta_ad_account_id,
     )
     try:
-        result = await create_paused_ad(
+        result = await create_meta_ad_paused(
             config=meta_config,
             name=f"PeerMarket draft #{draft_id}",
             primary_text=metadata["primary_text"],

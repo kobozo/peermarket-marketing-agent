@@ -1,10 +1,4 @@
-"""Meta Marketing API connector — creates paused ads from approved drafts.
-
-We always create in PAUSED state. The founder activates manually in
-Ads Manager. This keeps the agent in 'propose' autonomy mode per the
-spec's autonomy graduation rules — paid spend never happens without
-explicit human action.
-"""
+"""Meta Marketing API connector for creating and activating approved ads."""
 
 import asyncio
 import base64
@@ -44,12 +38,40 @@ class MetaAdResult:
     status: str
 
 
+@dataclass(frozen=True)
+class MetaActivationResult:
+    campaign: dict[str, str]
+    ad_set: dict[str, str]
+    ad: dict[str, str]
+
+
 class MetaAdsDisabled(RuntimeError):
     """Meta connector cannot operate — credentials missing."""
 
 
 class MetaAdsError(RuntimeError):
-    """Any Meta API failure."""
+    """Any Meta API failure, with sanitized reconciliation context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        phase: str | None = None,
+        resource_ids: dict[str, str] | None = None,
+        observed_statuses: dict[str, dict[str, str]] | None = None,
+        rollback_errors: dict[str, str] | None = None,
+    ) -> None:
+        self.phase = phase
+        self.resource_ids = resource_ids or {}
+        self.observed_statuses = observed_statuses or {}
+        self.rollback_errors = rollback_errors or {}
+        details = {
+            "phase": phase,
+            "resource_ids": self.resource_ids,
+            "observed_statuses": self.observed_statuses,
+            "rollback_errors": self.rollback_errors,
+        }
+        super().__init__(f"{message}: {details}")
 
 
 # Targeting templates per audience profile. Belgium-only, NL+FR.
@@ -227,7 +249,7 @@ def _sync_create(
         raise MetaAdsError(f"Meta API error: {e.api_error_message() or e}") from e
 
 
-async def create_paused_ad(
+async def create_meta_ad_paused(
     *,
     config: MetaConfig,
     name: str,
@@ -259,3 +281,111 @@ async def create_paused_ad(
         audience_profile_key=audience_profile_key,
         daily_budget_eur=daily_budget_eur,
     )
+
+
+def _resources(ids: dict[str, str]) -> list[tuple[str, object]]:
+    try:
+        return [
+            ("campaign", Campaign(ids["campaign_id"])),
+            ("ad_set", AdSet(ids["ad_set_id"])),
+            ("ad", Ad(ids["ad_id"])),
+        ]
+    except KeyError as exc:
+        raise MetaAdsError(f"missing Meta resource ID: {exc.args[0]}") from exc
+
+
+def _sync_get_statuses(
+    config: MetaConfig, ids: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    _ensure_enabled(config)
+    _init_api(config)
+    return {
+        name: dict(resource.api_get(fields=["status", "effective_status"]))
+        for name, resource in _resources(ids)
+    }
+
+
+async def get_meta_ad_statuses(
+    config: MetaConfig, ids: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    """Read configured and effective statuses for a Meta ad hierarchy."""
+    return await asyncio.to_thread(_sync_get_statuses, config, ids)
+
+
+def _sync_pause(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
+    _ensure_enabled(config)
+    _init_api(config)
+    errors: dict[str, str] = {}
+    for name, resource in reversed(_resources(ids)):
+        try:
+            resource.api_update(params={"status": "PAUSED"})
+        except Exception as exc:  # rollback must continue through every ancestor
+            message = str(exc)
+            credentials = sorted(
+                (config.app_secret, config.system_user_token), key=len, reverse=True
+            )
+            for credential in credentials:
+                if len(credential) >= 8:
+                    message = message.replace(credential, "[REDACTED]")
+            errors[name] = message
+    return errors
+
+
+async def pause_meta_ad(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
+    """Best-effort pause in child-to-parent order; return failures by resource."""
+    return await asyncio.to_thread(_sync_pause, config, ids)
+
+
+def _sync_observe_best_effort(
+    config: MetaConfig, ids: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    try:
+        return _sync_get_statuses(config, ids)
+    except Exception:
+        return {}
+
+
+def _validate_statuses(statuses: dict[str, dict[str, str]]) -> None:
+    accepted_effective_statuses = {"ACTIVE", "IN_PROCESS", "PENDING_REVIEW"}
+    for resource_name, status in statuses.items():
+        configured = status.get("status")
+        effective = status.get("effective_status")
+        if configured != "ACTIVE" or effective not in accepted_effective_statuses:
+            raise MetaAdsError(
+                f"Meta {resource_name} did not reach an active or review state"
+            )
+
+
+def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationResult:
+    _ensure_enabled(config)
+    _init_api(config)
+    phase = "activate_campaign"
+    try:
+        for name, resource in _resources(ids):
+            phase = f"activate_{name}"
+            resource.api_update(params={"status": "ACTIVE"})
+        phase = "verify_statuses"
+        statuses = _sync_get_statuses(config, ids)
+        _validate_statuses(statuses)
+        return MetaActivationResult(
+            campaign=statuses["campaign"],
+            ad_set=statuses["ad_set"],
+            ad=statuses["ad"],
+        )
+    except Exception as exc:
+        observed_statuses = _sync_observe_best_effort(config, ids)
+        rollback_errors = _sync_pause(config, ids)
+        raise MetaAdsError(
+            "Meta activation failed",
+            phase=phase,
+            resource_ids=dict(ids),
+            observed_statuses=observed_statuses,
+            rollback_errors=rollback_errors,
+        ) from exc
+
+
+async def activate_meta_ad(
+    config: MetaConfig, ids: dict[str, str]
+) -> MetaActivationResult:
+    """Activate parent-to-child, verify status, and roll back on failure."""
+    return await asyncio.to_thread(_sync_activate, config, ids)
