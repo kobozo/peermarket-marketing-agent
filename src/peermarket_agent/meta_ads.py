@@ -32,6 +32,7 @@ class MetaConfig:
     app_secret: str
     system_user_token: str
     ad_account_id: str  # 'act_<numeric>'
+    page_id: str
 
 
 @dataclass(frozen=True)
@@ -85,13 +86,15 @@ def _ensure_enabled(config: MetaConfig) -> None:
             "app_secret": config.app_secret,
             "system_user_token": config.system_user_token,
             "ad_account_id": config.ad_account_id,
+            "page_id": config.page_id,
         }.items()
         if not v
     ]
     if missing:
         raise MetaAdsDisabled(
             f"Meta connector disabled — missing credentials: {missing}. "
-            "Set META_APP_ID, META_APP_SECRET, META_SYSTEM_USER_TOKEN, META_AD_ACCOUNT_ID."
+            "Set META_APP_ID, META_APP_SECRET, META_SYSTEM_USER_TOKEN, "
+            "META_AD_ACCOUNT_ID, META_PAGE_ID."
         )
 
 
@@ -194,6 +197,7 @@ def _sync_create(
             params={
                 AdCreative.Field.name: f"{name} — creative",
                 AdCreative.Field.object_story_spec: {
+                    "page_id": config.page_id,
                     "link_data": link_data,
                 },
             },
@@ -224,7 +228,18 @@ def _sync_create(
             status="PAUSED",
         )
     except FacebookRequestError as e:
-        raise MetaAdsError(f"Meta API error: {e.api_error_message() or e}") from e
+        details = [e.api_error_message() or e.get_message()]
+        if e.api_error_code() is not None:
+            details.append(f"code={e.api_error_code()}")
+        if e.api_error_subcode() is not None:
+            details.append(f"subcode={e.api_error_subcode()}")
+        body = e.body()
+        api_error = body.get("error", {}) if isinstance(body, dict) else {}
+        if user_title := api_error.get("error_user_title"):
+            details.append(f"user_title={user_title}")
+        if user_message := api_error.get("error_user_msg"):
+            details.append(f"user_message={user_message}")
+        raise MetaAdsError(f"Meta API error: {'; '.join(details)}") from e
 
 
 async def create_paused_ad(

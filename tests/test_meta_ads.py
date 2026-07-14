@@ -16,6 +16,7 @@ _FULL_CONFIG = MetaConfig(
     app_secret="s",
     system_user_token="t",
     ad_account_id="act_999",
+    page_id="61592144690879",
 )
 
 
@@ -105,7 +106,9 @@ async def test_create_paused_ad_returns_result_with_ids(monkeypatch):
 
 
 async def test_create_paused_ad_disabled_when_credentials_missing():
-    config = MetaConfig(app_id="", app_secret="", system_user_token="", ad_account_id="")
+    config = MetaConfig(
+        app_id="", app_secret="", system_user_token="", ad_account_id="", page_id=""
+    )
     with pytest.raises(MetaAdsDisabled, match="missing credentials"):
         await create_paused_ad(
             config=config,
@@ -189,6 +192,48 @@ async def test_create_paused_ad_uploads_image_when_provided(monkeypatch):
     fake.create_ad_image.assert_called_once()
 
 
+async def test_create_paused_ad_uses_configured_page_identity(monkeypatch):
+    fake = _patch_meta_sdk(monkeypatch)
+    await create_paused_ad(
+        config=_FULL_CONFIG,
+        name="x",
+        primary_text="x" * 150,
+        headline="x",
+        description="x",
+        cta_type="LEARN_MORE",
+        landing_page_url="https://x",
+        image_bytes=None,
+        audience_profile_key="declutterers",
+        daily_budget_eur=5,
+    )
+
+    creative_params = fake.create_ad_creative.call_args.kwargs["params"]
+    assert creative_params["object_story_spec"]["page_id"] == "61592144690879"
+
+
+async def test_create_paused_ad_disabled_when_page_id_missing():
+    config = MetaConfig(
+        app_id="111",
+        app_secret="s",
+        system_user_token="t",
+        ad_account_id="act_999",
+        page_id="",
+    )
+    with pytest.raises(MetaAdsDisabled, match="page_id"):
+        await create_paused_ad(
+            config=config,
+            name="x",
+            primary_text="x" * 150,
+            headline="x",
+            description="x",
+            cta_type="LEARN_MORE",
+            landing_page_url="https://x",
+            image_bytes=None,
+            audience_profile_key="declutterers",
+            daily_budget_eur=5,
+        )
+
+
 async def test_create_paused_ad_passes_daily_budget_in_cents(monkeypatch):
     fake = _patch_meta_sdk(monkeypatch)
     await create_paused_ad(
@@ -223,6 +268,57 @@ async def test_create_paused_ad_raises_meta_ads_error_on_api_failure(monkeypatch
             audience_profile_key="declutterers",
             daily_budget_eur=5,
         )
+
+
+async def test_create_paused_ad_preserves_actionable_api_error_details(monkeypatch):
+    from facebook_business.exceptions import FacebookRequestError
+
+    error = FacebookRequestError(
+        "Request failed",
+        request_context={},
+        http_status=400,
+        http_headers={},
+        body={
+            "error": {
+                "message": "Invalid parameter",
+                "code": 100,
+                "error_subcode": 18157520,
+                "error_user_title": "Invalid Page",
+                "error_user_msg": "Select a Page connected to this ad account.",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.FacebookAdsApi.init",
+        lambda *a, **kw: None,
+    )
+    fake_account = MagicMock()
+    fake_account.create_campaign.side_effect = error
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.AdAccount",
+        lambda *a, **kw: fake_account,
+    )
+
+    with pytest.raises(MetaAdsError) as exc_info:
+        await create_paused_ad(
+            config=_FULL_CONFIG,
+            name="x",
+            primary_text="x" * 150,
+            headline="x",
+            description="x",
+            cta_type="LEARN_MORE",
+            landing_page_url="https://x",
+            image_bytes=None,
+            audience_profile_key="declutterers",
+            daily_budget_eur=5,
+        )
+
+    message = str(exc_info.value)
+    assert "Invalid parameter" in message
+    assert "code=100" in message
+    assert "subcode=18157520" in message
+    assert "Invalid Page" in message
+    assert "Select a Page connected to this ad account." in message
 
 
 async def test_create_paused_ad_all_resources_status_paused(monkeypatch):
