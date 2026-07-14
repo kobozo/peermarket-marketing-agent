@@ -44,3 +44,23 @@ Complete. Connector-level creation, activation, verification, and rollback primi
 ## Concerns
 
 None blocking. Pipeline-level reconciliation and activation invocation remain intentionally deferred to the later orchestration task.
+
+## Security follow-up
+
+### RED
+
+- Added a regression whose activation SDK exception contained the configured system-user token and inspected both `MetaAdsError.__cause__` and the formatted chained traceback. Focused tests failed because the original `RuntimeError` remained attached as `__cause__`.
+- Added a regression with two-character app secret and system-user token values embedded as standalone diagnostic values. Focused tests failed because the previous minimum-length guard left both credentials visible.
+
+### GREEN
+
+- Activation now raises its sanitized structured `MetaAdsError` with `from None`, suppressing the credential-bearing SDK exception from chained tracebacks and leaving no explicit cause.
+- Added centralized credential redaction for every non-empty configured app secret and system-user token. Longer credentials use exact literal replacement; short credentials use token-boundary matching so standalone secret values are removed without corrupting ordinary words that merely contain the same characters.
+- Focused connector tests now pass with 16 tests, including both security regressions.
+
+### Verification
+
+- `uv run pytest tests/test_meta_ads.py -q` → `16 passed`
+- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
+- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `150 passed`
+- `git diff --check` → clean

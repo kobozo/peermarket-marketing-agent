@@ -1,5 +1,6 @@
 """Meta Ads connector tests — no real API calls."""
 
+import traceback
 from unittest.mock import MagicMock
 
 import pytest
@@ -257,6 +258,7 @@ def _patch_resources(
     fail_on=None,
     rollback_fail_on=None,
     rollback_error_message=None,
+    activation_error_message=None,
 ):
     calls = []
 
@@ -269,7 +271,10 @@ def _patch_resources(
             status = params["status"]
             calls.append(("update", self.resource_type, self.resource_id, status))
             if status == "ACTIVE" and fail_on == self.resource_type:
-                raise RuntimeError(f"failed to activate {self.resource_type}")
+                raise RuntimeError(
+                    activation_error_message
+                    or f"failed to activate {self.resource_type}"
+                )
             if status == "PAUSED" and rollback_fail_on == self.resource_type:
                 raise RuntimeError(
                     rollback_error_message or f"failed to pause {self.resource_type}"
@@ -382,3 +387,62 @@ async def test_activation_error_redacts_credentials_from_rollback_errors(monkeyp
 
     assert caught.value.rollback_errors == {"ad": "request included [REDACTED]"}
     assert _FULL_CONFIG.system_user_token not in str(caught.value)
+
+
+async def test_activation_error_does_not_chain_credential_bearing_cause(monkeypatch):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(
+        monkeypatch,
+        statuses,
+        fail_on="ad_set",
+        activation_error_message=f"request token={_FULL_CONFIG.system_user_token}",
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(
+            _FULL_CONFIG,
+            {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"},
+        )
+
+    chained_traceback = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert caught.value.__cause__ is None
+    assert _FULL_CONFIG.system_user_token not in chained_traceback
+
+
+async def test_activation_error_redacts_short_credentials_without_corrupting_words(
+    monkeypatch,
+):
+    config = MetaConfig(
+        app_id="111",
+        app_secret="s3",
+        system_user_token="t4",
+        ad_account_id="act_999",
+    )
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(
+        monkeypatch,
+        statuses,
+        fail_on="ad_set",
+        rollback_fail_on="ad",
+        rollback_error_message="app_secret=s3; token=t4; status stays readable",
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(
+            config,
+            {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"},
+        )
+
+    assert caught.value.rollback_errors == {
+        "ad": "app_secret=[REDACTED]; token=[REDACTED]; status stays readable"
+    }

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import re
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -320,15 +321,26 @@ def _sync_pause(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
         try:
             resource.api_update(params={"status": "PAUSED"})
         except Exception as exc:  # rollback must continue through every ancestor
-            message = str(exc)
-            credentials = sorted(
-                (config.app_secret, config.system_user_token), key=len, reverse=True
-            )
-            for credential in credentials:
-                if len(credential) >= 8:
-                    message = message.replace(credential, "[REDACTED]")
-            errors[name] = message
+            errors[name] = _redact_credentials(str(exc), config)
     return errors
+
+
+def _redact_credentials(message: str, config: MetaConfig) -> str:
+    credentials = sorted(
+        {config.app_secret, config.system_user_token} - {""},
+        key=len,
+        reverse=True,
+    )
+    for credential in credentials:
+        if len(credential) >= 8:
+            message = message.replace(credential, "[REDACTED]")
+        else:
+            message = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(credential)}(?![A-Za-z0-9_])",
+                "[REDACTED]",
+                message,
+            )
+    return message
 
 
 async def pause_meta_ad(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
@@ -372,7 +384,7 @@ def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationRes
             ad_set=statuses["ad_set"],
             ad=statuses["ad"],
         )
-    except Exception as exc:
+    except Exception:
         observed_statuses = _sync_observe_best_effort(config, ids)
         rollback_errors = _sync_pause(config, ids)
         raise MetaAdsError(
@@ -381,7 +393,7 @@ def _sync_activate(config: MetaConfig, ids: dict[str, str]) -> MetaActivationRes
             resource_ids=dict(ids),
             observed_statuses=observed_statuses,
             rollback_errors=rollback_errors,
-        ) from exc
+        ) from None
 
 
 async def activate_meta_ad(
