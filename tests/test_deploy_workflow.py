@@ -24,17 +24,17 @@ def test_deploy_preserves_slack_revision_runtime_contract():
         assert f"secrets.{name}" in workflow_text
 
     assert "marketing-agent.service slack-bridge.service" in workflow_text
-    assert "sudo -u peermarket-agent systemd-run" not in workflow_text
-    migration_command = (
-        "sudo systemd-run --wait --pipe --collect --uid=peermarket-agent --gid=peermarket-agent"
-    )
+    assert "systemd-run" not in workflow_text
     shell_text = " ".join(workflow_text.replace("\\\n", " ").split())
-    assert migration_command in shell_text
-    assert "--property=EnvironmentFile=/etc/peermarket-agent/secrets.env" in workflow_text
-    assert "--working-directory=/opt/peermarket-agent" in workflow_text
+    assert "sudo -u peermarket-agent bash -c" in shell_text
     migrate = workflow_text.index("/opt/peermarket-agent/.venv/bin/peermarket-migrate")
     restart = workflow_text.index("sudo systemctl restart")
     assert migrate < restart
     migration_block = workflow_text[workflow_text.rfind("run: |", 0, migrate) : restart]
+    assert "set -euo pipefail" in migration_block
+    assert "set -a" in migration_block
+    assert "source /etc/peermarket-agent/secrets.env" in migration_block
+    assert "set +a" in migration_block
+    assert "cd /opt/peermarket-agent" in migration_block
+    assert "sudo -u peermarket-agent bash -c" in migration_block
     assert "||" not in migration_block
-    assert ";" not in migration_block
