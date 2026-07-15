@@ -12,6 +12,7 @@ from peermarket_agent.agent.loops.daily import (
     run_daily_drafts,
 )
 from peermarket_agent.agent.loops.hourly import run_hourly_pulse
+from peermarket_agent.agent.loops.revisions import run_pending_revisions
 from peermarket_agent.agent.loops.slack_outbox import run_slack_outbox
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.config import get_settings
@@ -46,6 +47,15 @@ async def _hourly_forever(engine, peermarket, notifier: SlackNotifier) -> None:
             log.exception("agent.slack_outbox_failed")
 
 
+async def _revisions_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) -> None:
+    while True:
+        await asyncio.sleep(15)
+        try:
+            await run_pending_revisions(engine, claude, notifier)
+        except Exception:
+            log.exception("agent.revisions_failed")
+
+
 async def _daily_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) -> None:
     while True:
         secs = await _seconds_until_next_9am()
@@ -57,7 +67,9 @@ async def _daily_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) 
             log.exception("agent.daily_loop_failed")
 
 
-async def _run_startup_jobs(engine, peermarket, notifier: SlackNotifier) -> None:
+async def _run_startup_jobs(
+    engine, peermarket, notifier: SlackNotifier, claude: ClaudeClient | None = None
+) -> None:
     try:
         await run_slack_outbox(engine, notifier)
     except Exception:
@@ -66,6 +78,11 @@ async def _run_startup_jobs(engine, peermarket, notifier: SlackNotifier) -> None
         await run_hourly_pulse(engine, peermarket)
     except Exception:
         log.exception("agent.startup_hourly_pulse_failed")
+    if claude is not None:
+        try:
+            await run_pending_revisions(engine, claude, notifier)
+        except Exception:
+            log.exception("agent.startup_revisions_failed")
 
 
 async def _run() -> None:
@@ -83,12 +100,13 @@ async def _run() -> None:
     log.info("agent.start", env="phase-1-loop-b-mvp")
 
     # Independent one-shot retries/pulse; neither can prevent recurring loops.
-    await _run_startup_jobs(engine, peermarket, notifier)
+    await _run_startup_jobs(engine, peermarket, notifier, claude)
 
     # Hourly KPI pulse + daily 09:00 Brussels draft loop, both forever.
     await asyncio.gather(
         _hourly_forever(engine, peermarket, notifier),
         _daily_forever(engine, claude, notifier),
+        _revisions_forever(engine, claude, notifier),
     )
 
 

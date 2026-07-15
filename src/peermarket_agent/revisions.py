@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.drafts import Draft, draft_insert_params
+from peermarket_agent.revision_generator import SourceDraft
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,70 @@ class FeedbackBatch:
     root_draft_id: int
     feedback_ids: tuple[int, ...]
     instructions: tuple[str, ...]
+
+
+async def list_ready_feedback_threads(engine: AsyncEngine) -> tuple[tuple[str, str], ...]:
+    """Return roots whose oldest pending feedback has completed the debounce."""
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                text(
+                    "SELECT channel_id, root_ts FROM draft_revision_feedback "
+                    "WHERE status='pending' GROUP BY channel_id, root_ts "
+                    "HAVING MIN(received_at) <= NOW()-INTERVAL '15 seconds' "
+                    "ORDER BY MIN(received_at)"
+                )
+            )
+        ).fetchall()
+    return tuple((str(row[0]), str(row[1])) for row in rows)
+
+
+async def load_latest_revision_source(
+    engine: AsyncEngine, root_draft_id: int
+) -> tuple[int, SourceDraft]:
+    """Load the current queued leaf used as the immutable generation source."""
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT d.id, at.name, d.channel, d.language, d.copy, d.metadata, "
+                        "d.asset_path FROM drafts d JOIN action_types at ON at.id=d.action_type_id "
+                        "WHERE d.root_draft_id=:root AND d.status='queued' "
+                        "ORDER BY d.revision_number DESC LIMIT 1"
+                    ),
+                    {"root": root_draft_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        raise ValueError("revision root has no queued predecessor")
+    return int(row["id"]), SourceDraft(
+        action_type_name=str(row["name"]),
+        channel=str(row["channel"]),
+        language=row["language"],
+        copy=str(row["copy"]),
+        metadata=dict(row["metadata"] or {}),
+        asset_path=row["asset_path"],
+    )
+
+
+async def mark_feedback_failed(
+    engine: AsyncEngine, feedback_ids: tuple[int, ...], failure_category: str
+) -> None:
+    """Finalize a claimed batch as failed without exposing model output."""
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(
+                "UPDATE draft_revision_feedback SET status='failed', "
+                "failure_category=:category WHERE id=ANY(:ids) AND status='processing'"
+            ),
+            {"ids": list(feedback_ids), "category": failure_category[:100]},
+        )
+        if result.rowcount != len(set(feedback_ids)):
+            raise RuntimeError("feedback failure state changed concurrently")
 
 
 async def bind_draft_thread(
