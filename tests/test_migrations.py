@@ -22,6 +22,8 @@ REQUIRED_TABLES = {
     "creatives_archive",
     "self_extensions",
     "learnings",
+    "draft_revision_feedback",
+    "slack_outbox",
 }
 
 
@@ -72,6 +74,73 @@ async def test_migrations_are_idempotent(engine):
         result = await conn.execute(text("SELECT count(*) FROM action_types"))
         # Schema-only — seed lives in T4. Count is 0 here.
         assert result.scalar() == 0
+
+
+async def test_revision_schema_has_lineage_bindings_and_superseded_status(engine):
+    await run_migrations(engine)
+    async with engine.connect() as conn:
+        columns = {
+            row[0]
+            for row in (
+                await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'drafts'"
+                    )
+                )
+            ).fetchall()
+        }
+        constraint = (
+            await conn.execute(
+                text(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conrelid = 'drafts'::regclass AND contype = 'c' "
+                    "AND pg_get_constraintdef(oid) LIKE '%status%'"
+                )
+            )
+        ).scalar_one()
+
+    assert {
+        "parent_draft_id",
+        "root_draft_id",
+        "revision_number",
+        "revision_feedback",
+        "revision_feedback_ts",
+        "slack_channel_id",
+        "slack_root_ts",
+    } <= columns
+    assert "superseded" in constraint
+
+
+async def test_revision_schema_enforces_root_feedback_and_outbox_idempotency(engine):
+    await run_migrations(engine)
+    async with engine.connect() as conn:
+        indexes = {
+            row[0]: row[1]
+            for row in (
+                await conn.execute(
+                    text(
+                        "SELECT indexname, indexdef FROM pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename IN "
+                        "('drafts', 'draft_revision_feedback', 'slack_outbox')"
+                    )
+                )
+            ).fetchall()
+        }
+
+    assert any(
+        "UNIQUE" in definition
+        and "slack_channel_id" in definition
+        and "slack_root_ts" in definition
+        for definition in indexes.values()
+    )
+    assert any(
+        "UNIQUE" in definition and "event_id" in definition for definition in indexes.values()
+    )
+    assert any(
+        "UNIQUE" in definition and "idempotency_key" in definition
+        for definition in indexes.values()
+    )
 
 
 async def test_migrations_reconcile_duplicate_draft_publications_before_unique_index(engine):

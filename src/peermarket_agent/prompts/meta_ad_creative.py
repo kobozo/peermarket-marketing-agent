@@ -11,6 +11,7 @@ import random
 from dataclasses import dataclass
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 _INPUT_CENTS_PER_TOKEN = 0.0003
@@ -133,27 +134,15 @@ async def generate_meta_ad_creative(
         max_tokens=600,
     )
     payload = parse_claude_json(resp.text)
+    validate_meta(
+        {**payload, "audience_profile_key": audience_profile_key},
+        allowed_audiences=set(AUDIENCE_PROFILES),
+    )
     primary_text = payload["primary_text"]
     headline = payload["headline"]
     description = payload["description"]
     cta_label = payload["cta_label"]
     budget = int(payload["suggested_daily_budget_eur"])
-
-    if not (125 <= len(primary_text) <= 300):
-        raise ValueError(
-            f"primary_text length out of range ({len(primary_text)} not in 125-300): "
-            f"{primary_text!r}"
-        )
-    if len(headline) > 40:
-        raise ValueError(f"headline too long ({len(headline)} > 40): {headline!r}")
-    if len(description) > 40:
-        raise ValueError(f"description too long ({len(description)} > 40): {description!r}")
-    if cta_label not in _ALLOWED_CTA_LABELS:
-        raise ValueError(
-            f"cta_label not allowed: {cta_label!r} (must be one of {_ALLOWED_CTA_LABELS})"
-        )
-    if not (5 <= budget <= 20):
-        raise ValueError(f"suggested_daily_budget_eur out of range ({budget} not in 5-20)")
 
     return MetaAdCreative(
         primary_text=primary_text,

@@ -21,6 +21,7 @@ from peermarket_agent.agent.cli_draft import run_draft_command
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.slack_dm import format_draft_dm, format_summary_dm
 from peermarket_agent.slack_notifier import SlackNotifier
+from peermarket_agent.slack_outbox import enqueue_root_approval
 
 log = structlog.get_logger(__name__)
 
@@ -100,7 +101,7 @@ async def run_daily_drafts(
     claude: ClaudeClient,
     notifier: SlackNotifier,
 ) -> int:
-    """Run Loop B once. Returns count of drafts that persisted + were DM'd."""
+    """Run Loop B once. Returns the count of approval roots newly enqueued."""
     persisted = 0
     for plan in _TODAYS_PLAN:
         action = plan["action_type_name"]
@@ -124,12 +125,12 @@ async def run_daily_drafts(
             log.warning("loop_b.draft_disappeared", action=action, draft_id=draft_id)
             continue
         message = format_draft_dm(draft)
-        sent = await notifier.notify_founder(message)
-        if sent:
-            persisted += 1
-            log.info("loop_b.dm_sent", action=action, draft_id=draft_id)
+        enqueued = await enqueue_root_approval(engine, draft_id=draft_id, text=message)
+        persisted += 1
+        if enqueued:
+            log.info("loop_b.approval_enqueued", action=action, draft_id=draft_id)
         else:
-            log.warning("loop_b.dm_failed", action=action, draft_id=draft_id)
+            log.info("loop_b.approval_already_enqueued", action=action, draft_id=draft_id)
 
     summary = format_summary_dm(drafts_persisted=persisted, drafts_attempted=len(_TODAYS_PLAN))
     await notifier.notify_founder(summary)

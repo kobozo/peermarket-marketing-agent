@@ -119,6 +119,11 @@ jobs:
 
       - name: Restart services
         run: |
+          sudo systemd-run --wait --pipe --collect \
+            --uid=peermarket-agent --gid=peermarket-agent \
+            --property=EnvironmentFile=/etc/peermarket-agent/secrets.env \
+            --working-directory=/opt/peermarket-agent \
+            /opt/peermarket-agent/.venv/bin/peermarket-migrate
           sudo systemctl restart marketing-agent.service slack-bridge.service
           sleep 5
           sudo systemctl is-active marketing-agent.service

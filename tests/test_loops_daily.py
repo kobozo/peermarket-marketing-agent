@@ -66,7 +66,8 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             # 3) TikTok gen
             ClaudeResponse(
                 text=(
-                    '{"hook": "Marktplaats moe?", "body": "Veilig verkopen.", "cta": "Plaats nu"}'
+                    '{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", '
+                    '"body": "Veilig verkopen.", "cta": "Plaats het nu"}'
                 ),
                 input_tokens=200,
                 output_tokens=40,
@@ -83,10 +84,7 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             ),
             # 5) Email gen
             ClaudeResponse(
-                text=(
-                    '{"subject": "Je hebt nog niets verkocht", '
-                    '"body": "Body text here long enough to be plausible."}'
-                ),
+                text=('{"subject": "Je hebt nog niets verkocht", "body": "' + "woord " * 80 + '"}'),
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",
@@ -110,8 +108,15 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
         engine=prepared_db, claude=fake_claude, notifier=fake_notifier
     )
     assert persisted == 3
-    # 3 draft DMs + 1 summary = 4 notify calls
-    assert fake_notifier.notify_founder.await_count == 4
+    # Approval roots are persisted to the outbox; only the operational summary is immediate.
+    assert fake_notifier.notify_founder.await_count == 1
+    async with prepared_db.connect() as conn:
+        queued = (
+            await conn.execute(
+                text("SELECT count(*) FROM slack_outbox WHERE message_kind='root_approval'")
+            )
+        ).scalar_one()
+    assert queued == 3
 
     # KPI row recorded
     async with prepared_db.connect() as conn:
@@ -152,7 +157,10 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
             ),
             # TikTok ok
             ClaudeResponse(
-                text=('{"hook": "ok?", "body": "Veilig verkopen.", "cta": "Plaats nu"}'),
+                text=(
+                    '{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", '
+                    '"body": "Veilig verkopen.", "cta": "Plaats het nu"}'
+                ),
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -167,7 +175,7 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
             ),
             # Email ok
             ClaudeResponse(
-                text=('{"subject": "ok", "body": "Body text here long enough."}'),
+                text=('{"subject": "ok", "body": "' + "woord " * 80 + '"}'),
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",
@@ -189,5 +197,44 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
         engine=prepared_db, claude=fake_claude, notifier=fake_notifier
     )
     assert persisted == 2
-    # 2 draft DMs + 1 summary
-    assert fake_notifier.notify_founder.await_count == 3
+    # 2 approval roots queued + 1 operational summary sent best-effort.
+    assert fake_notifier.notify_founder.await_count == 1
+    async with prepared_db.connect() as conn:
+        queued = (await conn.execute(text("SELECT count(*) FROM slack_outbox"))).scalar_one()
+    assert queued == 2
+
+
+async def test_daily_metric_counts_ready_approval_when_enqueue_is_idempotent(
+    prepared_db, monkeypatch
+):
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily._TODAYS_PLAN",
+        [{"action_type_name": "tiktok_post_organic", "language": "NL"}],
+    )
+    draft_id = 77
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily.run_draft_command",
+        AsyncMock(return_value=draft_id),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily._fetch_draft_with_action_name",
+        AsyncMock(
+            return_value={
+                "id": draft_id,
+                "action_type_name": "tiktok_post_organic",
+                "language": "NL",
+                "channel": "tiktok",
+                "brand_score": 90,
+                "copy": "ready",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily.enqueue_root_approval",
+        AsyncMock(return_value=False),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder = AsyncMock(return_value=True)
+
+    assert await run_daily_drafts(engine=prepared_db, claude=AsyncMock(), notifier=notifier) == 1
+    assert "1/1" in notifier.notify_founder.await_args.args[0]

@@ -25,6 +25,20 @@ class Draft:
     metadata: dict = field(default_factory=dict)
 
 
+def draft_insert_params(draft: Draft) -> dict:
+    """Return the shared SQL parameters for inserting an immutable draft variant."""
+    return {
+        "channel": draft.channel,
+        "language": draft.language,
+        "copy": draft.copy,
+        "asset_path": draft.asset_path,
+        "generation_cost_cents": draft.generation_cost_cents,
+        "brand_score": draft.brand_score,
+        "visual_truthfulness_pass": draft.visual_truthfulness_pass,
+        "metadata": json.dumps(draft.metadata or {}),
+    }
+
+
 async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
     """Insert a draft row, return its id. Raises ValueError if action_type unknown."""
     async with engine.begin() as conn:
@@ -44,19 +58,14 @@ async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
                     "INSERT INTO drafts "
                     "(action_type_id, channel, language, copy, asset_path, "
                     " generation_cost_cents, brand_score, visual_truthfulness_pass, metadata) "
-                    "VALUES (:atid, :ch, :lang, :copy, :ap, :cost, :bs, :vtp, CAST(:meta AS JSONB)) "
+                    "VALUES (:action_type_id, :channel, :language, :copy, :asset_path, "
+                    ":generation_cost_cents, :brand_score, :visual_truthfulness_pass, "
+                    "CAST(:metadata AS JSONB)) "
                     "RETURNING id"
                 ),
                 {
-                    "atid": action_type_id,
-                    "ch": draft.channel,
-                    "lang": draft.language,
-                    "copy": draft.copy,
-                    "ap": draft.asset_path,
-                    "cost": draft.generation_cost_cents,
-                    "bs": draft.brand_score,
-                    "vtp": draft.visual_truthfulness_pass,
-                    "meta": json.dumps(draft.metadata or {}),
+                    "action_type_id": action_type_id,
+                    **draft_insert_params(draft),
                 },
             )
         ).fetchone()
