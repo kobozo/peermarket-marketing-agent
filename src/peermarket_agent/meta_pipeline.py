@@ -57,6 +57,12 @@ class TerminalReplacementResult:
     failure: dict | None
 
 
+@dataclass(frozen=True)
+class _PublishedReplacementAuthorization:
+    draft_id: int
+    attempt_id: str
+
+
 class TerminalReplacementOperationalError(RuntimeError):
     """Sanitized post-transition replacement failure for operator surfaces."""
 
@@ -121,10 +127,13 @@ async def replace_terminal_meta_draft(
         )
         draft = await _fetch_meta_draft(engine, draft_id)
         publication = await get_meta_publication(engine, draft_id)
-        if draft is None or draft[0] != "approved":
+        if draft is None or draft[0] not in {"approved", "published"}:
             await _refuse_terminal_replacement(
-                notifier, draft_id, f"refusing replacement: draft #{draft_id} is not approved"
+                notifier,
+                draft_id,
+                f"refusing replacement: draft #{draft_id} is not approved or published",
             )
+        replacement_draft_status = draft[0]
         if publication is None or publication.external_ids != expected_ids:
             await _refuse_terminal_replacement(
                 notifier,
@@ -226,6 +235,11 @@ async def replace_terminal_meta_draft(
             )
 
         attempt_id = await begin_meta_terminal_replacement(engine, draft_id, expected_ids, statuses)
+        authorization = (
+            _PublishedReplacementAuthorization(draft_id=draft_id, attempt_id=attempt_id)
+            if replacement_draft_status == "published"
+            else None
+        )
         operational_failure: dict | None = None
         result: TerminalReplacementResult | None = None
         try:
@@ -236,6 +250,7 @@ async def replace_terminal_meta_draft(
                     settings=settings,
                     notifier=notifier,
                     prepared_image=prepared_image,
+                    _replacement_authorization=authorization,
                 )
             except Exception:
                 operational_failure = {
@@ -383,7 +398,11 @@ async def _record_failure(
 
 
 async def _mark_published(
-    engine: AsyncEngine, draft_id: int, statuses: dict[str, dict[str, str]]
+    engine: AsyncEngine,
+    draft_id: int,
+    statuses: dict[str, dict[str, str]],
+    *,
+    replacement_authorization: _PublishedReplacementAuthorization | None = None,
 ) -> None:
     """Commit verified publication state and draft transition atomically."""
     async with engine.begin() as connection:
@@ -398,15 +417,32 @@ async def _mark_published(
         )
         if result.rowcount != 1:
             raise RuntimeError("publication disappeared before finalization")
-        draft_result = await connection.execute(
-            text(
-                "UPDATE drafts SET status = 'published' "
-                "WHERE id = :draft_id AND status = 'approved'"
-            ),
-            {"draft_id": draft_id},
-        )
+        if replacement_authorization is None:
+            draft_result = await connection.execute(
+                text(
+                    "UPDATE drafts SET status = 'published' "
+                    "WHERE id = :draft_id AND status = 'approved'"
+                ),
+                {"draft_id": draft_id},
+            )
+        else:
+            draft_result = await connection.execute(
+                text(
+                    "UPDATE drafts SET status = status WHERE id = :draft_id "
+                    "AND status = 'published' AND EXISTS (SELECT 1 FROM publications p, "
+                    "jsonb_array_elements(COALESCE(p.replacement_history, '[]'::JSONB)) item "
+                    "WHERE p.draft_id = :draft_id "
+                    "AND item->>'attempt_id' = :attempt_id "
+                    "AND item->>'finished_at' IS NULL)"
+                ),
+                {
+                    "draft_id": draft_id,
+                    "attempt_id": replacement_authorization.attempt_id,
+                },
+            )
         if draft_result.rowcount != 1:
-            raise RuntimeError("draft was not approved during publication finalization")
+            expected = "published replacement attempt" if replacement_authorization else "approved"
+            raise RuntimeError(f"draft was not {expected} during publication finalization")
 
 
 def _build_landing_url(draft_id: int) -> str:
@@ -494,6 +530,7 @@ async def _process_approved_meta_draft(
     settings: Settings,
     notifier: SlackNotifier,
     prepared_image: bytes | None = None,
+    _replacement_authorization: _PublishedReplacementAuthorization | None = None,
 ) -> None:
     """End-to-end pipeline. Best-effort. Never raises connector failures."""
     log.info("meta_pipeline.start", draft_id=draft_id)
@@ -502,7 +539,19 @@ async def _process_approved_meta_draft(
         log.warning("meta_pipeline.draft_missing_or_wrong_type", draft_id=draft_id)
         return
     draft_status, metadata = draft
-    if draft_status == "published":
+    publication = await get_meta_publication(engine, draft_id)
+    authorized_published_replacement = (
+        draft_status == "published"
+        and _replacement_authorization is not None
+        and _replacement_authorization.draft_id == draft_id
+        and publication is not None
+        and any(
+            attempt.get("attempt_id") == _replacement_authorization.attempt_id
+            and attempt.get("finished_at") is None
+            for attempt in publication.replacement_history
+        )
+    )
+    if draft_status == "published" and not authorized_published_replacement:
         log.info("meta_pipeline.already_published", draft_id=draft_id)
         return
     if not metadata:
@@ -511,9 +560,11 @@ async def _process_approved_meta_draft(
             "we added structured metadata. Regenerate it and re-approve."
         )
         return
-    if draft_status != "approved":
+    if draft_status != "approved" and not authorized_published_replacement:
         log.warning("meta_pipeline.draft_not_approved", draft_id=draft_id, status=draft_status)
         return
+    draft_status_label = "Published" if authorized_published_replacement else "Approved"
+    retained_draft_status = draft_status_label.lower()
     if not settings.meta_auto_activate:
         log.warning("meta_pipeline.auto_activation_disabled", draft_id=draft_id)
         await notifier.notify_founder(
@@ -523,7 +574,6 @@ async def _process_approved_meta_draft(
         return
 
     metadata_budget_cents = int(metadata["suggested_daily_budget_eur"]) * 100
-    publication = await get_meta_publication(engine, draft_id)
     budget_cents = (
         publication.approved_budget_cents
         if publication is not None and publication.approved_budget_cents is not None
@@ -595,8 +645,9 @@ async def _process_approved_meta_draft(
                     error=e,
                 )
                 await notifier.notify_founder(
-                    f"⚠️ Approved draft #{draft_id} but couldn't screenshot peermarket.eu: {e}. "
-                    "Draft remains approved; retry after fixing screenshot capture."
+                    f"⚠️ {draft_status_label} draft #{draft_id} but couldn't screenshot "
+                    f"peermarket.eu: {e}. Draft remains {retained_draft_status}; retry after "
+                    "fixing screenshot capture."
                 )
                 return
 
@@ -612,7 +663,8 @@ async def _process_approved_meta_draft(
             except ImageEditError as e:
                 log.exception("meta_pipeline.image_edit_failed", draft_id=draft_id)
                 await notifier.notify_founder(
-                    f"⚠️ Approved draft #{draft_id}, screenshot OK, but image-edit failed: {e}. "
+                    f"⚠️ {draft_status_label} draft #{draft_id}, screenshot OK, but image-edit "
+                    f"failed: {e}. "
                     "Falling back to raw screenshot, continuing with Meta push."
                 )
 
@@ -640,8 +692,9 @@ async def _process_approved_meta_draft(
                 error=e,
             )
             await notifier.notify_founder(
-                f"⚠️ Approved draft #{draft_id}, but Meta connector isn't configured: {e}. "
-                "Set the META_* secrets + redeploy; draft remains approved."
+                f"⚠️ {draft_status_label} draft #{draft_id}, but Meta connector isn't "
+                f"configured: {e}. Set the META_* secrets + redeploy; draft remains "
+                f"{retained_draft_status}."
             )
             return
         except MetaAdsError as e:
@@ -654,8 +707,9 @@ async def _process_approved_meta_draft(
                 error=e,
             )
             await notifier.notify_founder(
-                f"⚠️ Approved draft #{draft_id}, but Meta creation failed: {e}. "
-                "Draft remains approved; no automatic duplicate retry was attempted."
+                f"⚠️ {draft_status_label} draft #{draft_id}, but Meta creation failed: {e}. "
+                f"Draft remains {retained_draft_status}; no automatic duplicate retry was "
+                "attempted."
             )
             return
         ids = {
@@ -701,7 +755,8 @@ async def _process_approved_meta_draft(
         )
         await notifier.notify_founder(
             f"⚠️ Meta activation failed for draft #{draft_id} during {details['phase']}. "
-            f"{rollback_state}; stored IDs retained for reconciliation. Draft remains approved."
+            f"{rollback_state}; stored IDs retained for reconciliation. Draft remains "
+            f"{retained_draft_status}."
         )
         return
 
@@ -711,7 +766,12 @@ async def _process_approved_meta_draft(
         "ad": activation.ad,
     }
     try:
-        await _mark_published(engine, draft_id, statuses)
+        await _mark_published(
+            engine,
+            draft_id,
+            statuses,
+            replacement_authorization=_replacement_authorization,
+        )
     except Exception:
         log.exception("meta_pipeline.finalize_failed", draft_id=draft_id)
         rollback_errors = await pause_meta_ad(meta_config, ids)
@@ -733,10 +793,17 @@ async def _process_approved_meta_draft(
             ads_manager_url=ads_manager_url,
         )
         rollback_state = "Rollback complete" if not rollback_errors else "Rollback incomplete"
+        if authorized_published_replacement:
+            retained_state_guidance = (
+                "Draft remains published. Retained IDs and replacement history require "
+                "operator inspection; the replacement command must not be retried blindly."
+            )
+        else:
+            retained_state_guidance = "Draft remains approved for retry."
         await notifier.notify_founder(
             f"⚠️ Meta activated draft #{draft_id}, but database finalization failed. "
             f"{rollback_state}; stored IDs and observed statuses were retained. "
-            "Draft remains approved for retry."
+            f"{retained_state_guidance}"
         )
         return
     observed_state = activation.ad.get("effective_status", activation.ad.get("status", "ACTIVE"))

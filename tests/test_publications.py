@@ -1,5 +1,6 @@
 """Unit tests for durable Meta publication persistence."""
 
+import json
 import os
 from contextlib import asynccontextmanager
 
@@ -299,3 +300,71 @@ async def test_replacement_finalizer_rejects_missing_publication(database_engine
         await record_meta_replacement_result(
             engine, draft_id + 999, "missing", state="failed", failure={"phase": "test"}
         )
+
+
+async def test_replacement_finalizer_updates_exactly_one_unfinished_attempt(database_engine):
+    engine, draft_id = database_engine
+    ids = {"campaign_id": "c", "ad_set_id": "s", "creative_id": "cr", "ad_id": "a"}
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id, external_ids=ids))
+    attempt_id = await begin_meta_terminal_replacement(engine, draft_id, ids, {})
+    await upsert_meta_publication(
+        engine, MetaPublication(draft_id=draft_id, external_ids={"campaign_id": "new-c"})
+    )
+
+    await record_meta_replacement_result(
+        engine, draft_id, attempt_id, state="failed", failure={"phase": "create"}
+    )
+
+    stored = await get_meta_publication(engine, draft_id)
+    attempt = stored.replacement_history[0]
+    assert attempt["replacement_ids"] == {"campaign_id": "new-c"}
+    assert attempt["state"] == "failed"
+    assert attempt["failure"] == {"phase": "create"}
+    assert attempt["finished_at"]
+
+
+async def test_replacement_finalizer_rejects_duplicate_matching_attempts_without_write(
+    database_engine,
+):
+    engine, draft_id = database_engine
+    duplicate = {
+        "attempt_id": "duplicate",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": None,
+        "state": "creating",
+    }
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id))
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE publications SET replacement_history = CAST(:history AS JSONB) "
+                "WHERE draft_id = :draft_id"
+            ),
+            {"draft_id": draft_id, "history": json.dumps([duplicate, duplicate])},
+        )
+    before = (await get_meta_publication(engine, draft_id)).replacement_history
+
+    with pytest.raises(MetaReplacementHistoryError):
+        await record_meta_replacement_result(
+            engine, draft_id, "duplicate", state="failed", failure={"phase": "test"}
+        )
+
+    assert (await get_meta_publication(engine, draft_id)).replacement_history == before
+
+
+async def test_replacement_finalizer_rejects_repeated_finalization_without_write(database_engine):
+    engine, draft_id = database_engine
+    ids = {"campaign_id": "c", "ad_set_id": "s", "creative_id": "cr", "ad_id": "a"}
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id, external_ids=ids))
+    attempt_id = await begin_meta_terminal_replacement(engine, draft_id, ids, {})
+    await record_meta_replacement_result(
+        engine, draft_id, attempt_id, state="failed", failure={"phase": "first"}
+    )
+    before = (await get_meta_publication(engine, draft_id)).replacement_history
+
+    with pytest.raises(MetaReplacementHistoryError):
+        await record_meta_replacement_result(
+            engine, draft_id, attempt_id, state="active", failure=None
+        )
+
+    assert (await get_meta_publication(engine, draft_id)).replacement_history == before
