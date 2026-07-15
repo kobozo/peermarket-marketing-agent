@@ -110,8 +110,15 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
         engine=prepared_db, claude=fake_claude, notifier=fake_notifier
     )
     assert persisted == 3
-    # 3 draft DMs + 1 summary = 4 notify calls
-    assert fake_notifier.notify_founder.await_count == 4
+    # Approval roots are persisted to the outbox; only the operational summary is immediate.
+    assert fake_notifier.notify_founder.await_count == 1
+    async with prepared_db.connect() as conn:
+        queued = (
+            await conn.execute(
+                text("SELECT count(*) FROM slack_outbox WHERE message_kind='root_approval'")
+            )
+        ).scalar_one()
+    assert queued == 3
 
     # KPI row recorded
     async with prepared_db.connect() as conn:
@@ -189,5 +196,8 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
         engine=prepared_db, claude=fake_claude, notifier=fake_notifier
     )
     assert persisted == 2
-    # 2 draft DMs + 1 summary
-    assert fake_notifier.notify_founder.await_count == 3
+    # 2 approval roots queued + 1 operational summary sent best-effort.
+    assert fake_notifier.notify_founder.await_count == 1
+    async with prepared_db.connect() as conn:
+        queued = (await conn.execute(text("SELECT count(*) FROM slack_outbox"))).scalar_one()
+    assert queued == 2

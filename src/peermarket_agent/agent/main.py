@@ -12,6 +12,7 @@ from peermarket_agent.agent.loops.daily import (
     run_daily_drafts,
 )
 from peermarket_agent.agent.loops.hourly import run_hourly_pulse
+from peermarket_agent.agent.loops.slack_outbox import run_slack_outbox
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.config import get_settings
 from peermarket_agent.db.engine import get_engine
@@ -32,13 +33,17 @@ async def _sleep_until_next_hour() -> None:
     await asyncio.sleep(secs)
 
 
-async def _hourly_forever(engine, peermarket) -> None:
+async def _hourly_forever(engine, peermarket, notifier: SlackNotifier) -> None:
     while True:
         await _sleep_until_next_hour()
         try:
             await run_hourly_pulse(engine, peermarket)
         except Exception:
             log.exception("agent.hourly_pulse_failed")
+        try:
+            await run_slack_outbox(engine, notifier)
+        except Exception:
+            log.exception("agent.slack_outbox_failed")
 
 
 async def _daily_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) -> None:
@@ -68,10 +73,11 @@ async def _run() -> None:
 
     # One-shot pulse on startup so smoke tests have data immediately.
     await run_hourly_pulse(engine, peermarket)
+    await run_slack_outbox(engine, notifier)
 
     # Hourly KPI pulse + daily 09:00 Brussels draft loop, both forever.
     await asyncio.gather(
-        _hourly_forever(engine, peermarket),
+        _hourly_forever(engine, peermarket, notifier),
         _daily_forever(engine, claude, notifier),
     )
 
