@@ -86,6 +86,7 @@ async def record_revision_feedback(engine: AsyncEngine, event: RevisionFeedbackE
 
 async def claim_feedback_batch(
     engine: AsyncEngine,
+    channel_id: str,
     root_ts: str,
     *,
     now: datetime | None = None,
@@ -95,9 +96,10 @@ async def claim_feedback_batch(
         root = (
             await connection.execute(
                 text(
-                    "SELECT id FROM drafts WHERE slack_root_ts = :root_ts AND revision_number = 0"
+                    "SELECT id FROM drafts WHERE slack_channel_id = :channel_id "
+                    "AND slack_root_ts = :root_ts AND revision_number = 0"
                 ),
-                {"root_ts": root_ts},
+                {"channel_id": channel_id, "root_ts": root_ts},
             )
         ).scalar_one_or_none()
         if root is None:

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.revisions import RevisionFeedbackEvent, record_revision_feedback
 
-RevisionReplyKind = Literal["ignored", "unknown_root", "recorded", "duplicate"]
+RevisionReplyKind = Literal["ignored", "unauthorized", "unknown_root", "recorded", "duplicate"]
 
 
 @dataclass(frozen=True)
@@ -24,10 +24,13 @@ _IGNORED_SUBTYPES = {
     "message_changed",
     "message_deleted",
     "thread_broadcast",
+    "file_share",
 }
 
 
-async def handle_revision_reply(engine: AsyncEngine, event: dict) -> RevisionReplyResult:
+async def handle_revision_reply(
+    engine: AsyncEngine, event: dict, founder_user_id: str
+) -> RevisionReplyResult:
     """Store a qualifying human DM thread reply without starting generation."""
     text_value = str(event.get("text") or "").strip()
     root_ts = str(event.get("thread_ts") or "").strip()
@@ -36,6 +39,7 @@ async def handle_revision_reply(engine: AsyncEngine, event: dict) -> RevisionRep
     user_id = str(event.get("user") or "").strip()
     if (
         event.get("bot_id")
+        or event.get("files")
         or event.get("subtype") in _IGNORED_SUBTYPES
         or event.get("channel_type") != "im"
         or not user_id
@@ -46,6 +50,11 @@ async def handle_revision_reply(engine: AsyncEngine, event: dict) -> RevisionRep
         or not channel_id
     ):
         return RevisionReplyResult(kind="ignored")
+    if not founder_user_id or user_id != founder_user_id:
+        return RevisionReplyResult(
+            kind="unauthorized",
+            reply_text="This Slack user is not authorized to manage marketing drafts.",
+        )
 
     async with engine.connect() as connection:
         known_root = (

@@ -70,3 +70,26 @@ None blocking. When Slack omits both the envelope event ID and `client_msg_id`,
 the handler derives a stable idempotency key from channel/root/message
 timestamps; the database's separate message-timestamp uniqueness constraint
 still protects redelivery.
+
+## Review follow-up
+
+- File-bearing events and `file_share` subtypes are now categorically ignored
+  before acknowledgement parsing, authorization, database access, revision
+  routing, or general greeting, including files with non-empty captions.
+- Feedback claim identity is now the complete `(channel_id, root_ts)` pair.
+  Coverage binds two channels to the same root timestamp and proves only the
+  selected channel's feedback is claimed.
+- The configured founder user ID is bound into the Slack message handler at app
+  construction and passed into the revision handler for defense in depth.
+  Unauthorized DMs cannot reach acknowledgement or feedback persistence and
+  receive only fixed refusal copy with no draft or message content echoed.
+
+Follow-up focused verification:
+
+```text
+36 passed in 6.51s
+262 passed in 27.58s
+79 files already formatted
+All checks passed!
+git diff --check: exit 0
+```

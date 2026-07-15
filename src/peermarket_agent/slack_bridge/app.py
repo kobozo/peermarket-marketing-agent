@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from functools import partial
 
 import click
 import structlog
@@ -25,6 +26,7 @@ _HELLO_TEXT = (
     "👋 PeerMarket marketing agent is online. I'm in Phase 0 — no posting yet, "
     "just confirming I can hear you."
 )
+_UNAUTHORIZED_TEXT = "This Slack user is not authorized to manage marketing drafts."
 
 
 async def handle_app_mention(event: dict, say) -> None:
@@ -33,16 +35,35 @@ async def handle_app_mention(event: dict, say) -> None:
     await say(text=_HELLO_TEXT)
 
 
-async def handle_im(event: dict, say, body: dict | None = None) -> None:
+async def handle_im(
+    event: dict,
+    say,
+    body: dict | None = None,
+    *,
+    founder_user_id: str,
+) -> None:
     if (
         event.get("bot_id")
+        or event.get("files")
         or event.get("subtype")
-        in {"bot_message", "message_changed", "message_deleted", "thread_broadcast"}
+        in {
+            "bot_message",
+            "message_changed",
+            "message_deleted",
+            "thread_broadcast",
+            "file_share",
+        }
         or event.get("channel_type") != "im"
     ):
         return
     text_msg = event.get("text") or ""
     user_id = event.get("user", "unknown")
+    if not founder_user_id or user_id != founder_user_id:
+        kwargs = {"text": _UNAUTHORIZED_TEXT}
+        if event.get("thread_ts"):
+            kwargs["thread_ts"] = event["thread_ts"]
+        await say(**kwargs)
+        return
     parsed = parse_ack(text_msg)
     if parsed is not None:
         action, draft_id = parsed
@@ -55,7 +76,7 @@ async def handle_im(event: dict, say, body: dict | None = None) -> None:
         routed_event = dict(event)
         if body and body.get("event_id"):
             routed_event["event_id"] = body["event_id"]
-        result = await handle_revision_reply(engine, routed_event)
+        result = await handle_revision_reply(engine, routed_event, founder_user_id)
         if result.reply_text:
             try:
                 await say(text=result.reply_text, thread_ts=event["thread_ts"])
@@ -69,10 +90,10 @@ async def handle_im(event: dict, say, body: dict | None = None) -> None:
     await say(text=_HELLO_TEXT)
 
 
-def build_app(slack_bot_token: str) -> AsyncApp:
+def build_app(slack_bot_token: str, founder_user_id: str) -> AsyncApp:
     app = AsyncApp(token=slack_bot_token)
     app.event("app_mention")(handle_app_mention)
-    app.event("message")(handle_im)
+    app.event("message")(partial(handle_im, founder_user_id=founder_user_id))
     return app
 
 
@@ -88,7 +109,7 @@ def build_healthz_api() -> FastAPI:
 
 async def _run() -> None:
     settings = get_settings()
-    app = build_app(settings.slack_bot_token)
+    app = build_app(settings.slack_bot_token, settings.slack_founder_user_id)
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
 
     api = build_healthz_api()
