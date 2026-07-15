@@ -793,10 +793,17 @@ async def _process_approved_meta_draft(
             ads_manager_url=ads_manager_url,
         )
         rollback_state = "Rollback complete" if not rollback_errors else "Rollback incomplete"
+        if authorized_published_replacement:
+            retained_state_guidance = (
+                "Draft remains published. Retained IDs and replacement history require "
+                "operator inspection; the replacement command must not be retried blindly."
+            )
+        else:
+            retained_state_guidance = "Draft remains approved for retry."
         await notifier.notify_founder(
             f"⚠️ Meta activated draft #{draft_id}, but database finalization failed. "
             f"{rollback_state}; stored IDs and observed statuses were retained. "
-            f"Draft remains {retained_draft_status} for retry."
+            f"{retained_state_guidance}"
         )
         return
     observed_state = activation.ad.get("effective_status", activation.ad.get("status", "ACTIVE"))

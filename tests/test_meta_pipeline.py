@@ -886,6 +886,10 @@ async def test_published_replacement_failure_notifications_preserve_published_wo
     notifications = "\n".join(call.args[0] for call in notifier.notify_founder.await_args_list)
     assert "published" in notifications.lower()
     assert "approved" not in notifications.lower()
+    if failure_phase == "finalize":
+        assert "operator inspection" in notifications.lower()
+        assert "must not be retried blindly" in notifications.lower()
+        assert "for retry" not in notifications.lower()
 
 
 async def test_terminal_replacement_sanitizes_history_finalizer_validation_failure(
