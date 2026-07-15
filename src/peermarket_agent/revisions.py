@@ -1,6 +1,7 @@
 """Persistence primitives for Slack-thread draft revisions."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -83,7 +84,13 @@ async def record_revision_feedback(engine: AsyncEngine, event: RevisionFeedbackE
     return result.rowcount == 1
 
 
-async def claim_feedback_batch(engine: AsyncEngine, root_ts: str) -> FeedbackBatch | None:
+async def claim_feedback_batch(
+    engine: AsyncEngine,
+    root_ts: str,
+    *,
+    now: datetime | None = None,
+) -> FeedbackBatch | None:
+    cutoff = (now or datetime.now(UTC)) - timedelta(seconds=15)
     async with engine.begin() as connection:
         root = (
             await connection.execute(
@@ -101,6 +108,17 @@ async def claim_feedback_batch(engine: AsyncEngine, root_ts: str) -> FeedbackBat
             ),
             {"root": root},
         )
+        oldest_pending = (
+            await connection.execute(
+                text(
+                    "SELECT MIN(received_at) FROM draft_revision_feedback "
+                    "WHERE root_draft_id = :root AND status = 'pending'"
+                ),
+                {"root": root},
+            )
+        ).scalar_one_or_none()
+        if oldest_pending is None or oldest_pending > cutoff:
+            return None
         rows = (
             await connection.execute(
                 text(

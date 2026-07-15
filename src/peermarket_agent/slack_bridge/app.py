@@ -16,6 +16,7 @@ from peermarket_agent.config import get_settings
 from peermarket_agent.db.engine import get_engine
 from peermarket_agent.slack_bridge.ack_handler import handle_ack
 from peermarket_agent.slack_bridge.ack_parser import parse_ack
+from peermarket_agent.slack_bridge.revision_handler import handle_revision_reply
 
 log = structlog.get_logger(__name__)
 
@@ -32,10 +33,13 @@ async def handle_app_mention(event: dict, say) -> None:
     await say(text=_HELLO_TEXT)
 
 
-async def handle_im(event: dict, say) -> None:
-    if event.get("bot_id"):
-        return
-    if event.get("channel_type") != "im":
+async def handle_im(event: dict, say, body: dict | None = None) -> None:
+    if (
+        event.get("bot_id")
+        or event.get("subtype")
+        in {"bot_message", "message_changed", "message_deleted", "thread_broadcast"}
+        or event.get("channel_type") != "im"
+    ):
         return
     text_msg = event.get("text") or ""
     user_id = event.get("user", "unknown")
@@ -45,6 +49,22 @@ async def handle_im(event: dict, say) -> None:
         engine = get_engine()
         result = await handle_ack(engine, action=action, draft_id=draft_id, decided_by=user_id)
         await say(text=result.reply_text)
+        return
+    if event.get("thread_ts"):
+        engine = get_engine()
+        routed_event = dict(event)
+        if body and body.get("event_id"):
+            routed_event["event_id"] = body["event_id"]
+        result = await handle_revision_reply(engine, routed_event)
+        if result.reply_text:
+            try:
+                await say(text=result.reply_text, thread_ts=event["thread_ts"])
+            except Exception as error:
+                log.warning(
+                    "slack_bridge.revision_receipt_failed",
+                    event_id=routed_event.get("event_id"),
+                    failure_category=type(error).__name__,
+                )
         return
     await say(text=_HELLO_TEXT)
 

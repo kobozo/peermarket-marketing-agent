@@ -89,3 +89,85 @@ async def test_handle_im_without_ack_falls_back_to_hello(monkeypatch, fake_say):
     fake_say.assert_awaited_once()
     args, kwargs = fake_say.await_args
     assert "PeerMarket marketing agent" in (kwargs.get("text") or args[0])
+
+
+async def test_thread_ack_has_precedence_over_revision_routing(monkeypatch, fake_say):
+    from peermarket_agent.slack_bridge import app as bridge_app
+    from peermarket_agent.slack_bridge.ack_handler import AckResult
+
+    fake_engine = object()
+    monkeypatch.setattr(bridge_app, "get_engine", lambda: fake_engine)
+    ack = AsyncMock(return_value=AckResult(success=True, reply_text="approved"))
+    revision = AsyncMock()
+    monkeypatch.setattr(bridge_app, "handle_ack", ack)
+    monkeypatch.setattr(bridge_app, "handle_revision_reply", revision)
+
+    await bridge_app.handle_im(
+        event={
+            "text": "✅ 42",
+            "user": "U1",
+            "channel": "D1",
+            "channel_type": "im",
+            "thread_ts": "100.000",
+            "ts": "100.001",
+        },
+        say=fake_say,
+        body={"event_id": "Ev1"},
+    )
+
+    ack.assert_awaited_once()
+    revision.assert_not_called()
+
+
+async def test_handled_thread_feedback_acks_in_thread_without_hello(monkeypatch, fake_say):
+    from peermarket_agent.slack_bridge import app as bridge_app
+    from peermarket_agent.slack_bridge.revision_handler import RevisionReplyResult
+
+    fake_engine = object()
+    monkeypatch.setattr(bridge_app, "get_engine", lambda: fake_engine)
+    revision = AsyncMock(
+        return_value=RevisionReplyResult(kind="recorded", reply_text="Feedback received.")
+    )
+    monkeypatch.setattr(bridge_app, "handle_revision_reply", revision)
+    event = {
+        "text": "Shorter",
+        "user": "U1",
+        "channel": "D1",
+        "channel_type": "im",
+        "thread_ts": "100.000",
+        "ts": "100.001",
+    }
+
+    await bridge_app.handle_im(event=event, say=fake_say, body={"event_id": "Ev1"})
+
+    revision.assert_awaited_once()
+    routed_event = revision.await_args.args[1]
+    assert routed_event["event_id"] == "Ev1"
+    fake_say.assert_awaited_once_with(text="Feedback received.", thread_ts="100.000")
+
+
+async def test_ignored_thread_event_does_not_fall_back_to_hello(monkeypatch, fake_say):
+    from peermarket_agent.slack_bridge import app as bridge_app
+    from peermarket_agent.slack_bridge.revision_handler import RevisionReplyResult
+
+    monkeypatch.setattr(bridge_app, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        bridge_app,
+        "handle_revision_reply",
+        AsyncMock(return_value=RevisionReplyResult(kind="ignored")),
+    )
+
+    await bridge_app.handle_im(
+        event={
+            "text": "bot prose",
+            "bot_id": "B1",
+            "channel": "D1",
+            "channel_type": "im",
+            "thread_ts": "100.000",
+            "ts": "100.001",
+        },
+        say=fake_say,
+        body={"event_id": "Ev1"},
+    )
+
+    fake_say.assert_not_called()

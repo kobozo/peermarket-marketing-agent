@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -55,6 +56,10 @@ def event(event_id: str, message_ts: str, text_value: str) -> RevisionFeedbackEv
     )
 
 
+def eligible_now() -> datetime:
+    return datetime.now(UTC) + timedelta(seconds=16)
+
+
 async def test_bind_draft_thread_is_idempotent_and_root_is_unique(engine):
     first = await persist_draft(engine, draft())
     second = await persist_draft(engine, draft("other"))
@@ -80,12 +85,12 @@ async def test_claim_feedback_batch_is_ordered_and_claimed_once(engine):
     await record_revision_feedback(engine, event("Ev2", "100.003", "Second"))
     await record_revision_feedback(engine, event("Ev1", "100.002", "First"))
 
-    batch = await claim_feedback_batch(engine, "100.000")
+    batch = await claim_feedback_batch(engine, "100.000", now=eligible_now())
     assert batch is not None
     assert batch.root_draft_id == original
     assert batch.feedback_ids
     assert batch.instructions == ("First", "Second")
-    assert await claim_feedback_batch(engine, "100.000") is None
+    assert await claim_feedback_batch(engine, "100.000", now=eligible_now()) is None
 
 
 async def test_concurrent_feedback_claims_have_one_winner(engine):
@@ -94,8 +99,8 @@ async def test_concurrent_feedback_claims_have_one_winner(engine):
     await record_revision_feedback(engine, event("Ev1", "100.002", "Shorter"))
 
     results = await asyncio.gather(
-        claim_feedback_batch(engine, "100.000"),
-        claim_feedback_batch(engine, "100.000"),
+        claim_feedback_batch(engine, "100.000", now=eligible_now()),
+        claim_feedback_batch(engine, "100.000", now=eligible_now()),
     )
     assert sum(result is not None for result in results) == 1
 
@@ -104,7 +109,7 @@ async def test_revision_insert_and_supersede_are_atomic(engine):
     original = await persist_draft(engine, draft())
     await bind_draft_thread(engine, original, "D123", "100.000")
     await record_revision_feedback(engine, event("Ev1", "100.002", "Shorter"))
-    batch = await claim_feedback_batch(engine, "100.000")
+    batch = await claim_feedback_batch(engine, "100.000", now=eligible_now())
     assert batch is not None
 
     revised_id = await persist_revision_and_supersede(
@@ -134,7 +139,7 @@ async def test_invalid_predecessor_rolls_back_feedback_and_draft(engine):
     original = await persist_draft(engine, draft())
     await bind_draft_thread(engine, original, "D123", "100.000")
     await record_revision_feedback(engine, event("Ev1", "100.002", "Shorter"))
-    batch = await claim_feedback_batch(engine, "100.000")
+    batch = await claim_feedback_batch(engine, "100.000", now=eligible_now())
     assert batch is not None
 
     with pytest.raises(ValueError, match="latest queued predecessor"):
@@ -155,14 +160,14 @@ async def test_stale_predecessor_cannot_create_another_latest_revision(engine):
     original = await persist_draft(engine, draft())
     await bind_draft_thread(engine, original, "D123", "100.000")
     await record_revision_feedback(engine, event("Ev1", "100.002", "Shorter"))
-    first_batch = await claim_feedback_batch(engine, "100.000")
+    first_batch = await claim_feedback_batch(engine, "100.000", now=eligible_now())
     assert first_batch is not None
     await persist_revision_and_supersede(
         engine, original, draft("revision 1"), first_batch.feedback_ids
     )
 
     await record_revision_feedback(engine, event("Ev2", "100.003", "Punchier"))
-    second_batch = await claim_feedback_batch(engine, "100.000")
+    second_batch = await claim_feedback_batch(engine, "100.000", now=eligible_now())
     assert second_batch is not None
     with pytest.raises(ValueError, match="latest queued predecessor"):
         await persist_revision_and_supersede(
