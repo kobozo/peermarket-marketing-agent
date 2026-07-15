@@ -21,7 +21,6 @@ from peermarket_agent.revisions import (
     renew_generation_lease,
     requeue_feedback_batch,
 )
-from peermarket_agent.slack_dm import format_revised_draft_dm
 from peermarket_agent.slack_notifier import SlackNotifier
 
 log = structlog.get_logger(__name__)
@@ -65,25 +64,12 @@ async def run_pending_revisions(
                 visual_truthfulness_pass=generated.draft.visual_truthfulness_pass,
                 metadata=generated.draft.metadata,
             )
-            message = format_revised_draft_dm(
-                {
-                    "id": "{{draft_id}}",
-                    "action_type_name": accepted.action_type_name,
-                    "language": accepted.language,
-                    "channel": accepted.channel,
-                    "brand_score": score,
-                    "copy": accepted.copy,
-                    "revision_number": source.revision_number + 1,
-                    "revision_feedback": "\n\n".join(batch.instructions),
-                },
-                change_summary=generated.change_summary,
-            )
             await persist_revision_and_supersede(
                 engine,
                 predecessor_id,
                 accepted,
                 batch.feedback_ids,
-                outbox_text=message,
+                outbox_change_summary=generated.change_summary,
                 outbox_idempotency_key=f"revision-feedback:{batch.feedback_ids[0]}",
                 lease_owner=batch.lease_owner,
             )

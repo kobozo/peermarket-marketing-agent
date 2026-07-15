@@ -242,7 +242,7 @@ async def test_revision_insert_and_supersede_are_atomic(engine):
         original,
         draft("revised"),
         batch.feedback_ids,
-        outbox_text="Revision {{draft_id}}",
+        outbox_change_summary="Shortened copy containing literal {{draft_id}}",
         outbox_idempotency_key="feedback:1",
     )
     async with engine.connect() as conn:
@@ -266,7 +266,9 @@ async def test_revision_insert_and_supersede_are_atomic(engine):
         (revised_id, "queued", original, original, 1, "D123", "100.000"),
     ]
     assert feedback_status == "applied"
-    assert outbox == (revised_id, f"Revision {revised_id}")
+    assert outbox[0] == revised_id
+    assert f"draft #{revised_id}" in outbox[1]
+    assert "literal {{draft_id}}" in outbox[1]
 
 
 async def test_outbox_insert_failure_rolls_back_revision_supersede_and_feedback(engine):
@@ -285,7 +287,7 @@ async def test_outbox_insert_failure_rolls_back_revision_supersede_and_feedback(
             original,
             draft("revised"),
             batch.feedback_ids,
-            outbox_text="Revision {{draft_id}}",
+            outbox_change_summary="Shortened",
             outbox_idempotency_key="feedback:1",
         )
 
@@ -313,7 +315,7 @@ async def test_invalid_predecessor_rolls_back_feedback_and_draft(engine):
             original + 999,
             draft("bad"),
             batch.feedback_ids,
-            outbox_text="bad {{draft_id}}",
+            outbox_change_summary="Bad",
             outbox_idempotency_key="invalid",
         )
 
@@ -337,7 +339,7 @@ async def test_stale_predecessor_cannot_create_another_latest_revision(engine):
         original,
         draft("revision 1"),
         first_batch.feedback_ids,
-        outbox_text="first {{draft_id}}",
+        outbox_change_summary="First",
         outbox_idempotency_key="first",
     )
 
@@ -350,6 +352,6 @@ async def test_stale_predecessor_cannot_create_another_latest_revision(engine):
             original,
             draft("wrong branch"),
             second_batch.feedback_ids,
-            outbox_text="second {{draft_id}}",
+            outbox_change_summary="Second",
             outbox_idempotency_key="second",
         )

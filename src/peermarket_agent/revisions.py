@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.drafts import Draft, draft_insert_params
 from peermarket_agent.revision_generator import SourceDraft
+from peermarket_agent.slack_dm import format_revised_draft_dm
 
 
 @dataclass(frozen=True)
@@ -370,13 +371,13 @@ async def persist_revision_and_supersede(
     revised_draft: Draft,
     feedback_ids: tuple[int, ...],
     *,
-    outbox_text: str,
+    outbox_change_summary: str,
     outbox_idempotency_key: str,
     lease_owner: str | None = None,
 ) -> int:
     if not feedback_ids:
         raise ValueError("revision requires claimed feedback")
-    if not outbox_text.strip() or not outbox_idempotency_key:
+    if not outbox_change_summary.strip() or not outbox_idempotency_key:
         raise ValueError("outbox payload and idempotency key must be non-empty")
     async with engine.begin() as connection:
         predecessor = (
@@ -474,7 +475,19 @@ async def persist_revision_and_supersede(
         )
         if applied.rowcount != len(set(feedback_ids)):
             raise RuntimeError("feedback application changed concurrently")
-        frozen_text = outbox_text.replace("{{draft_id}}", str(new_id))
+        frozen_text = format_revised_draft_dm(
+            {
+                "id": int(new_id),
+                "action_type_name": revised_draft.action_type_name,
+                "language": revised_draft.language,
+                "channel": revised_draft.channel,
+                "brand_score": revised_draft.brand_score,
+                "copy": revised_draft.copy,
+                "revision_number": int(predecessor["revision_number"]) + 1,
+                "revision_feedback": combined_feedback,
+            },
+            change_summary=outbox_change_summary,
+        )
         outbox = await connection.execute(
             text(
                 "INSERT INTO slack_outbox (idempotency_key, draft_id, channel_id, root_ts, "

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,13 @@ from peermarket_agent.config import get_settings
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
 from peermarket_agent.drafts import Draft, persist_draft
+from peermarket_agent.revisions import (
+    RevisionFeedbackEvent,
+    bind_draft_thread,
+    claim_feedback_batch,
+    persist_revision_and_supersede,
+    record_revision_feedback,
+)
 from peermarket_agent.slack_bridge.ack_handler import handle_ack
 
 
@@ -104,6 +112,75 @@ async def test_handle_ack_already_decided(engine_with_draft):
     assert row[1] == "U1"
 
 
+async def _revision(engine, original: int) -> int:
+    await bind_draft_thread(engine, original, "D123", "100.000")
+    await record_revision_feedback(
+        engine,
+        RevisionFeedbackEvent("Ev-ack", "D123", "100.000", "100.001", "shorter"),
+    )
+    batch = await claim_feedback_batch(
+        engine, "D123", "100.000", now=datetime.now(UTC) + timedelta(seconds=16)
+    )
+    assert batch is not None
+    return await persist_revision_and_supersede(
+        engine,
+        original,
+        Draft(
+            action_type_name="tiktok_post_organic",
+            channel="tiktok",
+            language="NL",
+            copy="revised",
+            asset_path=None,
+            generation_cost_cents=1,
+            brand_score=90,
+            visual_truthfulness_pass=True,
+        ),
+        batch.feedback_ids,
+        outbox_change_summary="Made it shorter",
+        outbox_idempotency_key="ack-revision",
+    )
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+async def test_handle_ack_refuses_superseded_variant_and_points_to_latest(
+    engine_with_draft, action
+):
+    engine, original = engine_with_draft
+    revised = await _revision(engine, original)
+
+    result = await handle_ack(engine, action=action, draft_id=original, decided_by="U1")
+
+    assert result.success is False
+    assert f"draft #{revised}" in result.reply_text.lower()
+    assert "revised" not in result.reply_text
+    async with engine.connect() as conn:
+        statuses = (
+            (await conn.execute(text("SELECT status FROM drafts ORDER BY id"))).scalars().all()
+        )
+    assert statuses == ["superseded", "queued"]
+
+
+async def test_handle_ack_refuses_nonlatest_queued_variant(engine_with_draft):
+    engine, original = engine_with_draft
+    revised = await _revision(engine, original)
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE drafts SET status='queued' WHERE id=:id"), {"id": original})
+
+    result = await handle_ack(engine, action="approve", draft_id=original, decided_by="U1")
+
+    assert result.success is False
+    assert f"draft #{revised}" in result.reply_text.lower()
+
+
+async def test_concurrent_acks_only_one_decision_wins(engine_with_draft):
+    engine, draft_id = engine_with_draft
+    results = await asyncio.gather(
+        handle_ack(engine, action="approve", draft_id=draft_id, decided_by="U1"),
+        handle_ack(engine, action="reject", draft_id=draft_id, decided_by="U2"),
+    )
+    assert sum(result.success for result in results) == 1
+
+
 async def test_handle_approve_meta_draft_schedules_pipeline(monkeypatch):
     """Approving a meta_ad_creative draft schedules process_approved_meta_draft."""
     # Seed minimum env so get_settings() works inside the handler
@@ -157,14 +234,38 @@ async def test_handle_approve_meta_draft_schedules_pipeline(monkeypatch):
             ),
         )
 
+        await bind_draft_thread(eng, draft_id, "D-META", "200.000")
+        async with eng.begin() as conn:
+            revised_id = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO drafts (action_type_id, channel, language, copy, "
+                        "generation_cost_cents, brand_score, visual_truthfulness_pass, metadata, "
+                        "parent_draft_id, root_draft_id, revision_number, revision_feedback, "
+                        "slack_channel_id, slack_root_ts) "
+                        "SELECT action_type_id, channel, language, 'revised meta', "
+                        "generation_cost_cents, brand_score, visual_truthfulness_pass, metadata, "
+                        "id, id, 1, 'make it sharper', slack_channel_id, slack_root_ts "
+                        "FROM drafts WHERE id=:id RETURNING id"
+                    ),
+                    {"id": draft_id},
+                )
+            ).scalar_one()
+            await conn.execute(
+                text("UPDATE drafts SET status='superseded' WHERE id=:id"), {"id": draft_id}
+            )
+
         pipeline_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(
             "peermarket_agent.slack_bridge.ack_handler.process_approved_meta_draft",
             pipeline_mock,
         )
 
-        result = await handle_ack(eng, action="approve", draft_id=draft_id, decided_by="U0FOUNDER")
-        assert result.success is True
+        results = await asyncio.gather(
+            handle_ack(eng, action="approve", draft_id=revised_id, decided_by="U0FOUNDER"),
+            handle_ack(eng, action="approve", draft_id=revised_id, decided_by="U0FOUNDER"),
+        )
+        assert sum(result.success for result in results) == 1
 
         # Wait briefly so the scheduled task gets a chance to run
         for _ in range(50):
@@ -174,8 +275,13 @@ async def test_handle_approve_meta_draft_schedules_pipeline(monkeypatch):
 
         pipeline_mock.assert_awaited_once()
         kwargs = pipeline_mock.await_args.kwargs
-        assert kwargs["draft_id"] == draft_id
+        assert kwargs["draft_id"] == revised_id
         assert kwargs["engine"] is eng
+        async with eng.connect() as conn:
+            statuses = (
+                (await conn.execute(text("SELECT status FROM drafts ORDER BY id"))).scalars().all()
+            )
+        assert statuses == ["superseded", "approved"]
     finally:
         get_settings.cache_clear()
         await eng.dispose()
