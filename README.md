@@ -86,6 +86,11 @@ Socket Mode must remain enabled.
 
 ### Replacing a terminal Meta hierarchy
 
+Before running any production replacement command, deploy this capability through
+a reviewed pull request and the complete GitHub Actions deployment workflow. Do
+not run the command from an unmerged branch or an ad-hoc production checkout, and
+never hand-edit production PostgreSQL to enable, reset, or repair a replacement.
+
 `peermarket-meta replace-terminal-draft` is an explicit recovery command for an
 `approved` or already `published` Meta draft. Use it only when the exact stored
 campaign, ad set, creative, and ad IDs are present and the entire live hierarchy

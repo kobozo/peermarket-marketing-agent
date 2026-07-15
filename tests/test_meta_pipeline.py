@@ -19,6 +19,7 @@ from peermarket_agent.meta_ads import (
     MetaAdsError,
 )
 from peermarket_agent.meta_pipeline import (
+    TerminalReplacementOperationalError,
     _mark_published,
     _process_approved_meta_draft,
     process_approved_meta_draft,
@@ -802,6 +803,91 @@ async def test_private_lifecycle_without_replacement_authorization_is_noop_for_p
     assert await get_meta_publication(engine, draft_id) is None
 
 
+@pytest.mark.parametrize("failure_phase", ["create", "activate", "finalize"])
+async def test_published_replacement_failure_notifications_preserve_published_wording(
+    monkeypatch, engine_with_meta_draft, failure_phase
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    old_ids = {
+        "campaign_id": "old-c",
+        "ad_set_id": "old-s",
+        "creative_id": "old-cr",
+        "ad_id": "old-a",
+    }
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE drafts SET status = 'published' WHERE id = :id"), {"id": draft_id}
+        )
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id,
+            state="active",
+            external_ids=old_ids,
+            approved_budget_cents=800,
+        ),
+    )
+    terminal = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=terminal)
+    )
+    _patch_replacement_preparation(monkeypatch)
+    created = MetaAdResult(
+        ad_id="new-a",
+        ad_set_id="new-s",
+        campaign_id="new-c",
+        creative_id="new-cr",
+        ads_manager_url="https://example.test/new-a",
+        status="PAUSED",
+    )
+    activation = MetaActivationResult(
+        campaign={"status": "ACTIVE", "effective_status": "ACTIVE"},
+        ad_set={"status": "ACTIVE", "effective_status": "ACTIVE"},
+        ad={"status": "ACTIVE", "effective_status": "PENDING_REVIEW"},
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_ad_paused",
+        AsyncMock(
+            side_effect=MetaAdsError("sanitized create failure", phase="create")
+            if failure_phase == "create"
+            else None,
+            return_value=created,
+        ),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.activate_meta_ad",
+        AsyncMock(
+            side_effect=MetaAdsError("sanitized activation failure", phase="activate")
+            if failure_phase == "activate"
+            else None,
+            return_value=activation,
+        ),
+    )
+    if failure_phase == "finalize":
+        monkeypatch.setattr(
+            "peermarket_agent.meta_pipeline._mark_published",
+            AsyncMock(side_effect=RuntimeError("database race")),
+        )
+        monkeypatch.setattr("peermarket_agent.meta_pipeline.pause_meta_ad", AsyncMock(return_value={}))
+    notifier = AsyncMock()
+
+    with pytest.raises(TerminalReplacementOperationalError):
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=_make_settings(),
+            notifier=notifier,
+            expected_ids=old_ids,
+        )
+
+    notifications = "\n".join(call.args[0] for call in notifier.notify_founder.await_args_list)
+    assert "published" in notifications.lower()
+    assert "approved" not in notifications.lower()
+
+
 async def test_terminal_replacement_sanitizes_history_finalizer_validation_failure(
     monkeypatch, engine_with_meta_draft
 ):
@@ -1033,6 +1119,7 @@ async def test_activation_failure_retains_ids_diagnostics_and_approved_status(
     assert status == "approved"
     notifier.notify_founder.assert_awaited_once()
     assert "Rollback complete" in notifier.notify_founder.await_args.args[0]
+    assert "Draft remains approved" in notifier.notify_founder.await_args.args[0]
 
 
 async def test_published_retry_is_noop(monkeypatch, engine_with_meta_draft):
@@ -1097,6 +1184,7 @@ async def test_finalization_failure_retains_reconciliation_state(
     stored = await get_meta_publication(engine, draft_id)
     assert stored is not None
     assert stored.external_ids == ids
+    assert "Draft remains approved" in notifier.notify_founder.await_args.args[0]
     assert stored.failure["phase"] == "finalize"
     assert stored.failure["rollback_complete"] is False
     assert stored.failure["rollback_errors"] == {"ad": "pause rejected"}
@@ -1286,6 +1374,7 @@ async def test_meta_disabled_dms_founder(monkeypatch, engine_with_meta_draft):
     msg = notifier.notify_founder.await_args.args[0]
     assert "Meta connector isn't configured" in msg
     assert "META_*" in msg
+    assert "draft remains approved" in msg
 
 
 async def test_non_meta_draft_is_skipped_silently(monkeypatch):

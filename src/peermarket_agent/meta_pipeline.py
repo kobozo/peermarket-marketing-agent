@@ -563,6 +563,8 @@ async def _process_approved_meta_draft(
     if draft_status != "approved" and not authorized_published_replacement:
         log.warning("meta_pipeline.draft_not_approved", draft_id=draft_id, status=draft_status)
         return
+    draft_status_label = "Published" if authorized_published_replacement else "Approved"
+    retained_draft_status = draft_status_label.lower()
     if not settings.meta_auto_activate:
         log.warning("meta_pipeline.auto_activation_disabled", draft_id=draft_id)
         await notifier.notify_founder(
@@ -643,8 +645,9 @@ async def _process_approved_meta_draft(
                     error=e,
                 )
                 await notifier.notify_founder(
-                    f"⚠️ Approved draft #{draft_id} but couldn't screenshot peermarket.eu: {e}. "
-                    "Draft remains approved; retry after fixing screenshot capture."
+                    f"⚠️ {draft_status_label} draft #{draft_id} but couldn't screenshot "
+                    f"peermarket.eu: {e}. Draft remains {retained_draft_status}; retry after "
+                    "fixing screenshot capture."
                 )
                 return
 
@@ -660,7 +663,8 @@ async def _process_approved_meta_draft(
             except ImageEditError as e:
                 log.exception("meta_pipeline.image_edit_failed", draft_id=draft_id)
                 await notifier.notify_founder(
-                    f"⚠️ Approved draft #{draft_id}, screenshot OK, but image-edit failed: {e}. "
+                    f"⚠️ {draft_status_label} draft #{draft_id}, screenshot OK, but image-edit "
+                    f"failed: {e}. "
                     "Falling back to raw screenshot, continuing with Meta push."
                 )
 
@@ -688,8 +692,9 @@ async def _process_approved_meta_draft(
                 error=e,
             )
             await notifier.notify_founder(
-                f"⚠️ Approved draft #{draft_id}, but Meta connector isn't configured: {e}. "
-                "Set the META_* secrets + redeploy; draft remains approved."
+                f"⚠️ {draft_status_label} draft #{draft_id}, but Meta connector isn't "
+                f"configured: {e}. Set the META_* secrets + redeploy; draft remains "
+                f"{retained_draft_status}."
             )
             return
         except MetaAdsError as e:
@@ -702,8 +707,9 @@ async def _process_approved_meta_draft(
                 error=e,
             )
             await notifier.notify_founder(
-                f"⚠️ Approved draft #{draft_id}, but Meta creation failed: {e}. "
-                "Draft remains approved; no automatic duplicate retry was attempted."
+                f"⚠️ {draft_status_label} draft #{draft_id}, but Meta creation failed: {e}. "
+                f"Draft remains {retained_draft_status}; no automatic duplicate retry was "
+                "attempted."
             )
             return
         ids = {
@@ -749,7 +755,8 @@ async def _process_approved_meta_draft(
         )
         await notifier.notify_founder(
             f"⚠️ Meta activation failed for draft #{draft_id} during {details['phase']}. "
-            f"{rollback_state}; stored IDs retained for reconciliation. Draft remains approved."
+            f"{rollback_state}; stored IDs retained for reconciliation. Draft remains "
+            f"{retained_draft_status}."
         )
         return
 
@@ -789,7 +796,7 @@ async def _process_approved_meta_draft(
         await notifier.notify_founder(
             f"⚠️ Meta activated draft #{draft_id}, but database finalization failed. "
             f"{rollback_state}; stored IDs and observed statuses were retained. "
-            "Draft remains approved for retry."
+            f"Draft remains {retained_draft_status} for retry."
         )
         return
     observed_state = activation.ad.get("effective_status", activation.ad.get("status", "ACTIVE"))
