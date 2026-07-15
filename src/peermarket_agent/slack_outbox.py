@@ -64,13 +64,22 @@ async def enqueue_thread_approval(
 
 
 async def deliver_pending_outbox(
-    engine: AsyncEngine, notifier: SlackNotifier, *, limit: int = 50
+    engine: AsyncEngine,
+    notifier: SlackNotifier,
+    *,
+    limit: int = 50,
+    lease_seconds: int = 300,
 ) -> int:
     """Deliver due messages once, retaining their frozen payload for retries."""
     owner = str(uuid.uuid4())
-    rows = await _claim_pending_outbox(engine, owner=owner, limit=limit)
     delivered = 0
-    for row in rows:
+    for _ in range(limit):
+        rows = await _claim_pending_outbox(engine, owner=owner, lease_seconds=lease_seconds)
+        if not rows:
+            break
+        row = rows[0]
+        if not await _lease_is_current(engine, row, owner=owner):
+            continue
         try:
             result = await notifier.send_message(
                 row.text,
@@ -90,10 +99,25 @@ async def deliver_pending_outbox(
     return delivered
 
 
+async def _lease_is_current(engine: AsyncEngine, message: OutboxMessage, *, owner: str) -> bool:
+    """Verify ownership immediately before the external side effect."""
+    async with engine.connect() as connection:
+        current = (
+            await connection.execute(
+                sql_text(
+                    "SELECT 1 FROM slack_outbox WHERE id=:id AND lease_owner=:owner "
+                    "AND lease_expires_at > NOW() AND status IN ('pending','failed')"
+                ),
+                {"id": message.id, "owner": owner},
+            )
+        ).scalar_one_or_none()
+    return current is not None
+
+
 async def _claim_pending_outbox(
-    engine: AsyncEngine, *, owner: str, limit: int, lease_seconds: int = 300
+    engine: AsyncEngine, *, owner: str, lease_seconds: int = 300
 ) -> tuple[OutboxMessage, ...]:
-    """Lease due rows in one short transaction without holding locks during I/O."""
+    """Lease at most one due row without holding locks during I/O."""
     async with engine.begin() as connection:
         rows = (
             (
@@ -102,14 +126,14 @@ async def _claim_pending_outbox(
                         "WITH candidates AS (SELECT id FROM slack_outbox "
                         "WHERE status IN ('pending','failed') AND next_attempt_at <= NOW() "
                         "AND (lease_expires_at IS NULL OR lease_expires_at <= NOW()) "
-                        "ORDER BY id LIMIT :limit FOR UPDATE SKIP LOCKED) "
+                        "ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) "
                         "UPDATE slack_outbox AS outbox SET lease_owner=:owner, "
                         "lease_expires_at=NOW()+make_interval(secs => :lease_seconds), "
                         "attempt_count=attempt_count+1 FROM candidates "
                         "WHERE outbox.id=candidates.id RETURNING outbox.id, outbox.draft_id, "
                         "outbox.channel_id, outbox.root_ts, outbox.message_kind, outbox.payload"
                     ),
-                    {"limit": limit, "owner": owner, "lease_seconds": lease_seconds},
+                    {"owner": owner, "lease_seconds": lease_seconds},
                 )
             )
             .mappings()

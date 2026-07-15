@@ -1,5 +1,6 @@
 """Transactional Slack approval outbox tests."""
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
@@ -16,6 +17,7 @@ from peermarket_agent.slack_notifier import SlackMessageResult
 from peermarket_agent.slack_outbox import (
     _claim_pending_outbox,
     _finalize_success,
+    _lease_is_current,
     deliver_pending_outbox,
     enqueue_root_approval,
     enqueue_thread_approval,
@@ -130,8 +132,8 @@ async def test_concurrent_workers_claim_each_message_once(prepared_db):
         await enqueue_root_approval(prepared_db, draft_id=draft_id, text=f"root {draft_id}")
 
     first, second = await __import__("asyncio").gather(
-        _claim_pending_outbox(prepared_db, owner="worker-a", limit=2),
-        _claim_pending_outbox(prepared_db, owner="worker-b", limit=2),
+        _claim_pending_outbox(prepared_db, owner="worker-a"),
+        _claim_pending_outbox(prepared_db, owner="worker-b"),
     )
 
     assert {item.id for item in first}.isdisjoint({item.id for item in second})
@@ -141,13 +143,13 @@ async def test_concurrent_workers_claim_each_message_once(prepared_db):
 async def test_expired_lease_is_reclaimed_and_stale_owner_cannot_finalize(prepared_db):
     draft_id = await _draft(prepared_db)
     await enqueue_root_approval(prepared_db, draft_id=draft_id, text="root")
-    claimed = await _claim_pending_outbox(prepared_db, owner="old", limit=1)
+    claimed = await _claim_pending_outbox(prepared_db, owner="old")
     async with prepared_db.begin() as connection:
         await connection.execute(
             text("UPDATE slack_outbox SET lease_expires_at=:expired"),
             {"expired": datetime.now(UTC) - timedelta(seconds=1)},
         )
-    reclaimed = await _claim_pending_outbox(prepared_db, owner="new", limit=1)
+    reclaimed = await _claim_pending_outbox(prepared_db, owner="new")
 
     assert reclaimed[0].id == claimed[0].id
     assert not await _finalize_success(
@@ -204,3 +206,54 @@ async def test_cancellation_between_rows_preserves_finalized_first(prepared_db):
             .all()
         )
     assert statuses == ["delivered", "pending"]
+
+
+async def test_reclaimed_lease_prevents_stale_worker_from_sending(prepared_db, monkeypatch):
+    draft_id = await _draft(prepared_db)
+    await enqueue_root_approval(prepared_db, draft_id=draft_id, text="one visible root")
+    first_at_boundary = asyncio.Event()
+    second_finished = asyncio.Event()
+    checks = 0
+    real_check = _lease_is_current
+
+    async def controlled_check(engine, message, *, owner):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            first_at_boundary.set()
+            await second_finished.wait()
+        return await real_check(engine, message, owner=owner)
+
+    monkeypatch.setattr("peermarket_agent.slack_outbox._lease_is_current", controlled_check)
+    notifier = AsyncMock()
+    notifier.send_message = AsyncMock(return_value=SlackMessageResult("D1", "1.0"))
+
+    stale_worker = asyncio.create_task(
+        deliver_pending_outbox(prepared_db, notifier, limit=1, lease_seconds=60)
+    )
+    await first_at_boundary.wait()
+    async with prepared_db.begin() as connection:
+        await connection.execute(
+            text("UPDATE slack_outbox SET lease_expires_at=NOW()-INTERVAL '1 second'")
+        )
+    current_worker = asyncio.create_task(
+        deliver_pending_outbox(prepared_db, notifier, limit=1, lease_seconds=60)
+    )
+    await current_worker
+    second_finished.set()
+    await stale_worker
+
+    assert notifier.send_message.await_count == 1
+
+
+async def test_delivery_limit_caps_claimed_messages(prepared_db):
+    for value in ("one", "two", "three"):
+        draft_id = await _draft(prepared_db, value)
+        await enqueue_root_approval(prepared_db, draft_id=draft_id, text=value)
+    notifier = AsyncMock()
+    notifier.send_message = AsyncMock(
+        side_effect=[SlackMessageResult("D1", "1.0"), SlackMessageResult("D1", "2.0")]
+    )
+
+    assert await deliver_pending_outbox(prepared_db, notifier, limit=2) == 2
+    assert notifier.send_message.await_count == 2

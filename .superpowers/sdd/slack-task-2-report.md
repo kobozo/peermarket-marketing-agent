@@ -116,3 +116,26 @@ both startup failure directions, and idempotent daily counting.
 The unavoidable ambiguous Slack-success/network-response gap documented above
 is unchanged; retry always uses the frozen stored payload and never regenerates
 copy.
+
+### Lease-race follow-up
+
+The claim primitive now leases at most one row. Delivery repeats the sequence
+claim one → verify current ownership at the send boundary → post → finalize,
+up to the caller's throughput limit. It therefore never pre-leases later batch
+candidates whose leases could expire while earlier network calls run.
+
+A deterministic two-worker test pauses the first worker at the send boundary,
+expires and reclaims its lease with a second worker, then resumes the stale
+worker. The current worker posts and finalizes; the stale ownership check fails
+and no second visible Slack call occurs. Separate coverage confirms the
+throughput limit, frozen payload, cancellation behavior, and per-result
+finalization remain intact.
+
+Final verification after this follow-up:
+
+```text
+239 passed in 23.66s
+77 files already formatted
+All checks passed!
+git diff --check: exit 0
+```
