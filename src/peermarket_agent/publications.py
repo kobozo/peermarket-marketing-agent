@@ -2,7 +2,8 @@
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -17,8 +18,13 @@ class MetaPublication:
     failure: dict | None = None
     approved_budget_cents: int | None = None
     ads_manager_url: str | None = None
+    replacement_history: list[dict] = field(default_factory=list)
     created_at: datetime | None = field(default=None, compare=False)
     updated_at: datetime | None = field(default=None, compare=False)
+
+
+class MetaReplacementHistoryError(RuntimeError):
+    """A started replacement attempt could not be durably finalized."""
 
 
 async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublication | None:
@@ -33,7 +39,7 @@ async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublic
                         "THEN jsonb_build_object('ad_id', external_id) "
                         "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB) "
                         "AS external_ids, external_statuses, failure, "
-                        "approved_budget_cents, ads_manager_url, published_at AS created_at, "
+                        "approved_budget_cents, ads_manager_url, replacement_history, published_at AS created_at, "
                         "updated_at FROM publications WHERE draft_id = :draft_id"
                     ),
                     {"draft_id": draft_id},
@@ -47,6 +53,7 @@ async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublic
     values = dict(row)
     values["external_ids"] = values["external_ids"] or {}
     values["external_statuses"] = values["external_statuses"] or {}
+    values["replacement_history"] = values.get("replacement_history") or []
     return MetaPublication(**values)
 
 
@@ -102,3 +109,82 @@ async def mark_meta_publication_active(engine: AsyncEngine, draft_id: int, statu
                 "external_statuses": json.dumps(statuses or {}),
             },
         )
+
+
+async def begin_meta_terminal_replacement(
+    engine: AsyncEngine,
+    draft_id: int,
+    expected_ids: dict[str, str],
+    terminal_statuses: dict[str, dict[str, str]],
+) -> str:
+    """Archive the exact current hierarchy and clear it in one guarded transition."""
+    attempt_id = str(uuid4())
+    history_entry = {
+        "attempt_id": attempt_id,
+        "started_at": datetime.now(UTC).isoformat(),
+        "finished_at": None,
+        "old_ids": expected_ids,
+        "terminal_statuses": terminal_statuses,
+        "replacement_ids": {},
+        "state": "creating",
+    }
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(
+                "UPDATE publications SET external_id = NULL, external_ids = '{}'::JSONB, "
+                "external_statuses = '{}'::JSONB, state = 'creating', failure = NULL, "
+                "ads_manager_url = NULL, replacement_history = "
+                "COALESCE(replacement_history, '[]'::JSONB) || CAST(:entry AS JSONB), "
+                "updated_at = NOW() WHERE draft_id = :draft_id AND "
+                "(CASE WHEN external_id IS NOT NULL THEN jsonb_build_object('ad_id', external_id) "
+                "ELSE '{}'::JSONB END || COALESCE(external_ids, '{}'::JSONB)) = "
+                "CAST(:expected_ids AS JSONB)"
+            ),
+            {
+                "draft_id": draft_id,
+                "expected_ids": json.dumps(expected_ids),
+                "entry": json.dumps([history_entry]),
+            },
+        )
+        if result.rowcount != 1:
+            raise ValueError("refusing replacement: stored Meta IDs changed")
+    return attempt_id
+
+
+async def record_meta_replacement_result(
+    engine: AsyncEngine,
+    draft_id: int,
+    attempt_id: str,
+    *,
+    state: str,
+    failure: dict | None,
+) -> None:
+    """Finalize one identified replacement attempt in place."""
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(
+                "UPDATE publications SET replacement_history = "
+                "COALESCE((SELECT jsonb_agg(CASE WHEN item.value->>'attempt_id' = :attempt_id "
+                "THEN item.value || jsonb_build_object("
+                "'replacement_ids', COALESCE(publications.external_ids, '{}'::JSONB), "
+                "'state', CAST(:state AS TEXT), 'failure', CAST(:failure AS JSONB), "
+                "'finished_at', CAST(:finished_at AS TEXT)) ELSE item.value END "
+                "ORDER BY item.ordinality) "
+                "FROM jsonb_array_elements(COALESCE(publications.replacement_history, '[]'::JSONB)) "
+                "WITH ORDINALITY AS item(value, ordinality)), '[]'::JSONB), updated_at = NOW() "
+                "WHERE draft_id = :draft_id AND EXISTS (SELECT 1 FROM "
+                "jsonb_array_elements(COALESCE(replacement_history, '[]'::JSONB)) AS existing "
+                "WHERE existing->>'attempt_id' = :attempt_id)"
+            ),
+            {
+                "draft_id": draft_id,
+                "attempt_id": attempt_id,
+                "state": state,
+                "failure": json.dumps(failure) if failure is not None else None,
+                "finished_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        if result.rowcount != 1:
+            raise MetaReplacementHistoryError(
+                f"replacement attempt was not found for draft #{draft_id}"
+            )

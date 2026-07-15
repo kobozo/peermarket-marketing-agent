@@ -1,5 +1,6 @@
 """Meta pipeline tests — approval → screenshot → brand-frame → paused Meta ad."""
 
+import asyncio
 import os
 from unittest.mock import AsyncMock
 
@@ -17,10 +18,15 @@ from peermarket_agent.meta_ads import (
     MetaAdsDisabled,
     MetaAdsError,
 )
-from peermarket_agent.meta_pipeline import _mark_published, process_approved_meta_draft
+from peermarket_agent.meta_pipeline import (
+    _mark_published,
+    process_approved_meta_draft,
+    replace_terminal_meta_draft,
+)
 from peermarket_agent.nano_banana import ImageEditDisabled
 from peermarket_agent.publications import (
     MetaPublication,
+    MetaReplacementHistoryError,
     get_meta_publication,
     upsert_meta_publication,
 )
@@ -55,6 +61,15 @@ def _make_settings(**overrides) -> Settings:
     )
     base.update(overrides)
     return Settings(**base)
+
+
+def _patch_replacement_preparation(monkeypatch):
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.screenshot_url", AsyncMock(return_value=b"raw")
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.edit_image", AsyncMock(return_value=b"prepared")
+    )
 
 
 async def test_pipeline_refuses_automatic_activation_when_disabled(
@@ -213,6 +228,497 @@ async def test_full_happy_path(monkeypatch, engine_with_meta_draft):
             await conn.execute(text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id})
         ).scalar_one()
     assert status == "published"
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        {
+            "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+            "ad_set": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+            "ad": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+        },
+        {
+            "campaign": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+            "ad_set": {"status": "DELETED", "effective_status": "DELETED"},
+        },
+        {
+            "campaign": {"status": "ARCHIVED", "effective_status": "UNKNOWN"},
+            "ad_set": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+            "ad": {"status": "ARCHIVED", "effective_status": "ARCHIVED"},
+        },
+    ],
+)
+async def test_terminal_replacement_refuses_nonterminal_missing_or_unknown_without_write_or_create(
+    monkeypatch, engine_with_meta_draft, statuses
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=statuses)
+    )
+    create = AsyncMock()
+    notifier = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create)
+
+    with pytest.raises(ValueError, match="not entirely terminal"):
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=_make_settings(),
+            notifier=notifier,
+            expected_ids=ids,
+        )
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored.external_ids == ids
+    assert stored.replacement_history == []
+    create.assert_not_awaited()
+    notifier.notify_founder.assert_awaited_once()
+
+
+async def test_terminal_replacement_archives_exact_ids_then_runs_normal_pipeline_once(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+    statuses = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=statuses)
+    )
+    _patch_replacement_preparation(monkeypatch)
+
+    async def successful_replacement(**kwargs):
+        await upsert_meta_publication(
+            engine,
+            MetaPublication(
+                draft_id=draft_id,
+                state="active",
+                external_ids={
+                    "campaign_id": "new-c",
+                    "ad_set_id": "new-s",
+                    "creative_id": "new-cr",
+                    "ad_id": "new-a",
+                },
+            ),
+        )
+
+    normal = AsyncMock(side_effect=successful_replacement)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline._process_approved_meta_draft", normal)
+
+    result = await replace_terminal_meta_draft(
+        engine=engine,
+        draft_id=draft_id,
+        settings=_make_settings(),
+        notifier=AsyncMock(),
+        expected_ids=ids,
+    )
+
+    normal.assert_awaited_once()
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored.external_ids["campaign_id"] == "new-c"
+    assert stored.approved_budget_cents == 1000
+    assert stored.replacement_history[0]["old_ids"] == ids
+    assert result.old_ids == ids
+
+
+async def test_terminal_replacement_partial_creation_is_current_and_historical(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+    statuses = {
+        name: {"status": "DELETED", "effective_status": "DELETED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=statuses)
+    )
+    _patch_replacement_preparation(monkeypatch)
+
+    async def partial(**kwargs):
+        await upsert_meta_publication(
+            engine,
+            MetaPublication(
+                draft_id=draft_id,
+                state="failed",
+                external_ids={"campaign_id": "new-c"},
+                failure={"phase": "create_ad_set"},
+            ),
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline._process_approved_meta_draft",
+        AsyncMock(side_effect=partial),
+    )
+    notifier = AsyncMock()
+    with pytest.raises(Exception, match="replacement failed"):
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=_make_settings(),
+            notifier=notifier,
+            expected_ids=ids,
+        )
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored.replacement_history[0]["old_ids"] == ids
+    assert len(stored.replacement_history) == 1
+    assert stored.replacement_history[0]["replacement_ids"] == {"campaign_id": "new-c"}
+    assert "old-c" in notifier.notify_founder.await_args.args[0]
+    assert "new-c" in notifier.notify_founder.await_args.args[0]
+
+
+async def test_concurrent_terminal_replacements_create_only_once(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+    statuses = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    status_read = AsyncMock(return_value=statuses)
+
+    async def successful_replacement(**kwargs):
+        await upsert_meta_publication(
+            engine,
+            MetaPublication(
+                draft_id=draft_id,
+                state="active",
+                external_ids={
+                    "campaign_id": "new-c",
+                    "ad_set_id": "new-s",
+                    "creative_id": "new-cr",
+                    "ad_id": "new-a",
+                },
+            ),
+        )
+
+    normal = AsyncMock(side_effect=successful_replacement)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.get_meta_ad_statuses", status_read)
+    _patch_replacement_preparation(monkeypatch)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline._process_approved_meta_draft", normal)
+
+    outcomes = await asyncio.gather(
+        *[
+            replace_terminal_meta_draft(
+                engine=engine,
+                draft_id=draft_id,
+                settings=_make_settings(),
+                notifier=AsyncMock(),
+                expected_ids=ids,
+            )
+            for _ in range(2)
+        ],
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(value, Exception) for value in outcomes) == 1
+    assert normal.await_count == 1
+    assert status_read.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("settings", "budget_cents", "metadata_patch", "message"),
+    [
+        (_make_settings(meta_auto_activate=False), 1000, {}, "automatic Meta activation"),
+        (_make_settings(), 1050, {}, "whole euro"),
+        (_make_settings(), 1000, {"headline": None}, "metadata"),
+        (_make_settings(), 1000, {"headline": {}}, "metadata"),
+        (_make_settings(meta_page_id=""), 1000, {}, "connector configuration"),
+    ],
+)
+async def test_terminal_replacement_refuses_invalid_local_prerequisite_without_mutation(
+    monkeypatch, engine_with_meta_draft, settings, budget_cents, metadata_patch, message
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=budget_cents
+        ),
+    )
+    if metadata_patch:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE drafts SET metadata = metadata || CAST(:patch AS JSONB) WHERE id = :id"
+                ),
+                {"id": draft_id, "patch": __import__("json").dumps(metadata_patch)},
+            )
+    status_read = AsyncMock()
+    create = AsyncMock()
+    notifier = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.get_meta_ad_statuses", status_read)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create)
+
+    with pytest.raises(ValueError, match=message):
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=settings,
+            notifier=notifier,
+            expected_ids=ids,
+        )
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored.external_ids == ids
+    assert stored.replacement_history == []
+    status_read.assert_not_awaited()
+    create.assert_not_awaited()
+    notifier.notify_founder.assert_awaited_once()
+    assert "refusing" in notifier.notify_founder.await_args.args[0]
+
+
+async def test_terminal_replacement_refuses_screenshot_failure_without_mutation(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+    statuses = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=statuses)
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.screenshot_url",
+        AsyncMock(side_effect=ScreenshotError("browser down")),
+    )
+    create = AsyncMock()
+    notifier = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create)
+
+    with pytest.raises(ValueError, match="prepare replacement image"):
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=_make_settings(),
+            notifier=notifier,
+            expected_ids=ids,
+        )
+    stored = await get_meta_publication(engine, draft_id)
+    assert stored.external_ids == ids
+    assert stored.replacement_history == []
+    create.assert_not_awaited()
+    notifier.notify_founder.assert_awaited_once()
+
+
+async def test_terminal_replacement_finalizes_single_history_entry_on_unexpected_connector_exception(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    ids = {"campaign_id": "old-c", "ad_set_id": "old-s", "creative_id": "old-cr", "ad_id": "old-a"}
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=ids, approved_budget_cents=1000
+        ),
+    )
+    statuses = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=statuses)
+    )
+    _patch_replacement_preparation(monkeypatch)
+    notifier = AsyncMock()
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_ad_paused",
+        AsyncMock(side_effect=RuntimeError("token secret raw")),
+    )
+
+    with pytest.raises(Exception, match="replacement failed"):
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=_make_settings(),
+            notifier=notifier,
+            expected_ids=ids,
+        )
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert len(stored.replacement_history) == 1
+    attempt = stored.replacement_history[0]
+    assert attempt["attempt_id"]
+    assert attempt["started_at"]
+    assert attempt["finished_at"]
+    assert attempt["old_ids"] == ids
+    assert attempt["state"] == "failed"
+    assert attempt["failure"]["phase"] == "unexpected"
+    assert "token secret raw" not in str(attempt)
+
+
+async def test_terminal_replacement_success_survives_real_lifecycle_notifier_failure(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    old_ids = {
+        "campaign_id": "old-c",
+        "ad_set_id": "old-s",
+        "creative_id": "old-cr",
+        "ad_id": "old-a",
+    }
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=old_ids, approved_budget_cents=1000
+        ),
+    )
+    terminal = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=terminal)
+    )
+    _patch_replacement_preparation(monkeypatch)
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_ad_paused",
+        AsyncMock(
+            return_value=MetaAdResult(
+                ad_id="new-a",
+                ad_set_id="new-s",
+                campaign_id="new-c",
+                creative_id="new-cr",
+                ads_manager_url="https://example.test/new-a",
+                status="PAUSED",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.activate_meta_ad",
+        AsyncMock(
+            return_value=MetaActivationResult(
+                campaign={"status": "ACTIVE", "effective_status": "ACTIVE"},
+                ad_set={"status": "ACTIVE", "effective_status": "ACTIVE"},
+                ad={"status": "ACTIVE", "effective_status": "PENDING_REVIEW"},
+            )
+        ),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder = AsyncMock(side_effect=RuntimeError("slack unavailable"))
+
+    result = await replace_terminal_meta_draft(
+        engine=engine,
+        draft_id=draft_id,
+        settings=_make_settings(),
+        notifier=notifier,
+        expected_ids=old_ids,
+    )
+
+    stored = await get_meta_publication(engine, draft_id)
+    assert result.state == "active"
+    assert result.current_ids["ad_id"] == "new-a"
+    assert stored.state == "active"
+    assert stored.failure is None
+    assert stored.replacement_history[0]["state"] == "active"
+    assert stored.replacement_history[0]["failure"] is None
+    async with engine.connect() as connection:
+        draft_status = (
+            await connection.execute(
+                text("SELECT status FROM drafts WHERE id = :id"), {"id": draft_id}
+            )
+        ).scalar_one()
+    assert draft_status == "published"
+
+
+async def test_terminal_replacement_sanitizes_history_finalizer_validation_failure(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, draft_id, _ = engine_with_meta_draft
+    old_ids = {
+        "campaign_id": "old-c",
+        "ad_set_id": "old-s",
+        "creative_id": "old-cr",
+        "ad_id": "old-a",
+    }
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=draft_id, state="failed", external_ids=old_ids, approved_budget_cents=1000
+        ),
+    )
+    terminal = {
+        name: {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+        for name in ("campaign", "ad_set", "ad")
+    }
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=terminal)
+    )
+    _patch_replacement_preparation(monkeypatch)
+
+    async def successful_replacement(**kwargs):
+        await upsert_meta_publication(
+            engine,
+            MetaPublication(
+                draft_id=draft_id,
+                state="active",
+                external_ids={
+                    "campaign_id": "new-c",
+                    "ad_set_id": "new-s",
+                    "creative_id": "new-cr",
+                    "ad_id": "new-a",
+                },
+            ),
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline._process_approved_meta_draft",
+        AsyncMock(side_effect=successful_replacement),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.record_meta_replacement_result",
+        AsyncMock(side_effect=MetaReplacementHistoryError("mismatch raw detail")),
+    )
+
+    with pytest.raises(Exception, match="history finalization failed") as error:
+        await replace_terminal_meta_draft(
+            engine=engine,
+            draft_id=draft_id,
+            settings=_make_settings(),
+            notifier=AsyncMock(),
+            expected_ids=old_ids,
+        )
+
+    assert "mismatch raw detail" not in str(error.value)
 
 
 async def test_existing_publication_reconciles_without_creating_resources(

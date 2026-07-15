@@ -1,6 +1,7 @@
 """Safety contract for the Meta reconciliation operator command."""
 
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from peermarket_agent.cli_meta import cli, reconcile_draft
 from peermarket_agent.db.migrations import run_migrations
+from peermarket_agent.meta_pipeline import TerminalReplacementOperationalError
 from peermarket_agent.publications import (
     MetaPublication,
     get_meta_publication,
@@ -76,6 +78,54 @@ def test_reconcile_cli_requires_every_resource_id():
 
     assert result.exit_code == 2
     assert "Missing option '--adset-id'" in result.output
+
+
+def test_terminal_replacement_cli_is_explicit_and_requires_every_resource_id():
+    result = CliRunner().invoke(
+        cli,
+        ["replace-terminal-draft", "--draft-id", "156", "--campaign-id", "campaign-1"],
+    )
+    assert result.exit_code == 2
+    assert "Missing option '--adset-id'" in result.output
+    assert "--budget" not in CliRunner().invoke(cli, ["replace-terminal-draft", "--help"]).output
+
+
+def test_terminal_replacement_cli_sanitizes_operational_failure(monkeypatch):
+    monkeypatch.setattr(
+        "peermarket_agent.cli_meta.get_settings",
+        lambda: SimpleNamespace(slack_bot_token="token", slack_founder_user_id="founder"),
+    )
+    monkeypatch.setattr("peermarket_agent.cli_meta.SlackNotifier", lambda **kwargs: object())
+    monkeypatch.setattr("peermarket_agent.cli_meta.get_engine", lambda: object())
+    monkeypatch.setattr(
+        "peermarket_agent.cli_meta.replace_terminal_meta_draft",
+        AsyncMock(
+            side_effect=TerminalReplacementOperationalError(
+                "terminal replacement failed during unexpected; inspect stored replacement history"
+            )
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "replace-terminal-draft",
+            "--draft-id",
+            "156",
+            "--campaign-id",
+            "campaign-1",
+            "--adset-id",
+            "adset-1",
+            "--creative-id",
+            "creative-1",
+            "--ad-id",
+            "ad-1",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "inspect stored replacement history" in result.output
+    assert "Traceback" not in result.output
 
 
 @pytest.mark.parametrize("option", ["--campaign-id", "--adset-id", "--creative-id", "--ad-id"])

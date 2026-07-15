@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.config import Settings, get_settings
 from peermarket_agent.db.engine import get_engine
-from peermarket_agent.meta_pipeline import process_approved_meta_draft
+from peermarket_agent.meta_pipeline import (
+    TerminalReplacementOperationalError,
+    process_approved_meta_draft,
+    replace_terminal_meta_draft,
+)
 from peermarket_agent.publications import (
     get_meta_publication,
 )
@@ -108,6 +112,52 @@ def reconcile_draft_command(
         raise click.ClickException(str(error)) from error
     for line in lines:
         click.echo(line)
+
+
+@cli.command("replace-terminal-draft")
+@click.option("--draft-id", required=True, type=click.IntRange(min=1))
+@click.option("--campaign-id", required=True, type=str, callback=_non_empty_id)
+@click.option("--adset-id", required=True, type=str, callback=_non_empty_id)
+@click.option("--creative-id", required=True, type=str, callback=_non_empty_id)
+@click.option("--ad-id", required=True, type=str, callback=_non_empty_id)
+def replace_terminal_draft_command(
+    draft_id: int,
+    campaign_id: str,
+    adset_id: str,
+    creative_id: str,
+    ad_id: str,
+) -> None:
+    """Replace an exact stored hierarchy only when every resource is terminal."""
+    settings = get_settings()
+    notifier = SlackNotifier(
+        bot_token=settings.slack_bot_token,
+        founder_user_id=settings.slack_founder_user_id,
+    )
+    ids = {
+        "campaign_id": campaign_id,
+        "ad_set_id": adset_id,
+        "creative_id": creative_id,
+        "ad_id": ad_id,
+    }
+    try:
+        result = asyncio.run(
+            replace_terminal_meta_draft(
+                engine=get_engine(),
+                draft_id=draft_id,
+                settings=settings,
+                notifier=notifier,
+                expected_ids=ids,
+            )
+        )
+    except (ValueError, TerminalReplacementOperationalError) as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(f"Draft #{draft_id} terminal replacement attempt completed.")
+    click.echo(f"Archived IDs: {json.dumps(result.old_ids, sort_keys=True)}")
+    click.echo(f"Archived statuses: {json.dumps(result.terminal_statuses, sort_keys=True)}")
+    click.echo(f"Current IDs: {json.dumps(result.current_ids, sort_keys=True)}")
+    click.echo(f"Current state: {result.state}")
+    if result.failure:
+        click.echo(f"Current failure: {json.dumps(result.failure, sort_keys=True)}")
 
 
 if __name__ == "__main__":
