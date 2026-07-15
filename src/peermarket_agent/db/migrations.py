@@ -192,6 +192,8 @@ _STEPS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_revision_feedback_pending "
     "ON draft_revision_feedback (root_draft_id, status, message_ts)",
     "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
+    "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_owner TEXT",
+    "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_statuses JSONB",

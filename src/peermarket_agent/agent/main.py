@@ -57,6 +57,17 @@ async def _daily_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) 
             log.exception("agent.daily_loop_failed")
 
 
+async def _run_startup_jobs(engine, peermarket, notifier: SlackNotifier) -> None:
+    try:
+        await run_slack_outbox(engine, notifier)
+    except Exception:
+        log.exception("agent.startup_slack_outbox_failed")
+    try:
+        await run_hourly_pulse(engine, peermarket)
+    except Exception:
+        log.exception("agent.startup_hourly_pulse_failed")
+
+
 async def _run() -> None:
     settings = get_settings()
     engine = get_engine()
@@ -71,9 +82,8 @@ async def _run() -> None:
     )
     log.info("agent.start", env="phase-1-loop-b-mvp")
 
-    # One-shot pulse on startup so smoke tests have data immediately.
-    await run_hourly_pulse(engine, peermarket)
-    await run_slack_outbox(engine, notifier)
+    # Independent one-shot retries/pulse; neither can prevent recurring loops.
+    await _run_startup_jobs(engine, peermarket, notifier)
 
     # Hourly KPI pulse + daily 09:00 Brussels draft loop, both forever.
     await asyncio.gather(

@@ -201,3 +201,39 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
     async with prepared_db.connect() as conn:
         queued = (await conn.execute(text("SELECT count(*) FROM slack_outbox"))).scalar_one()
     assert queued == 2
+
+
+async def test_daily_metric_counts_ready_approval_when_enqueue_is_idempotent(
+    prepared_db, monkeypatch
+):
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily._TODAYS_PLAN",
+        [{"action_type_name": "tiktok_post_organic", "language": "NL"}],
+    )
+    draft_id = 77
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily.run_draft_command",
+        AsyncMock(return_value=draft_id),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily._fetch_draft_with_action_name",
+        AsyncMock(
+            return_value={
+                "id": draft_id,
+                "action_type_name": "tiktok_post_organic",
+                "language": "NL",
+                "channel": "tiktok",
+                "brand_score": 90,
+                "copy": "ready",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.daily.enqueue_root_approval",
+        AsyncMock(return_value=False),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder = AsyncMock(return_value=True)
+
+    assert await run_daily_drafts(engine=prepared_db, claude=AsyncMock(), notifier=notifier) == 1
+    assert "1/1" in notifier.notify_founder.await_args.args[0]

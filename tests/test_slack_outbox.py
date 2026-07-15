@@ -1,6 +1,7 @@
 """Transactional Slack approval outbox tests."""
 
 import os
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,8 @@ from peermarket_agent.drafts import Draft, persist_draft
 from peermarket_agent.revisions import bind_draft_thread
 from peermarket_agent.slack_notifier import SlackMessageResult
 from peermarket_agent.slack_outbox import (
+    _claim_pending_outbox,
+    _finalize_success,
     deliver_pending_outbox,
     enqueue_root_approval,
     enqueue_thread_approval,
@@ -119,3 +122,85 @@ async def test_thread_delivery_uses_stored_channel_and_root(prepared_db):
     notifier.send_message.assert_awaited_once_with(
         "frozen revision", channel_id="D9", thread_ts="200.02"
     )
+
+
+async def test_concurrent_workers_claim_each_message_once(prepared_db):
+    ids = [await _draft(prepared_db, f"copy {index}") for index in range(2)]
+    for draft_id in ids:
+        await enqueue_root_approval(prepared_db, draft_id=draft_id, text=f"root {draft_id}")
+
+    first, second = await __import__("asyncio").gather(
+        _claim_pending_outbox(prepared_db, owner="worker-a", limit=2),
+        _claim_pending_outbox(prepared_db, owner="worker-b", limit=2),
+    )
+
+    assert {item.id for item in first}.isdisjoint({item.id for item in second})
+    assert len(first) + len(second) == 2
+
+
+async def test_expired_lease_is_reclaimed_and_stale_owner_cannot_finalize(prepared_db):
+    draft_id = await _draft(prepared_db)
+    await enqueue_root_approval(prepared_db, draft_id=draft_id, text="root")
+    claimed = await _claim_pending_outbox(prepared_db, owner="old", limit=1)
+    async with prepared_db.begin() as connection:
+        await connection.execute(
+            text("UPDATE slack_outbox SET lease_expires_at=:expired"),
+            {"expired": datetime.now(UTC) - timedelta(seconds=1)},
+        )
+    reclaimed = await _claim_pending_outbox(prepared_db, owner="new", limit=1)
+
+    assert reclaimed[0].id == claimed[0].id
+    assert not await _finalize_success(
+        prepared_db,
+        claimed[0],
+        owner="old",
+        result=SlackMessageResult("D-old", "1.0"),
+    )
+    assert await _finalize_success(
+        prepared_db,
+        reclaimed[0],
+        owner="new",
+        result=SlackMessageResult("D-new", "2.0"),
+    )
+
+
+async def test_successful_first_message_survives_second_failure(prepared_db):
+    first_id = await _draft(prepared_db, "first")
+    second_id = await _draft(prepared_db, "second")
+    for draft_id in (first_id, second_id):
+        await enqueue_root_approval(prepared_db, draft_id=draft_id, text=str(draft_id))
+    notifier = AsyncMock()
+    notifier.send_message = AsyncMock(
+        side_effect=[SlackMessageResult("D1", "1.0"), RuntimeError("down")]
+    )
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 1
+
+    async with prepared_db.connect() as connection:
+        statuses = (
+            (await connection.execute(text("SELECT status FROM slack_outbox ORDER BY id")))
+            .scalars()
+            .all()
+        )
+    assert statuses == ["delivered", "failed"]
+
+
+async def test_cancellation_between_rows_preserves_finalized_first(prepared_db):
+    for value in ("first", "second"):
+        draft_id = await _draft(prepared_db, value)
+        await enqueue_root_approval(prepared_db, draft_id=draft_id, text=value)
+    notifier = AsyncMock()
+    notifier.send_message = AsyncMock(
+        side_effect=[SlackMessageResult("D1", "1.0"), __import__("asyncio").CancelledError()]
+    )
+
+    with pytest.raises(__import__("asyncio").CancelledError):
+        await deliver_pending_outbox(prepared_db, notifier)
+
+    async with prepared_db.connect() as connection:
+        statuses = (
+            (await connection.execute(text("SELECT status FROM slack_outbox ORDER BY id")))
+            .scalars()
+            .all()
+        )
+    assert statuses == ["delivered", "pending"]

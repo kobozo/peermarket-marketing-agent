@@ -80,3 +80,39 @@ if Slack accepts a post but the client receives no response, a later retry can
 duplicate the visible message. The database path is idempotent and never
 regenerates copy, but Slack's `chat.postMessage` API does not expose a native
 idempotency token for eliminating that external ambiguity.
+
+## Review follow-up
+
+The review found that the first delivery implementation held one database
+transaction and its row locks across a batch of network calls. It was replaced
+with a lease protocol:
+
+- an idempotent migration adds `lease_owner` and `lease_expires_at`;
+- workers atomically claim due/expired rows with `FOR UPDATE SKIP LOCKED` and
+  immediately release the transaction and connection;
+- Slack calls execute without a database connection or row lock;
+- every success or failure is finalized in a separate short transaction;
+- finalization requires the current lease owner, preventing a stale worker from
+  mutating a reclaimed row;
+- cancellation leaves only the unprocessed leased rows for expiry/reclaim and
+  cannot roll back earlier finalized successes.
+
+Startup outbox retry now runs first and independently from the KPI pulse. Both
+failures are caught and logged separately before recurring loops start. Daily
+summary and KPI counts now represent ready approval drafts even when enqueue is
+an idempotent no-op.
+
+Follow-up RED initially failed collection on the missing claim/finalization and
+startup-isolation interfaces. Focused GREEN was:
+
+```text
+20 passed in 4.19s
+```
+
+Coverage includes concurrent workers, expired-lease reclaim, stale-owner
+rejection, cancellation between rows, first-success/second-failure durability,
+both startup failure directions, and idempotent daily counting.
+
+The unavoidable ambiguous Slack-success/network-response gap documented above
+is unchanged; retry always uses the frozen stored payload and never regenerates
+copy.

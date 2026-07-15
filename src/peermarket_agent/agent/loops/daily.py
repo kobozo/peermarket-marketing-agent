@@ -126,8 +126,8 @@ async def run_daily_drafts(
             continue
         message = format_draft_dm(draft)
         enqueued = await enqueue_root_approval(engine, draft_id=draft_id, text=message)
+        persisted += 1
         if enqueued:
-            persisted += 1
             log.info("loop_b.approval_enqueued", action=action, draft_id=draft_id)
         else:
             log.info("loop_b.approval_already_enqueued", action=action, draft_id=draft_id)

@@ -1,6 +1,8 @@
 """Durable Slack approval-message outbox."""
 
 import json
+import uuid
+from dataclasses import dataclass
 
 import structlog
 from sqlalchemy import text as sql_text
@@ -9,6 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from peermarket_agent.slack_notifier import SlackNotifier
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class OutboxMessage:
+    id: int
+    draft_id: int
+    channel_id: str | None
+    root_ts: str | None
+    message_kind: str
+    text: str
 
 
 async def enqueue_root_approval(
@@ -55,63 +67,118 @@ async def deliver_pending_outbox(
     engine: AsyncEngine, notifier: SlackNotifier, *, limit: int = 50
 ) -> int:
     """Deliver due messages once, retaining their frozen payload for retries."""
+    owner = str(uuid.uuid4())
+    rows = await _claim_pending_outbox(engine, owner=owner, limit=limit)
     delivered = 0
+    for row in rows:
+        try:
+            result = await notifier.send_message(
+                row.text,
+                channel_id=row.channel_id,
+                thread_ts=row.root_ts,
+            )
+            if await _finalize_success(engine, row, owner=owner, result=result):
+                delivered += 1
+        except Exception as error:
+            await _finalize_failure(engine, row, owner=owner, failure_category=type(error).__name__)
+            log.warning(
+                "slack_outbox.delivery_failed",
+                outbox_id=row.id,
+                draft_id=row.draft_id,
+                failure_category=type(error).__name__,
+            )
+    return delivered
+
+
+async def _claim_pending_outbox(
+    engine: AsyncEngine, *, owner: str, limit: int, lease_seconds: int = 300
+) -> tuple[OutboxMessage, ...]:
+    """Lease due rows in one short transaction without holding locks during I/O."""
     async with engine.begin() as connection:
         rows = (
+            (
+                await connection.execute(
+                    sql_text(
+                        "WITH candidates AS (SELECT id FROM slack_outbox "
+                        "WHERE status IN ('pending','failed') AND next_attempt_at <= NOW() "
+                        "AND (lease_expires_at IS NULL OR lease_expires_at <= NOW()) "
+                        "ORDER BY id LIMIT :limit FOR UPDATE SKIP LOCKED) "
+                        "UPDATE slack_outbox AS outbox SET lease_owner=:owner, "
+                        "lease_expires_at=NOW()+make_interval(secs => :lease_seconds), "
+                        "attempt_count=attempt_count+1 FROM candidates "
+                        "WHERE outbox.id=candidates.id RETURNING outbox.id, outbox.draft_id, "
+                        "outbox.channel_id, outbox.root_ts, outbox.message_kind, outbox.payload"
+                    ),
+                    {"limit": limit, "owner": owner, "lease_seconds": lease_seconds},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return tuple(
+        OutboxMessage(
+            id=int(row["id"]),
+            draft_id=int(row["draft_id"]),
+            channel_id=row["channel_id"],
+            root_ts=row["root_ts"],
+            message_kind=str(row["message_kind"]),
+            text=str(row["payload"]["text"]),
+        )
+        for row in rows
+    )
+
+
+async def _finalize_success(engine, message, *, owner: str, result) -> bool:
+    """Commit one success only when this worker still owns the lease."""
+    async with engine.begin() as connection:
+        owned = (
             await connection.execute(
                 sql_text(
-                    "SELECT id, draft_id, channel_id, root_ts, message_kind, payload "
-                    "FROM slack_outbox WHERE status IN ('pending','failed') "
-                    "AND next_attempt_at <= NOW() ORDER BY id LIMIT :limit "
-                    "FOR UPDATE SKIP LOCKED"
+                    "SELECT id FROM slack_outbox WHERE id=:id AND lease_owner=:owner "
+                    "AND status IN ('pending','failed') FOR UPDATE"
                 ),
-                {"limit": limit},
+                {"id": message.id, "owner": owner},
             )
-        ).mappings()
-        for row in rows:
-            try:
-                result = await notifier.send_message(
-                    str(row["payload"]["text"]),
-                    channel_id=row["channel_id"],
-                    thread_ts=row["root_ts"],
-                )
-                if row["message_kind"] == "root_approval":
-                    bound = await connection.execute(
-                        sql_text(
-                            "UPDATE drafts SET slack_channel_id=:channel, slack_root_ts=:root, "
-                            "root_draft_id=id WHERE id=:draft_id AND revision_number=0 "
-                            "AND status='queued' AND slack_channel_id IS NULL "
-                            "AND slack_root_ts IS NULL"
-                        ),
-                        {
-                            "channel": result.channel_id,
-                            "root": result.ts,
-                            "draft_id": row["draft_id"],
-                        },
-                    )
-                    if bound.rowcount != 1:
-                        raise RuntimeError("root draft could not be bound after Slack delivery")
-                await connection.execute(
-                    sql_text(
-                        "UPDATE slack_outbox SET status='delivered', delivered_at=NOW(), "
-                        "attempt_count=attempt_count+1, last_failure_category=NULL WHERE id=:id"
-                    ),
-                    {"id": row["id"]},
-                )
-                delivered += 1
-            except Exception as error:
-                await connection.execute(
-                    sql_text(
-                        "UPDATE slack_outbox SET status='failed', attempt_count=attempt_count+1, "
-                        "next_attempt_at=NOW()+INTERVAL '1 hour', "
-                        "last_failure_category=:category WHERE id=:id"
-                    ),
-                    {"id": row["id"], "category": type(error).__name__},
-                )
-                log.warning(
-                    "slack_outbox.delivery_failed",
-                    outbox_id=row["id"],
-                    draft_id=row["draft_id"],
-                    failure_category=type(error).__name__,
-                )
-    return delivered
+        ).scalar_one_or_none()
+        if owned is None:
+            return False
+        if message.message_kind == "root_approval":
+            bound = await connection.execute(
+                sql_text(
+                    "UPDATE drafts SET slack_channel_id=:channel, slack_root_ts=:root, "
+                    "root_draft_id=id WHERE id=:draft_id AND revision_number=0 "
+                    "AND status='queued' AND slack_channel_id IS NULL AND slack_root_ts IS NULL"
+                ),
+                {
+                    "channel": result.channel_id,
+                    "root": result.ts,
+                    "draft_id": message.draft_id,
+                },
+            )
+            if bound.rowcount != 1:
+                raise RuntimeError("root draft could not be bound after Slack delivery")
+        await connection.execute(
+            sql_text(
+                "UPDATE slack_outbox SET status='delivered', delivered_at=NOW(), "
+                "last_failure_category=NULL, lease_owner=NULL, lease_expires_at=NULL "
+                "WHERE id=:id AND lease_owner=:owner"
+            ),
+            {"id": message.id, "owner": owner},
+        )
+    return True
+
+
+async def _finalize_failure(
+    engine: AsyncEngine, message: OutboxMessage, *, owner: str, failure_category: str
+) -> bool:
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            sql_text(
+                "UPDATE slack_outbox SET status='failed', "
+                "next_attempt_at=NOW()+INTERVAL '1 hour', last_failure_category=:category, "
+                "lease_owner=NULL, lease_expires_at=NULL WHERE id=:id AND lease_owner=:owner "
+                "AND status IN ('pending','failed')"
+            ),
+            {"id": message.id, "owner": owner, "category": failure_category},
+        )
+    return result.rowcount == 1
