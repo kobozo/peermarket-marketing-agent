@@ -132,6 +132,66 @@ _STEPS: list[str] = [
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
     "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS parent_draft_id BIGINT REFERENCES drafts(id)",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS root_draft_id BIGINT REFERENCES drafts(id)",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS revision_number INT NOT NULL DEFAULT 0",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS revision_feedback TEXT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS revision_feedback_ts TEXT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS slack_channel_id TEXT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS slack_root_ts TEXT",
+    """DO $$
+       DECLARE constraint_name TEXT;
+       BEGIN
+         FOR constraint_name IN
+           SELECT conname FROM pg_constraint
+           WHERE conrelid = 'drafts'::regclass AND contype = 'c'
+             AND pg_get_constraintdef(oid) LIKE '%status%'
+         LOOP
+           EXECUTE format('ALTER TABLE drafts DROP CONSTRAINT %I', constraint_name);
+         END LOOP;
+         ALTER TABLE drafts ADD CONSTRAINT drafts_status_check
+           CHECK (status IN ('queued','approved','rejected','killed','published','superseded'));
+       END $$""",
+    """CREATE TABLE IF NOT EXISTS draft_revision_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        channel_id TEXT NOT NULL,
+        root_ts TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        feedback_text TEXT NOT NULL,
+        root_draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','processing','applied','failed')),
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        claimed_at TIMESTAMPTZ,
+        applied_at TIMESTAMPTZ,
+        failure_category TEXT,
+        UNIQUE (channel_id, root_ts, message_ts)
+    )""",
+    """CREATE TABLE IF NOT EXISTS slack_outbox (
+        id BIGSERIAL PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        channel_id TEXT,
+        root_ts TEXT,
+        message_kind TEXT NOT NULL CHECK (message_kind IN ('root_approval','thread_approval')),
+        payload JSONB NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','delivered','failed')),
+        attempt_count INT NOT NULL DEFAULT 0,
+        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        delivered_at TIMESTAMPTZ,
+        last_failure_category TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_slack_root_binding_unique "
+    "ON drafts (slack_channel_id, slack_root_ts) WHERE revision_number = 0 "
+    "AND slack_channel_id IS NOT NULL AND slack_root_ts IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_root_revision_unique "
+    "ON drafts (root_draft_id, revision_number) WHERE root_draft_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_revision_feedback_pending "
+    "ON draft_revision_feedback (root_draft_id, status, message_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_statuses JSONB",
