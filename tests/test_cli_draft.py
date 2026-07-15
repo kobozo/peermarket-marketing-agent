@@ -33,7 +33,7 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats nu"}',
+                text='{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats het nu"}',
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -67,7 +67,7 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
                 {"id": draft_id},
             )
         ).fetchone()
-    assert "Marktplaats moe?" in row[0]
+    assert "Wil je vandaag veilig" in row[0]
     assert row[1] == 92
     assert row[2] == "tiktok"
     assert row[3] == "NL"
@@ -79,7 +79,7 @@ async def test_run_draft_rejects_low_score_draft_does_not_persist(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "wrong tone", "body": "amazing offer!!!", "cta": "buy now!"}',
+                text='{"hook": "Buy everything today with this amazing sales offer", "body": "amazing offer!!!", "cta": "buy it now"}',
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -114,7 +114,7 @@ async def test_run_draft_email_persists(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"subject": "Je hebt nog niets verkocht", "body": "Hoi, je hebt een account..."}',
+                text='{"subject": "Je hebt nog niets verkocht", "body": "' + "woord " * 80 + '"}',
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",

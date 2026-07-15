@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_email
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 _INPUT_CENTS_PER_TOKEN = 0.0003
@@ -69,9 +70,8 @@ async def generate_email(
         max_tokens=600,
     )
     payload = parse_claude_json(resp.text)
+    validate_email(payload)
     subject = payload["subject"]
-    if len(subject) > 60:
-        raise ValueError(f"subject too long ({len(subject)} > 60): {subject!r}")
     return Email(
         subject=subject,
         body=payload["body"],

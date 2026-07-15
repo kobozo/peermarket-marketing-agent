@@ -1,3 +1,4 @@
+import asyncio
 import os
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
 from peermarket_agent.drafts import Draft, persist_draft
 from peermarket_agent.revisions import (
+    RevisionConflictError,
     RevisionFeedbackEvent,
     bind_draft_thread,
     record_revision_feedback,
@@ -58,7 +60,7 @@ async def setup_feedback(engine, text_value="Shorter"):
 def generation(text=None):
     return ClaudeResponse(
         text=text
-        or '{"hook":"Nieuw?","body":"Veilig.","cta":"Plaats nu","change_summary":"Korter"}',
+        or '{"hook":"Wil je vandaag veilig en lokaal spullen verkopen?","body":"Veilig.","cta":"Plaats het nu","change_summary":"Korter"}',
         input_tokens=100,
         output_tokens=50,
         model="claude-sonnet-4-6",
@@ -101,6 +103,7 @@ async def test_valid_revision_supersedes_and_enqueues_same_thread_approval(engin
     assert outbox[:3] == ("D1", "100.0", "thread_approval")
     assert "Changes applied" in outbox[3] and f"❌ {original + 1}" in outbox[3]
     assert feedback_status == "applied"
+    assert outbox[3].count(str(original + 1)) >= 2
 
 
 @pytest.mark.parametrize(("generated", "brand"), [("not-json", None), (None, 79)])
@@ -155,6 +158,33 @@ async def test_feedback_arriving_during_generation_stays_pending_for_next_batch(
         ).fetchall()
     assert statuses == [("First", "applied"), ("Second", "pending")]
 
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE draft_revision_feedback SET received_at=NOW()-INTERVAL '16 seconds' "
+                "WHERE status='pending'"
+            )
+        )
+    second_claude = AsyncMock()
+
+    async def second_complete(**kwargs):
+        if "<source_draft_data>" in kwargs.get("user", ""):
+            assert "Wil je vandaag veilig en lokaal spullen verkopen?" in kwargs["user"]
+            return generation(
+                '{"hook":"Wil je nu betrouwbaar en lokaal jouw spullen verkopen?","body":"Veilig.","cta":"Plaats het nu","change_summary":"Tweede"}'
+            )
+        return score()
+
+    second_claude.complete.side_effect = second_complete
+    assert await run_pending_revisions(engine, second_claude, AsyncMock()) == 1
+    async with engine.connect() as conn:
+        revisions = (
+            (await conn.execute(text("SELECT revision_number FROM drafts ORDER BY id")))
+            .scalars()
+            .all()
+        )
+    assert revisions == [0, 1, 2]
+
 
 async def test_repeated_loop_does_not_duplicate_generation(engine):
     await setup_feedback(engine)
@@ -163,3 +193,51 @@ async def test_repeated_loop_does_not_duplicate_generation(engine):
     assert await run_pending_revisions(engine, claude, AsyncMock()) == 1
     assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
     assert claude.complete.await_count == 2
+
+
+async def test_cancellation_requeues_owned_batch_and_releases_root(engine):
+    await setup_feedback(engine)
+    started = asyncio.Event()
+    claude = AsyncMock()
+
+    async def blocked(**kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    claude.complete.side_effect = blocked
+    task = asyncio.create_task(run_pending_revisions(engine, claude, AsyncMock()))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with engine.connect() as conn:
+        status = (
+            await conn.execute(text("SELECT status FROM draft_revision_feedback"))
+        ).scalar_one()
+        leases = (
+            await conn.execute(text("SELECT count(*) FROM draft_revision_generation_leases"))
+        ).scalar_one()
+    assert status == "pending"
+    assert leases == 0
+
+
+async def test_latest_leaf_conflict_requeues_instead_of_failing(engine, monkeypatch):
+    await setup_feedback(engine)
+    claude = AsyncMock()
+    claude.complete.side_effect = [generation(), score()]
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.revisions.persist_revision_and_supersede",
+        AsyncMock(side_effect=RevisionConflictError("latest changed")),
+    )
+
+    assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
+    async with engine.connect() as conn:
+        status = (
+            await conn.execute(text("SELECT status FROM draft_revision_feedback"))
+        ).scalar_one()
+        leases = (
+            await conn.execute(text("SELECT count(*) FROM draft_revision_generation_leases"))
+        ).scalar_one()
+    assert status == "pending"
+    assert leases == 0

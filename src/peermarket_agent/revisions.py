@@ -1,5 +1,7 @@
 """Persistence primitives for Slack-thread draft revisions."""
 
+import json
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -25,6 +27,11 @@ class FeedbackBatch:
     root_draft_id: int
     feedback_ids: tuple[int, ...]
     instructions: tuple[str, ...]
+    lease_owner: str
+
+
+class RevisionConflictError(ValueError):
+    """The claimed source is no longer the latest queued leaf."""
 
 
 async def list_ready_feedback_threads(engine: AsyncEngine) -> tuple[tuple[str, str], ...]:
@@ -33,10 +40,10 @@ async def list_ready_feedback_threads(engine: AsyncEngine) -> tuple[tuple[str, s
         rows = (
             await connection.execute(
                 text(
-                    "SELECT channel_id, root_ts FROM draft_revision_feedback "
-                    "WHERE status='pending' GROUP BY channel_id, root_ts "
-                    "HAVING MIN(received_at) <= NOW()-INTERVAL '15 seconds' "
-                    "ORDER BY MIN(received_at)"
+                    "SELECT channel_id, root_ts FROM draft_revision_feedback WHERE "
+                    "(status='pending' AND received_at <= NOW()-INTERVAL '15 seconds') "
+                    "OR (status='processing' AND processing_lease_expires_at <= NOW()) "
+                    "GROUP BY channel_id, root_ts ORDER BY MIN(received_at)"
                 )
             )
         ).fetchall()
@@ -53,7 +60,8 @@ async def load_latest_revision_source(
                 await connection.execute(
                     text(
                         "SELECT d.id, at.name, d.channel, d.language, d.copy, d.metadata, "
-                        "d.asset_path FROM drafts d JOIN action_types at ON at.id=d.action_type_id "
+                        "d.asset_path, d.revision_number FROM drafts d JOIN action_types at "
+                        "ON at.id=d.action_type_id "
                         "WHERE d.root_draft_id=:root AND d.status='queued' "
                         "ORDER BY d.revision_number DESC LIMIT 1"
                     ),
@@ -72,23 +80,110 @@ async def load_latest_revision_source(
         copy=str(row["copy"]),
         metadata=dict(row["metadata"] or {}),
         asset_path=row["asset_path"],
+        revision_number=int(row["revision_number"]),
     )
 
 
 async def mark_feedback_failed(
-    engine: AsyncEngine, feedback_ids: tuple[int, ...], failure_category: str
+    engine: AsyncEngine,
+    feedback_ids: tuple[int, ...],
+    failure_category: str,
+    *,
+    lease_owner: str | None = None,
 ) -> None:
     """Finalize a claimed batch as failed without exposing model output."""
     async with engine.begin() as connection:
+        owner_clause = " AND processing_owner=:owner" if lease_owner else ""
         result = await connection.execute(
             text(
                 "UPDATE draft_revision_feedback SET status='failed', "
                 "failure_category=:category WHERE id=ANY(:ids) AND status='processing'"
+                + owner_clause
             ),
-            {"ids": list(feedback_ids), "category": failure_category[:100]},
+            {
+                "ids": list(feedback_ids),
+                "category": failure_category[:100],
+                "owner": lease_owner,
+            },
         )
         if result.rowcount != len(set(feedback_ids)):
             raise RuntimeError("feedback failure state changed concurrently")
+        if lease_owner:
+            await connection.execute(
+                text(
+                    "DELETE FROM draft_revision_generation_leases leases USING "
+                    "draft_revision_feedback feedback WHERE feedback.id=:feedback_id "
+                    "AND leases.root_draft_id=feedback.root_draft_id "
+                    "AND leases.lease_owner=:owner"
+                ),
+                {"feedback_id": feedback_ids[0], "owner": lease_owner},
+            )
+
+
+async def requeue_feedback_batch(
+    engine: AsyncEngine, feedback_ids: tuple[int, ...], lease_owner: str
+) -> None:
+    """Return an owned conflicted/cancelled batch to pending and release its root."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE draft_revision_feedback SET status='pending', processing_owner=NULL, "
+                "processing_lease_expires_at=NULL WHERE id=ANY(:ids) "
+                "AND status='processing' AND processing_owner=:owner"
+            ),
+            {"ids": list(feedback_ids), "owner": lease_owner},
+        )
+        await connection.execute(
+            text(
+                "DELETE FROM draft_revision_generation_leases leases USING "
+                "draft_revision_feedback feedback WHERE feedback.id=:feedback_id "
+                "AND leases.root_draft_id=feedback.root_draft_id AND leases.lease_owner=:owner"
+            ),
+            {"feedback_id": feedback_ids[0], "owner": lease_owner},
+        )
+
+
+async def renew_generation_lease(
+    engine: AsyncEngine,
+    root_draft_id: int,
+    lease_owner: str,
+    *,
+    now: datetime | None = None,
+    lease_seconds: int = 300,
+) -> bool:
+    """Extend an owned root/feedback lease without retaining a DB connection."""
+    renewal_time = now or datetime.now(UTC)
+    async with engine.begin() as connection:
+        renewed = await connection.execute(
+            text(
+                "UPDATE draft_revision_generation_leases SET lease_expires_at="
+                "CAST(:now AS TIMESTAMPTZ)+make_interval(secs => :lease_seconds) "
+                "WHERE root_draft_id=:root AND lease_owner=:owner"
+            ),
+            {
+                "root": root_draft_id,
+                "owner": lease_owner,
+                "now": renewal_time,
+                "lease_seconds": lease_seconds,
+            },
+        )
+        if renewed.rowcount != 1:
+            return False
+        await connection.execute(
+            text(
+                "UPDATE draft_revision_feedback SET processing_lease_expires_at="
+                "CAST(:now AS TIMESTAMPTZ)+make_interval(secs => :lease_seconds) "
+                "WHERE root_draft_id=:root AND status='processing' "
+                "AND processing_owner=:owner"
+            ),
+            {
+                "root": root_draft_id,
+                "owner": lease_owner,
+                "now": renewal_time,
+                "lease_seconds": lease_seconds,
+            },
+        )
+    return True
 
 
 async def bind_draft_thread(
@@ -155,8 +250,12 @@ async def claim_feedback_batch(
     root_ts: str,
     *,
     now: datetime | None = None,
+    owner: str | None = None,
+    lease_seconds: int = 300,
 ) -> FeedbackBatch | None:
-    cutoff = (now or datetime.now(UTC)) - timedelta(seconds=15)
+    claim_now = now or datetime.now(UTC)
+    cutoff = claim_now - timedelta(seconds=15)
+    lease_owner = owner or str(uuid.uuid4())
     async with engine.begin() as connection:
         root = (
             await connection.execute(
@@ -175,6 +274,40 @@ async def claim_feedback_batch(
             ),
             {"root": root},
         )
+        acquired = (
+            await connection.execute(
+                text(
+                    "INSERT INTO draft_revision_generation_leases "
+                    "(root_draft_id, lease_owner, lease_expires_at) VALUES "
+                    "(:root, :owner, CAST(:now AS TIMESTAMPTZ) + "
+                    "make_interval(secs => :lease_seconds)) "
+                    "ON CONFLICT (root_draft_id) DO UPDATE SET lease_owner=:owner, "
+                    "lease_expires_at=CAST(:now AS TIMESTAMPTZ) + "
+                    "make_interval(secs => :lease_seconds), "
+                    "attempt_count=draft_revision_generation_leases.attempt_count+1 "
+                    "WHERE draft_revision_generation_leases.lease_expires_at <= "
+                    "CAST(:now AS TIMESTAMPTZ) "
+                    "RETURNING root_draft_id"
+                ),
+                {
+                    "root": root,
+                    "owner": lease_owner,
+                    "now": claim_now,
+                    "lease_seconds": lease_seconds,
+                },
+            )
+        ).scalar_one_or_none()
+        if acquired is None:
+            return None
+        await connection.execute(
+            text(
+                "UPDATE draft_revision_feedback SET status='pending', processing_owner=NULL, "
+                "processing_lease_expires_at=NULL WHERE root_draft_id=:root "
+                "AND status='processing' AND processing_lease_expires_at <= "
+                "CAST(:now AS TIMESTAMPTZ)"
+            ),
+            {"root": root, "now": claim_now},
+        )
         oldest_pending = (
             await connection.execute(
                 text(
@@ -185,6 +318,13 @@ async def claim_feedback_batch(
             )
         ).scalar_one_or_none()
         if oldest_pending is None or oldest_pending > cutoff:
+            await connection.execute(
+                text(
+                    "DELETE FROM draft_revision_generation_leases "
+                    "WHERE root_draft_id=:root AND lease_owner=:owner"
+                ),
+                {"root": root, "owner": lease_owner},
+            )
             return None
         rows = (
             await connection.execute(
@@ -201,10 +341,18 @@ async def claim_feedback_batch(
         feedback_ids = tuple(int(row[0]) for row in rows)
         result = await connection.execute(
             text(
-                "UPDATE draft_revision_feedback SET status = 'processing', claimed_at = NOW() "
+                "UPDATE draft_revision_feedback SET status = 'processing', claimed_at = :now, "
+                "processing_owner=:owner, processing_lease_expires_at="
+                "CAST(:now AS TIMESTAMPTZ) + "
+                "make_interval(secs => :lease_seconds), processing_attempts=processing_attempts+1 "
                 "WHERE id = ANY(:ids) AND status = 'pending'"
             ),
-            {"ids": list(feedback_ids)},
+            {
+                "ids": list(feedback_ids),
+                "owner": lease_owner,
+                "now": claim_now,
+                "lease_seconds": lease_seconds,
+            },
         )
         if result.rowcount != len(feedback_ids):
             raise RuntimeError("feedback claim changed concurrently")
@@ -212,6 +360,7 @@ async def claim_feedback_batch(
         root_draft_id=int(root),
         feedback_ids=feedback_ids,
         instructions=tuple(str(row[1]) for row in rows),
+        lease_owner=lease_owner,
     )
 
 
@@ -220,9 +369,15 @@ async def persist_revision_and_supersede(
     predecessor_id: int,
     revised_draft: Draft,
     feedback_ids: tuple[int, ...],
+    *,
+    outbox_text: str,
+    outbox_idempotency_key: str,
+    lease_owner: str | None = None,
 ) -> int:
     if not feedback_ids:
         raise ValueError("revision requires claimed feedback")
+    if not outbox_text.strip() or not outbox_idempotency_key:
+        raise ValueError("outbox payload and idempotency key must be non-empty")
     async with engine.begin() as connection:
         predecessor = (
             (
@@ -238,7 +393,7 @@ async def persist_revision_and_supersede(
             .one_or_none()
         )
         if predecessor is None or predecessor["root_draft_id"] is None:
-            raise ValueError("draft is not the latest queued predecessor")
+            raise RevisionConflictError("draft is not the latest queued predecessor")
         root_id = int(predecessor["root_draft_id"])
         await connection.execute(
             text(
@@ -249,7 +404,8 @@ async def persist_revision_and_supersede(
         feedback = (
             await connection.execute(
                 text(
-                    "SELECT id, feedback_text, message_ts FROM draft_revision_feedback "
+                    "SELECT id, feedback_text, message_ts, processing_owner "
+                    "FROM draft_revision_feedback "
                     "WHERE id = ANY(:ids) AND root_draft_id = :root "
                     "AND status = 'processing' ORDER BY message_ts, id FOR UPDATE"
                 ),
@@ -258,6 +414,11 @@ async def persist_revision_and_supersede(
         ).fetchall()
         if len(feedback) != len(set(feedback_ids)):
             raise ValueError("revision feedback is not claimed for this root")
+        batch_owner = str(feedback[0][3])
+        if any(str(row[3]) != batch_owner for row in feedback):
+            raise ValueError("revision feedback has inconsistent processing ownership")
+        if lease_owner is not None and batch_owner != lease_owner:
+            raise ValueError("revision feedback is owned by another worker")
         superseded = await connection.execute(
             text(
                 "UPDATE drafts SET status = 'superseded', decided_at = NOW(), "
@@ -269,7 +430,7 @@ async def persist_revision_and_supersede(
             {"id": predecessor_id, "root": root_id},
         )
         if superseded.rowcount != 1:
-            raise ValueError("draft is not the latest queued predecessor")
+            raise RevisionConflictError("draft is not the latest queued predecessor")
         action_type_id = (
             await connection.execute(
                 text("SELECT id FROM action_types WHERE name = :name"),
@@ -313,4 +474,29 @@ async def persist_revision_and_supersede(
         )
         if applied.rowcount != len(set(feedback_ids)):
             raise RuntimeError("feedback application changed concurrently")
+        frozen_text = outbox_text.replace("{{draft_id}}", str(new_id))
+        outbox = await connection.execute(
+            text(
+                "INSERT INTO slack_outbox (idempotency_key, draft_id, channel_id, root_ts, "
+                "message_kind, payload) VALUES (:key, :draft_id, :channel, :root_ts, "
+                "'thread_approval', CAST(:payload AS JSONB)) ON CONFLICT "
+                "(idempotency_key) DO NOTHING"
+            ),
+            {
+                "key": outbox_idempotency_key,
+                "draft_id": new_id,
+                "channel": predecessor["slack_channel_id"],
+                "root_ts": predecessor["slack_root_ts"],
+                "payload": json.dumps({"text": frozen_text}),
+            },
+        )
+        if outbox.rowcount != 1:
+            raise ValueError("outbox payload idempotency conflict")
+        await connection.execute(
+            text(
+                "DELETE FROM draft_revision_generation_leases WHERE root_draft_id=:root "
+                "AND lease_owner=:owner"
+            ),
+            {"root": root_id, "owner": batch_owner},
+        )
     return int(new_id)

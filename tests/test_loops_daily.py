@@ -66,7 +66,8 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             # 3) TikTok gen
             ClaudeResponse(
                 text=(
-                    '{"hook": "Marktplaats moe?", "body": "Veilig verkopen.", "cta": "Plaats nu"}'
+                    '{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", '
+                    '"body": "Veilig verkopen.", "cta": "Plaats het nu"}'
                 ),
                 input_tokens=200,
                 output_tokens=40,
@@ -83,10 +84,7 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             ),
             # 5) Email gen
             ClaudeResponse(
-                text=(
-                    '{"subject": "Je hebt nog niets verkocht", '
-                    '"body": "Body text here long enough to be plausible."}'
-                ),
+                text=('{"subject": "Je hebt nog niets verkocht", "body": "' + "woord " * 80 + '"}'),
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",
@@ -159,7 +157,10 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
             ),
             # TikTok ok
             ClaudeResponse(
-                text=('{"hook": "ok?", "body": "Veilig verkopen.", "cta": "Plaats nu"}'),
+                text=(
+                    '{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", '
+                    '"body": "Veilig verkopen.", "cta": "Plaats het nu"}'
+                ),
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -174,7 +175,7 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
             ),
             # Email ok
             ClaudeResponse(
-                text=('{"subject": "ok", "body": "Body text here long enough."}'),
+                text=('{"subject": "ok", "body": "' + "woord " * 80 + '"}'),
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",

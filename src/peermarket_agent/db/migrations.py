@@ -191,6 +191,15 @@ _STEPS: list[str] = [
     "ON drafts (root_draft_id, revision_number) WHERE root_draft_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_revision_feedback_pending "
     "ON draft_revision_feedback (root_draft_id, status, message_ts)",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_owner TEXT",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_attempts INT NOT NULL DEFAULT 0",
+    """CREATE TABLE IF NOT EXISTS draft_revision_generation_leases (
+        root_draft_id BIGINT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+        lease_owner TEXT NOT NULL,
+        lease_expires_at TIMESTAMPTZ NOT NULL,
+        attempt_count INT NOT NULL DEFAULT 1
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_owner TEXT",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",

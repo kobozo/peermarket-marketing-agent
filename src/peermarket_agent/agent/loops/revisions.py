@@ -1,7 +1,9 @@
 """Claim, generate, quality-gate, and enqueue Slack draft revisions."""
 
+import asyncio
+import contextlib
+
 import structlog
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
@@ -10,36 +12,28 @@ from peermarket_agent.drafts import Draft
 from peermarket_agent.prompts.brand_voice import load_brand_voice
 from peermarket_agent.revision_generator import revise_draft
 from peermarket_agent.revisions import (
+    RevisionConflictError,
     claim_feedback_batch,
     list_ready_feedback_threads,
     load_latest_revision_source,
     mark_feedback_failed,
     persist_revision_and_supersede,
+    renew_generation_lease,
+    requeue_feedback_batch,
 )
 from peermarket_agent.slack_dm import format_revised_draft_dm
 from peermarket_agent.slack_notifier import SlackNotifier
-from peermarket_agent.slack_outbox import enqueue_thread_approval
 
 log = structlog.get_logger(__name__)
 
 
-async def _fetch_revised_row(engine: AsyncEngine, draft_id: int) -> dict:
-    async with engine.connect() as connection:
-        row = (
-            (
-                await connection.execute(
-                    text(
-                        "SELECT d.id, at.name AS action_type_name, d.language, d.channel, "
-                        "d.brand_score, d.copy, d.revision_number, d.revision_feedback "
-                        "FROM drafts d JOIN action_types at ON at.id=d.action_type_id WHERE d.id=:id"
-                    ),
-                    {"id": draft_id},
-                )
-            )
-            .mappings()
-            .one()
-        )
-    return dict(row)
+async def _renew_while_generating(engine: AsyncEngine, batch) -> None:
+    while True:
+        await asyncio.sleep(100)
+        if not await renew_generation_lease(
+            engine, batch.root_draft_id, batch.lease_owner, lease_seconds=300
+        ):
+            return
 
 
 async def run_pending_revisions(
@@ -51,7 +45,7 @@ async def run_pending_revisions(
         batch = await claim_feedback_batch(engine, channel_id, root_ts)
         if batch is None:
             continue
-        persisted = False
+        heartbeat = asyncio.create_task(_renew_while_generating(engine, batch))
         try:
             predecessor_id, source = await load_latest_revision_source(engine, batch.root_draft_id)
             generated = await revise_draft(claude, source, batch.instructions)
@@ -71,26 +65,45 @@ async def run_pending_revisions(
                 visual_truthfulness_pass=generated.draft.visual_truthfulness_pass,
                 metadata=generated.draft.metadata,
             )
-            draft_id = await persist_revision_and_supersede(
-                engine, predecessor_id, accepted, batch.feedback_ids
+            message = format_revised_draft_dm(
+                {
+                    "id": "{{draft_id}}",
+                    "action_type_name": accepted.action_type_name,
+                    "language": accepted.language,
+                    "channel": accepted.channel,
+                    "brand_score": score,
+                    "copy": accepted.copy,
+                    "revision_number": source.revision_number + 1,
+                    "revision_feedback": "\n\n".join(batch.instructions),
+                },
+                change_summary=generated.change_summary,
             )
-            persisted = True
-            row = await _fetch_revised_row(engine, draft_id)
-            message = format_revised_draft_dm(row, change_summary=generated.change_summary)
-            await enqueue_thread_approval(engine, draft_id=draft_id, text=message)
+            await persist_revision_and_supersede(
+                engine,
+                predecessor_id,
+                accepted,
+                batch.feedback_ids,
+                outbox_text=message,
+                outbox_idempotency_key=f"revision-feedback:{batch.feedback_ids[0]}",
+                lease_owner=batch.lease_owner,
+            )
             completed += 1
+        except asyncio.CancelledError:
+            await requeue_feedback_batch(engine, batch.feedback_ids, batch.lease_owner)
+            raise
+        except RevisionConflictError:
+            await requeue_feedback_batch(engine, batch.feedback_ids, batch.lease_owner)
+            log.info("revision.conflict_requeued", root_draft_id=batch.root_draft_id)
         except Exception as error:
-            if persisted:
-                log.exception(
-                    "revision.approval_enqueue_failed",
-                    root_draft_id=batch.root_draft_id,
-                    draft_id=draft_id,
-                )
-                continue
             category = (
                 str(error) if str(error) == "brand_score_below_threshold" else type(error).__name__
             )
-            await mark_feedback_failed(engine, batch.feedback_ids, category)
+            await mark_feedback_failed(
+                engine,
+                batch.feedback_ids,
+                category,
+                lease_owner=batch.lease_owner,
+            )
             log.warning(
                 "revision.generation_failed",
                 root_draft_id=batch.root_draft_id,
@@ -104,4 +117,8 @@ async def run_pending_revisions(
                 )
             except Exception:
                 log.warning("revision.failure_notice_failed", root_draft_id=batch.root_draft_id)
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
     return completed
