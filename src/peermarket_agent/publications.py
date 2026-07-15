@@ -23,6 +23,10 @@ class MetaPublication:
     updated_at: datetime | None = field(default=None, compare=False)
 
 
+class MetaReplacementHistoryError(RuntimeError):
+    """A started replacement attempt could not be durably finalized."""
+
+
 async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublication | None:
     """Return the publication recorded for a draft, if one exists."""
     async with engine.connect() as connection:
@@ -157,7 +161,7 @@ async def record_meta_replacement_result(
 ) -> None:
     """Finalize one identified replacement attempt in place."""
     async with engine.begin() as connection:
-        await connection.execute(
+        result = await connection.execute(
             text(
                 "UPDATE publications SET replacement_history = "
                 "COALESCE((SELECT jsonb_agg(CASE WHEN item.value->>'attempt_id' = :attempt_id "
@@ -168,7 +172,9 @@ async def record_meta_replacement_result(
                 "ORDER BY item.ordinality) "
                 "FROM jsonb_array_elements(COALESCE(publications.replacement_history, '[]'::JSONB)) "
                 "WITH ORDINALITY AS item(value, ordinality)), '[]'::JSONB), updated_at = NOW() "
-                "WHERE draft_id = :draft_id"
+                "WHERE draft_id = :draft_id AND EXISTS (SELECT 1 FROM "
+                "jsonb_array_elements(COALESCE(replacement_history, '[]'::JSONB)) AS existing "
+                "WHERE existing->>'attempt_id' = :attempt_id)"
             ),
             {
                 "draft_id": draft_id,
@@ -178,3 +184,7 @@ async def record_meta_replacement_result(
                 "finished_at": datetime.now(UTC).isoformat(),
             },
         )
+        if result.rowcount != 1:
+            raise MetaReplacementHistoryError(
+                f"replacement attempt was not found for draft #{draft_id}"
+            )

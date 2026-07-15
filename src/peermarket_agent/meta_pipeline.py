@@ -24,6 +24,7 @@ from peermarket_agent.nano_banana import (
 )
 from peermarket_agent.publications import (
     MetaPublication,
+    MetaReplacementHistoryError,
     begin_meta_terminal_replacement,
     get_meta_publication,
     record_meta_replacement_result,
@@ -288,11 +289,9 @@ async def replace_terminal_meta_draft(
                     f"failure={json.dumps(result.failure, sort_keys=True) if result.failure else 'none'}."
                 )
             except Exception:
-                if operational_failure is None:
-                    operational_failure = {
-                        "phase": "notify",
-                        "message": "replacement result notification failed",
-                    }
+                log.exception(
+                    "meta_pipeline.replacement_result_notification_failed", draft_id=draft_id
+                )
         finally:
             current = await get_meta_publication(engine, draft_id)
             final_state = (
@@ -301,13 +300,19 @@ async def replace_terminal_meta_draft(
             final_failure = operational_failure or (
                 current.failure if current else {"phase": "unexpected"}
             )
-            await record_meta_replacement_result(
-                engine,
-                draft_id,
-                attempt_id,
-                state=final_state or "failed",
-                failure=final_failure,
-            )
+            try:
+                await record_meta_replacement_result(
+                    engine,
+                    draft_id,
+                    attempt_id,
+                    state=final_state or "failed",
+                    failure=final_failure,
+                )
+            except MetaReplacementHistoryError:
+                raise TerminalReplacementOperationalError(
+                    "terminal replacement history finalization failed; "
+                    "publication state requires operator inspection"
+                ) from None
         if operational_failure:
             phase = operational_failure.get("phase", "operational")
             current_ids = result.current_ids if result is not None else {}
@@ -735,10 +740,13 @@ async def _process_approved_meta_draft(
         )
         return
     observed_state = activation.ad.get("effective_status", activation.ad.get("status", "ACTIVE"))
-    await notifier.notify_founder(
-        f"📣 *Meta ad active for draft #{draft_id}*\n"
-        f"Open in Ads Manager: {ads_manager_url}\n"
-        f"State: {observed_state} · Audience: {metadata['audience_profile_key']} · "
-        f"Budget: €{budget_cents / 100:g}/day"
-    )
+    try:
+        await notifier.notify_founder(
+            f"📣 *Meta ad active for draft #{draft_id}*\n"
+            f"Open in Ads Manager: {ads_manager_url}\n"
+            f"State: {observed_state} · Audience: {metadata['audience_profile_key']} · "
+            f"Budget: €{budget_cents / 100:g}/day"
+        )
+    except Exception:
+        log.exception("meta_pipeline.success_notification_failed", draft_id=draft_id)
     log.info("meta_pipeline.success", draft_id=draft_id, ad_id=ids["ad_id"])

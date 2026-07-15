@@ -70,3 +70,13 @@ Follow-up review findings were addressed test-first:
 - refusal and result Slack messages are best-effort and truthful, while CLI operational errors contain no raw exception text or traceback.
 
 Review RED cases reproduced prerequisite mutation, non-integral budget handling, missing refusal notifications, split history association, successful CLI exit on partial failure, raw unexpected connector errors, and notifier exceptions. The post-review full verification result is recorded in the final handoff.
+
+## Final notification and history review
+
+The final review was addressed with additional RED/GREEN coverage:
+
+- the normal lifecycle's success notification is best-effort after `_mark_published`; notification delivery exceptions are logged and cannot downgrade or unwind verified Meta/database success;
+- a real replacement lifecycle test (without mocking `_process_approved_meta_draft`) verifies that a raising notifier leaves the publication `active`, the draft `published`, and the single replacement attempt finalized successfully with current IDs;
+- replacement summary notification is likewise best-effort after a successful lifecycle, so it cannot recast success as replacement failure;
+- history finalization now requires both the publication row and matching `attempt_id`; missing publications and mismatched attempt IDs raise `MetaReplacementHistoryError`;
+- the replacement wrapper sanitizes history-finalizer validation failures into an operator-facing operational error without exposing internal details.

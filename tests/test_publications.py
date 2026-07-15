@@ -10,9 +10,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.publications import (
     MetaPublication,
+    MetaReplacementHistoryError,
     begin_meta_terminal_replacement,
     get_meta_publication,
     mark_meta_publication_active,
+    record_meta_replacement_result,
     upsert_meta_publication,
 )
 
@@ -276,3 +278,24 @@ async def test_terminal_replacement_requires_exact_current_ids_without_write(dat
     assert stored is not None
     assert stored.external_ids == ids
     assert stored.replacement_history == []
+
+
+async def test_replacement_finalizer_rejects_mismatched_attempt(database_engine):
+    engine, draft_id = database_engine
+    ids = {"campaign_id": "c", "ad_set_id": "s", "creative_id": "cr", "ad_id": "a"}
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id, external_ids=ids))
+    await begin_meta_terminal_replacement(engine, draft_id, ids, {})
+
+    with pytest.raises(MetaReplacementHistoryError, match="attempt was not found"):
+        await record_meta_replacement_result(
+            engine, draft_id, "wrong-attempt", state="failed", failure={"phase": "test"}
+        )
+
+
+async def test_replacement_finalizer_rejects_missing_publication(database_engine):
+    engine, draft_id = database_engine
+
+    with pytest.raises(MetaReplacementHistoryError, match="attempt was not found"):
+        await record_meta_replacement_result(
+            engine, draft_id + 999, "missing", state="failed", failure={"phase": "test"}
+        )
