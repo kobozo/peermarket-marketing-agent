@@ -172,9 +172,12 @@ async def record_meta_replacement_result(
                 "ORDER BY item.ordinality) "
                 "FROM jsonb_array_elements(COALESCE(publications.replacement_history, '[]'::JSONB)) "
                 "WITH ORDINALITY AS item(value, ordinality)), '[]'::JSONB), updated_at = NOW() "
-                "WHERE draft_id = :draft_id AND EXISTS (SELECT 1 FROM "
-                "jsonb_array_elements(COALESCE(replacement_history, '[]'::JSONB)) AS existing "
-                "WHERE existing->>'attempt_id' = :attempt_id)"
+                "WHERE draft_id = :draft_id AND (SELECT COUNT(*) FROM "
+                "jsonb_array_elements(COALESCE(replacement_history, '[]'::JSONB)) AS matching "
+                "WHERE matching->>'attempt_id' = :attempt_id) = 1 AND EXISTS (SELECT 1 FROM "
+                "jsonb_array_elements(COALESCE(replacement_history, '[]'::JSONB)) AS unfinished "
+                "WHERE unfinished->>'attempt_id' = :attempt_id "
+                "AND unfinished->>'finished_at' IS NULL)"
             ),
             {
                 "draft_id": draft_id,
@@ -186,5 +189,5 @@ async def record_meta_replacement_result(
         )
         if result.rowcount != 1:
             raise MetaReplacementHistoryError(
-                f"replacement attempt was not found for draft #{draft_id}"
+                f"replacement attempt was not found or unfinished exactly once for draft #{draft_id}"
             )
