@@ -119,7 +119,8 @@ jobs:
 
       - name: Restart services
         run: |
-          sudo -u peermarket-agent systemd-run --wait --pipe --quiet \
+          sudo systemd-run --wait --pipe --collect \
+            --uid=peermarket-agent --gid=peermarket-agent \
             --property=EnvironmentFile=/etc/peermarket-agent/secrets.env \
             --working-directory=/opt/peermarket-agent \
             /opt/peermarket-agent/.venv/bin/peermarket-migrate

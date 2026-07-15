@@ -249,7 +249,8 @@ async def test_transient_generation_failure_retries_then_succeeds(engine):
     claude = AsyncMock()
     claude.complete.side_effect = [TimeoutError("provider timeout")]
 
-    assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
+    notifier = AsyncMock()
+    assert await run_pending_revisions(engine, claude, notifier) == 0
     async with engine.connect() as conn:
         first = (
             await conn.execute(
@@ -260,6 +261,9 @@ async def test_transient_generation_failure_retries_then_succeeds(engine):
             )
         ).one()
     assert first == ("pending", 1, True)
+    notice = notifier.send_message.await_args.args[0]
+    assert "retry" in notice.lower()
+    assert "couldn't produce a valid revision" not in notice.lower()
 
     async with engine.begin() as conn:
         await conn.execute(text("UPDATE draft_revision_feedback SET next_attempt_at=NOW()"))
@@ -274,7 +278,8 @@ async def test_transient_generation_failure_stops_at_attempt_cap(engine):
     claude = AsyncMock()
     claude.complete.side_effect = TimeoutError("provider timeout")
 
-    assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
+    notifier = AsyncMock()
+    assert await run_pending_revisions(engine, claude, notifier) == 0
     async with engine.connect() as conn:
         row = (
             await conn.execute(
@@ -282,6 +287,7 @@ async def test_transient_generation_failure_stops_at_attempt_cap(engine):
             )
         ).one()
     assert row == ("failed", 3)
+    assert "couldn't produce a valid revision" in notifier.send_message.await_args.args[0].lower()
 
 
 async def test_permanent_validation_failure_can_be_manually_requeued(engine):

@@ -104,7 +104,8 @@ async def run_pending_revisions(
                 str(error) if str(error) == "brand_score_below_threshold" else type(error).__name__
             )
             attempts = await _feedback_attempts(engine, batch.feedback_ids)
-            if _is_retryable(error) and attempts < MAX_GENERATION_ATTEMPTS:
+            will_retry = _is_retryable(error) and attempts < MAX_GENERATION_ATTEMPTS
+            if will_retry:
                 await retry_feedback_batch(
                     engine,
                     batch.feedback_ids,
@@ -124,9 +125,22 @@ async def run_pending_revisions(
                 root_draft_id=batch.root_draft_id,
                 failure_category=category,
             )
+            notice = None
+            if will_retry and attempts == 1:
+                notice = (
+                    "Revision generation hit a temporary problem. I'll retry automatically; "
+                    "the current draft remains unchanged."
+                )
+            elif not will_retry:
+                notice = (
+                    "I couldn't produce a valid revision from that feedback. "
+                    "The current draft remains unchanged."
+                )
+            if notice is None:
+                continue
             try:
                 await notifier.send_message(
-                    "I couldn't produce a valid revision from that feedback. The current draft remains unchanged.",
+                    notice,
                     channel_id=channel_id,
                     thread_ts=root_ts,
                 )

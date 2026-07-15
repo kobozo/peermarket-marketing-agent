@@ -44,3 +44,24 @@ last eligibility transaction but while/after Slack accepts the API call, the
 message can already be visible. The implementation records successful delivery
 when Slack returns success and prevents later retries once the target is known
 stale; it does not claim to erase an already-sent message.
+
+## Final blocker follow-up
+
+- Replaced the privileged-user inversion in deployment with root
+  `systemd-run --wait --pipe --collect --uid=peermarket-agent
+  --gid=peermarket-agent`, retaining the deployed `EnvironmentFile` and working
+  directory. The migration process runs as the service account, while root can
+  create the transient unit unattended; migration failure stops the shell
+  before either service restart.
+- Strengthened the deploy contract test to reject `sudo -u peermarket-agent
+  systemd-run`, require the root invocation flags/environment/directory, forbid
+  failure masking, and enforce migration-before-restart ordering.
+- Retryable generation failures now send concise automatic-retry copy on only
+  the first attempt. The terminal validity notice is reserved for permanent
+  validation failures or exhaustion of the three-attempt cap.
+- A read-only SSH probe for the runner's systemd version was attempted at
+  `192.168.1.121`, but runner authentication was unavailable; no production
+  command or mutation occurred.
+
+Focused RED: two failures (privilege inversion and terminal copy on transient
+failure). Focused GREEN: `12 passed in 3.51s`.
