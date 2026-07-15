@@ -127,7 +127,11 @@ def replace_terminal_draft_command(
     creative_id: str,
     ad_id: str,
 ) -> None:
-    """Replace an exact stored hierarchy only when every resource is terminal."""
+    """Replace an approved or published draft's terminal hierarchy.
+
+    Requires the exact stored IDs and preserves the frozen budget. Successful
+    activation creates spend.
+    """
     settings = get_settings()
     notifier = SlackNotifier(
         bot_token=settings.slack_bot_token,

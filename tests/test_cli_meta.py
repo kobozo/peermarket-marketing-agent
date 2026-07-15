@@ -87,7 +87,10 @@ def test_terminal_replacement_cli_is_explicit_and_requires_every_resource_id():
     )
     assert result.exit_code == 2
     assert "Missing option '--adset-id'" in result.output
-    assert "--budget" not in CliRunner().invoke(cli, ["replace-terminal-draft", "--help"]).output
+    help_output = CliRunner().invoke(cli, ["replace-terminal-draft", "--help"]).output
+    assert "--budget" not in help_output
+    assert "approved or published" in help_output
+    assert "frozen budget" in help_output
 
 
 def test_terminal_replacement_cli_sanitizes_operational_failure(monkeypatch):

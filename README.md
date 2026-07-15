@@ -83,3 +83,27 @@ the existing `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`, and
 `SLACK_FOUNDER_USER_ID` secrets; this feature adds no interval variable or new
 secret. The Slack app must subscribe to direct-message `message` events and
 Socket Mode must remain enabled.
+
+### Replacing a terminal Meta hierarchy
+
+`peermarket-meta replace-terminal-draft` is an explicit recovery command for an
+`approved` or already `published` Meta draft. Use it only when the exact stored
+campaign, ad set, creative, and ad IDs are present and the entire live hierarchy
+is terminal (`ARCHIVED` or `DELETED`). It preserves the publication's frozen
+budget; after successful activation, the replacement creates spend.
+
+Operators must first inspect both Meta and PostgreSQL, then supply all four IDs
+exactly as stored:
+
+```bash
+peermarket-meta replace-terminal-draft \
+  --draft-id 156 \
+  --campaign-id 120249110304880342 \
+  --adset-id 120249110305000342 \
+  --creative-id 28047843224854442 \
+  --ad-id 120249110305530342
+```
+
+Do not blindly retry this command after a failure. Inspect the current IDs,
+draft status, publication state, and finalized replacement-history entry before
+deciding on any further operator action.
