@@ -566,6 +566,7 @@ async def test_terminal_replacement_finalizes_single_history_entry_on_unexpected
     )
     _patch_replacement_preparation(monkeypatch)
     notifier = AsyncMock()
+
     async def partial_then_crash(**kwargs):
         await upsert_meta_publication(
             engine,
@@ -871,7 +872,9 @@ async def test_published_replacement_failure_notifications_preserve_published_wo
             "peermarket_agent.meta_pipeline._mark_published",
             AsyncMock(side_effect=RuntimeError("database race")),
         )
-        monkeypatch.setattr("peermarket_agent.meta_pipeline.pause_meta_ad", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            "peermarket_agent.meta_pipeline.pause_meta_ad", AsyncMock(return_value={})
+        )
     notifier = AsyncMock()
 
     with pytest.raises(TerminalReplacementOperationalError):
