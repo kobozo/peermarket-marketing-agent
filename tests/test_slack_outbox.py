@@ -257,3 +257,125 @@ async def test_delivery_limit_caps_claimed_messages(prepared_db):
 
     assert await deliver_pending_outbox(prepared_db, notifier, limit=2) == 2
     assert notifier.send_message.await_count == 2
+
+
+async def test_root_success_reconciles_when_ack_decides_draft_during_send(prepared_db):
+    draft_id = await _draft(prepared_db)
+    await enqueue_root_approval(prepared_db, draft_id=draft_id, text="root")
+    notifier = AsyncMock()
+
+    async def send_and_ack(*args, **kwargs):
+        async with prepared_db.begin() as connection:
+            await connection.execute(
+                text("UPDATE drafts SET status='approved' WHERE id=:id"), {"id": draft_id}
+            )
+        return SlackMessageResult("D1", "300.01")
+
+    notifier.send_message.side_effect = send_and_ack
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 1
+    async with prepared_db.connect() as connection:
+        row = (
+            await connection.execute(
+                text(
+                    "SELECT d.status, d.root_draft_id, d.slack_root_ts, o.status "
+                    "FROM drafts d JOIN slack_outbox o ON o.draft_id=d.id WHERE d.id=:id"
+                ),
+                {"id": draft_id},
+            )
+        ).one()
+    assert row == ("approved", draft_id, "300.01", "delivered")
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected", "superseded"])
+async def test_stale_root_outbox_is_obsoleted_without_slack_call(prepared_db, decision):
+    draft_id = await _draft(prepared_db)
+    await enqueue_root_approval(prepared_db, draft_id=draft_id, text="root")
+    async with prepared_db.begin() as connection:
+        await connection.execute(
+            text("UPDATE drafts SET status=:status WHERE id=:id"),
+            {"status": decision, "id": draft_id},
+        )
+    notifier = AsyncMock()
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 0
+    notifier.send_message.assert_not_awaited()
+    async with prepared_db.connect() as connection:
+        status = (await connection.execute(text("SELECT status FROM slack_outbox"))).scalar_one()
+    assert status == "obsolete"
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected", "superseded"])
+async def test_stale_revised_outbox_is_obsoleted_without_slack_call(prepared_db, decision):
+    root_id = await _draft(prepared_db)
+    await bind_draft_thread(prepared_db, root_id, "D1", "400.01")
+    async with prepared_db.begin() as connection:
+        revised_id = (
+            await connection.execute(
+                text(
+                    "INSERT INTO drafts (action_type_id, channel, language, copy, metadata, "
+                    "parent_draft_id, root_draft_id, revision_number, slack_channel_id, slack_root_ts) "
+                    "SELECT action_type_id, channel, language, 'revision', '{}', id, id, 1, "
+                    "slack_channel_id, slack_root_ts FROM drafts WHERE id=:root RETURNING id"
+                ),
+                {"root": root_id},
+            )
+        ).scalar_one()
+        await connection.execute(
+            text("UPDATE drafts SET status='superseded' WHERE id=:root"), {"root": root_id}
+        )
+    await enqueue_thread_approval(prepared_db, draft_id=revised_id, text="revision")
+    async with prepared_db.begin() as connection:
+        await connection.execute(
+            text("UPDATE drafts SET status=:status WHERE id=:id"),
+            {"status": decision, "id": revised_id},
+        )
+        if decision == "superseded":
+            await connection.execute(
+                text(
+                    "INSERT INTO drafts (action_type_id, channel, language, copy, metadata, "
+                    "parent_draft_id, root_draft_id, revision_number, slack_channel_id, slack_root_ts) "
+                    "SELECT action_type_id, channel, language, 'newer', '{}', id, root_draft_id, 2, "
+                    "slack_channel_id, slack_root_ts FROM drafts WHERE id=:id"
+                ),
+                {"id": revised_id},
+            )
+    notifier = AsyncMock()
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 0
+    notifier.send_message.assert_not_awaited()
+    async with prepared_db.connect() as connection:
+        status = (await connection.execute(text("SELECT status FROM slack_outbox"))).scalar_one()
+    assert status == "obsolete"
+
+
+async def test_ambiguous_root_success_then_ack_becomes_terminal_without_repost(prepared_db):
+    draft_id = await _draft(prepared_db)
+    await enqueue_root_approval(prepared_db, draft_id=draft_id, text="root")
+    notifier = AsyncMock()
+
+    async def accepted_but_response_lost(*args, **kwargs):
+        async with prepared_db.begin() as connection:
+            await connection.execute(
+                text("UPDATE drafts SET status='approved' WHERE id=:id"), {"id": draft_id}
+            )
+        raise TimeoutError("response lost")
+
+    notifier.send_message.side_effect = accepted_but_response_lost
+    assert await deliver_pending_outbox(prepared_db, notifier) == 0
+    async with prepared_db.begin() as connection:
+        await connection.execute(text("UPDATE slack_outbox SET next_attempt_at=NOW()"))
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 0
+    assert notifier.send_message.await_count == 1
+    async with prepared_db.connect() as connection:
+        row = (
+            await connection.execute(
+                text(
+                    "SELECT d.root_draft_id, o.status FROM drafts d "
+                    "JOIN slack_outbox o ON o.draft_id=d.id WHERE d.id=:id"
+                ),
+                {"id": draft_id},
+            )
+        ).one()
+    assert row == (draft_id, "obsolete")

@@ -39,6 +39,14 @@ async def enqueue_root_approval(
             ),
             {"key": key, "draft_id": draft_id, "payload": json.dumps({"text": text})},
         )
+        if result.rowcount == 1:
+            await connection.execute(
+                sql_text(
+                    "UPDATE drafts SET root_draft_id=id WHERE id=:draft_id "
+                    "AND revision_number=0 AND root_draft_id IS NULL"
+                ),
+                {"draft_id": draft_id},
+            )
     return result.rowcount == 1
 
 
@@ -100,8 +108,20 @@ async def deliver_pending_outbox(
 
 
 async def _lease_is_current(engine: AsyncEngine, message: OutboxMessage, *, owner: str) -> bool:
-    """Verify ownership immediately before the external side effect."""
-    async with engine.connect() as connection:
+    """Atomically cancel stale approvals or verify ownership at the send boundary."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            sql_text(
+                "UPDATE slack_outbox o SET status='obsolete', lease_owner=NULL, "
+                "lease_expires_at=NULL, last_failure_category='draft_not_eligible' "
+                "WHERE o.id=:id AND o.lease_owner=:owner AND o.status IN ('pending','failed') "
+                "AND NOT EXISTS (SELECT 1 FROM drafts d WHERE d.id=o.draft_id "
+                "AND d.status='queued' AND NOT EXISTS (SELECT 1 FROM drafts newer "
+                "WHERE newer.root_draft_id=d.root_draft_id "
+                "AND newer.revision_number>d.revision_number))"
+            ),
+            {"id": message.id, "owner": owner},
+        )
         current = (
             await connection.execute(
                 sql_text(
@@ -170,8 +190,9 @@ async def _finalize_success(engine, message, *, owner: str, result) -> bool:
             bound = await connection.execute(
                 sql_text(
                     "UPDATE drafts SET slack_channel_id=:channel, slack_root_ts=:root, "
-                    "root_draft_id=id WHERE id=:draft_id AND revision_number=0 "
-                    "AND status='queued' AND slack_channel_id IS NULL AND slack_root_ts IS NULL"
+                    "root_draft_id=id WHERE id=:draft_id AND revision_number=0 AND ("
+                    "(slack_channel_id IS NULL AND slack_root_ts IS NULL) OR "
+                    "(slack_channel_id=:channel AND slack_root_ts=:root))"
                 ),
                 {
                     "channel": result.channel_id,

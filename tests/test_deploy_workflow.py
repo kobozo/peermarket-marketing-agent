@@ -24,3 +24,7 @@ def test_deploy_preserves_slack_revision_runtime_contract():
         assert f"secrets.{name}" in workflow_text
 
     assert "marketing-agent.service slack-bridge.service" in workflow_text
+    migrate = workflow_text.index("/opt/peermarket-agent/.venv/bin/peermarket-migrate")
+    restart = workflow_text.index("sudo systemctl restart")
+    assert migrate < restart
+    assert "EnvironmentFile=/etc/peermarket-agent/secrets.env" in workflow_text

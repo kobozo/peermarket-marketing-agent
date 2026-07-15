@@ -118,6 +118,7 @@ async def test_thread_ack_has_precedence_over_revision_routing(monkeypatch, fake
 
     ack.assert_awaited_once()
     revision.assert_not_called()
+    fake_say.assert_awaited_once_with(text="approved", thread_ts="100.000")
 
 
 async def test_handled_thread_feedback_acks_in_thread_without_hello(monkeypatch, fake_say):

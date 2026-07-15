@@ -16,6 +16,7 @@ from peermarket_agent.revisions import (
     RevisionFeedbackEvent,
     bind_draft_thread,
     record_revision_feedback,
+    retry_failed_feedback,
 )
 
 
@@ -241,3 +242,80 @@ async def test_latest_leaf_conflict_requeues_instead_of_failing(engine, monkeypa
         ).scalar_one()
     assert status == "pending"
     assert leases == 0
+
+
+async def test_transient_generation_failure_retries_then_succeeds(engine):
+    await setup_feedback(engine)
+    claude = AsyncMock()
+    claude.complete.side_effect = [TimeoutError("provider timeout")]
+
+    assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
+    async with engine.connect() as conn:
+        first = (
+            await conn.execute(
+                text(
+                    "SELECT status, processing_attempts, next_attempt_at > NOW() "
+                    "FROM draft_revision_feedback"
+                )
+            )
+        ).one()
+    assert first == ("pending", 1, True)
+
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE draft_revision_feedback SET next_attempt_at=NOW()"))
+    claude.complete.side_effect = [generation(), score()]
+    assert await run_pending_revisions(engine, claude, AsyncMock()) == 1
+
+
+async def test_transient_generation_failure_stops_at_attempt_cap(engine):
+    await setup_feedback(engine)
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE draft_revision_feedback SET processing_attempts=2"))
+    claude = AsyncMock()
+    claude.complete.side_effect = TimeoutError("provider timeout")
+
+    assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT status, processing_attempts FROM draft_revision_feedback")
+            )
+        ).one()
+    assert row == ("failed", 3)
+
+
+async def test_permanent_validation_failure_can_be_manually_requeued(engine):
+    await setup_feedback(engine)
+    claude = AsyncMock()
+    claude.complete.side_effect = [generation(), score(79)]
+    assert await run_pending_revisions(engine, claude, AsyncMock()) == 0
+    async with engine.connect() as conn:
+        feedback_id = (
+            await conn.execute(text("SELECT id FROM draft_revision_feedback"))
+        ).scalar_one()
+
+    assert await retry_failed_feedback(engine, (feedback_id,)) == 1
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(text("SELECT status, failure_category FROM draft_revision_feedback"))
+        ).one()
+    assert row == ("pending", None)
+
+
+async def test_heartbeat_database_failure_does_not_undo_committed_revision(engine, monkeypatch):
+    await setup_feedback(engine)
+    claude = AsyncMock()
+    claude.complete.side_effect = [generation(), score()]
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.revisions._renew_while_generating",
+        AsyncMock(side_effect=RuntimeError("heartbeat db unavailable")),
+    )
+
+    assert await run_pending_revisions(engine, claude, AsyncMock()) == 1
+    async with engine.connect() as conn:
+        statuses = (
+            (await conn.execute(text("SELECT status FROM drafts ORDER BY revision_number")))
+            .scalars()
+            .all()
+        )
+    assert statuses == ["superseded", "queued"]

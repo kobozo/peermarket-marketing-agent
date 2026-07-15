@@ -1,9 +1,11 @@
 """Claim, generate, quality-gate, and enqueue Slack draft revisions."""
 
 import asyncio
-import contextlib
 
+import anthropic
 import structlog
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
@@ -20,10 +22,27 @@ from peermarket_agent.revisions import (
     persist_revision_and_supersede,
     renew_generation_lease,
     requeue_feedback_batch,
+    retry_feedback_batch,
 )
 from peermarket_agent.slack_notifier import SlackNotifier
 
 log = structlog.get_logger(__name__)
+MAX_GENERATION_ATTEMPTS = 3
+
+
+def _is_retryable(error: Exception) -> bool:
+    return isinstance(
+        error,
+        (
+            anthropic.APIConnectionError,
+            anthropic.APITimeoutError,
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+            SQLAlchemyError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    )
 
 
 async def _renew_while_generating(engine: AsyncEngine, batch) -> None:
@@ -84,12 +103,22 @@ async def run_pending_revisions(
             category = (
                 str(error) if str(error) == "brand_score_below_threshold" else type(error).__name__
             )
-            await mark_feedback_failed(
-                engine,
-                batch.feedback_ids,
-                category,
-                lease_owner=batch.lease_owner,
-            )
+            attempts = await _feedback_attempts(engine, batch.feedback_ids)
+            if _is_retryable(error) and attempts < MAX_GENERATION_ATTEMPTS:
+                await retry_feedback_batch(
+                    engine,
+                    batch.feedback_ids,
+                    batch.lease_owner,
+                    failure_category=category,
+                    backoff_seconds=60 * (2 ** (attempts - 1)),
+                )
+            else:
+                await mark_feedback_failed(
+                    engine,
+                    batch.feedback_ids,
+                    category,
+                    lease_owner=batch.lease_owner,
+                )
             log.warning(
                 "revision.generation_failed",
                 root_draft_id=batch.root_draft_id,
@@ -105,6 +134,29 @@ async def run_pending_revisions(
                 log.warning("revision.failure_notice_failed", root_draft_id=batch.root_draft_id)
         finally:
             heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await heartbeat
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                log.warning(
+                    "revision.heartbeat_failed",
+                    root_draft_id=batch.root_draft_id,
+                    failure_category=type(error).__name__,
+                )
     return completed
+
+
+async def _feedback_attempts(engine: AsyncEngine, feedback_ids: tuple[int, ...]) -> int:
+    async with engine.connect() as connection:
+        return int(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT MAX(processing_attempts) FROM draft_revision_feedback "
+                        "WHERE id=ANY(:ids)"
+                    ),
+                    {"ids": list(feedback_ids)},
+                )
+            ).scalar_one()
+        )

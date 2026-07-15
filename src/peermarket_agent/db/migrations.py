@@ -194,6 +194,7 @@ _STEPS: list[str] = [
     "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_owner TEXT",
     "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_lease_expires_at TIMESTAMPTZ",
     "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_attempts INT NOT NULL DEFAULT 0",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
     """CREATE TABLE IF NOT EXISTS draft_revision_generation_leases (
         root_draft_id BIGINT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
         lease_owner TEXT NOT NULL,
@@ -203,6 +204,19 @@ _STEPS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_owner TEXT",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    """DO $$
+       DECLARE constraint_name TEXT;
+       BEGIN
+         FOR constraint_name IN
+           SELECT conname FROM pg_constraint
+           WHERE conrelid = 'slack_outbox'::regclass AND contype = 'c'
+             AND pg_get_constraintdef(oid) LIKE '%status%'
+         LOOP
+           EXECUTE format('ALTER TABLE slack_outbox DROP CONSTRAINT %I', constraint_name);
+         END LOOP;
+         ALTER TABLE slack_outbox ADD CONSTRAINT slack_outbox_status_check
+           CHECK (status IN ('pending','delivered','failed','obsolete'));
+       END $$""",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_statuses JSONB",

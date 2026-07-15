@@ -65,6 +65,15 @@ thread. Root bindings are committed only after a successful Slack post.
   `draft_revision_generation_leases`. Expired processing/generation leases are
   reclaimed automatically. Preserve pending feedback and lineage instead of
   deleting or replaying Slack events.
+- Permanent schema or brand-validation failures remain `failed` for inspection.
+  A controlled operator retry uses `retry_failed_feedback(engine, (<id>,))`;
+  it only transitions retained failed rows back to `pending`. Provider, network,
+  and database operational failures retry automatically three times with backoff.
+- Approval outbox rows are revalidated immediately before Slack posting. If the
+  target was approved, rejected, or superseded after enqueue, the row becomes
+  terminal `obsolete` without an API call. A decision racing after the final
+  check can still coincide with an already-sent message; Slack has no atomic
+  transaction with PostgreSQL, so the stored result records the observed truth.
 - After recovery, verify the lineage is `queued -> superseded -> queued` and
   that the newest draft has one pending or delivered thread-approval outbox
   record. Do not approve a recovery test draft or activate paid media.

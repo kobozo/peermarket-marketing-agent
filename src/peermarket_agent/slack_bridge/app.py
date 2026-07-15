@@ -69,7 +69,10 @@ async def handle_im(
         action, draft_id = parsed
         engine = get_engine()
         result = await handle_ack(engine, action=action, draft_id=draft_id, decided_by=user_id)
-        await say(text=result.reply_text)
+        kwargs = {"text": result.reply_text}
+        if event.get("thread_ts"):
+            kwargs["thread_ts"] = event["thread_ts"]
+        await say(**kwargs)
         return
     if event.get("thread_ts"):
         engine = get_engine()

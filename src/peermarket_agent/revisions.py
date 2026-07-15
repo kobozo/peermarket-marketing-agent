@@ -42,7 +42,8 @@ async def list_ready_feedback_threads(engine: AsyncEngine) -> tuple[tuple[str, s
             await connection.execute(
                 text(
                     "SELECT channel_id, root_ts FROM draft_revision_feedback WHERE "
-                    "(status='pending' AND received_at <= NOW()-INTERVAL '15 seconds') "
+                    "(status='pending' AND received_at <= NOW()-INTERVAL '15 seconds' "
+                    "AND next_attempt_at <= NOW()) "
                     "OR (status='processing' AND processing_lease_expires_at <= NOW()) "
                     "GROUP BY channel_id, root_ts ORDER BY MIN(received_at)"
                 )
@@ -119,6 +120,60 @@ async def mark_feedback_failed(
                 ),
                 {"feedback_id": feedback_ids[0], "owner": lease_owner},
             )
+
+
+async def retry_feedback_batch(
+    engine: AsyncEngine,
+    feedback_ids: tuple[int, ...],
+    lease_owner: str,
+    *,
+    failure_category: str,
+    backoff_seconds: int,
+) -> None:
+    """Return an operationally failed owned batch to pending with bounded backoff."""
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(
+                "UPDATE draft_revision_feedback SET status='pending', "
+                "failure_category=:category, processing_owner=NULL, "
+                "processing_lease_expires_at=NULL, "
+                "next_attempt_at=NOW()+make_interval(secs => :backoff) "
+                "WHERE id=ANY(:ids) AND status='processing' AND processing_owner=:owner"
+            ),
+            {
+                "ids": list(feedback_ids),
+                "owner": lease_owner,
+                "category": failure_category[:100],
+                "backoff": backoff_seconds,
+            },
+        )
+        if result.rowcount != len(set(feedback_ids)):
+            raise RuntimeError("feedback retry state changed concurrently")
+        await connection.execute(
+            text(
+                "DELETE FROM draft_revision_generation_leases leases USING "
+                "draft_revision_feedback feedback WHERE feedback.id=:feedback_id "
+                "AND leases.root_draft_id=feedback.root_draft_id "
+                "AND leases.lease_owner=:owner"
+            ),
+            {"feedback_id": feedback_ids[0], "owner": lease_owner},
+        )
+
+
+async def retry_failed_feedback(engine: AsyncEngine, feedback_ids: tuple[int, ...]) -> int:
+    """Safely make retained permanent failures available for an operator retry."""
+    if not feedback_ids:
+        return 0
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(
+                "UPDATE draft_revision_feedback SET status='pending', failure_category=NULL, "
+                "processing_owner=NULL, processing_lease_expires_at=NULL, next_attempt_at=NOW() "
+                "WHERE id=ANY(:ids) AND status='failed'"
+            ),
+            {"ids": list(feedback_ids)},
+        )
+    return result.rowcount
 
 
 async def requeue_feedback_batch(
@@ -313,9 +368,10 @@ async def claim_feedback_batch(
             await connection.execute(
                 text(
                     "SELECT MIN(received_at) FROM draft_revision_feedback "
-                    "WHERE root_draft_id = :root AND status = 'pending'"
+                    "WHERE root_draft_id = :root AND status = 'pending' "
+                    "AND next_attempt_at <= CAST(:now AS TIMESTAMPTZ)"
                 ),
-                {"root": root},
+                {"root": root, "now": claim_now},
             )
         ).scalar_one_or_none()
         if oldest_pending is None or oldest_pending > cutoff:
@@ -332,9 +388,10 @@ async def claim_feedback_batch(
                 text(
                     "SELECT id, feedback_text FROM draft_revision_feedback "
                     "WHERE root_draft_id = :root AND status = 'pending' "
+                    "AND next_attempt_at <= CAST(:now AS TIMESTAMPTZ) "
                     "ORDER BY message_ts, id FOR UPDATE"
                 ),
-                {"root": root},
+                {"root": root, "now": claim_now},
             )
         ).fetchall()
         if not rows:
