@@ -115,7 +115,7 @@ def test_two_distinct_qualified_variants_are_eligible_with_evidence():
     decision = eligible_learning(
         [
             variant(),
-            variant(evidence_id="publication:2:2026-07-15", publication_id=2),
+            variant(evidence_id="publication:2:2026-07-15", publication_id=2, registrations=11),
         ],
         DEFAULT_THRESHOLDS,
     )
@@ -130,7 +130,7 @@ def test_two_distinct_qualified_variants_are_eligible_with_evidence():
         "variants": 2,
         "impressions": 2_000,
         "landing_page_views": 60,
-        "registrations": 20,
+        "registrations": 21,
     }
 
 
@@ -186,7 +186,7 @@ def test_conversion_learning_compares_registration_rate():
     assert decision.outcome["winner_value"] == "0.4"
 
 
-def test_delivery_outcome_tie_is_deterministic_by_publication_id():
+def test_delivery_outcome_tie_is_neutral_observation_not_learning():
     decision = eligible_learning(
         [
             variant(evidence_id="e-2", publication_id=2, landing_page_views=40),
@@ -196,5 +196,6 @@ def test_delivery_outcome_tie_is_deterministic_by_publication_id():
         learning_type="delivery",
     )
 
-    assert decision.outcome["winner_publication_id"] == 1
-    assert decision.outcome["loser_publication_id"] == 2
+    assert decision.eligible is False
+    assert decision.reason == "no_observed_difference"
+    assert decision.outcome is None

@@ -246,7 +246,7 @@ async def test_daily_run_is_idempotent_and_sanitizes_unavailable_summary(databas
     assert len(performance["daily_observations"]) == 1
     message = notifier.notify_founder.await_args_list[0].args[0]
     assert "unavailable" in message
-    assert "2026-07-15 → 2026-07-16 UTC (rolling-2-calendar-days)" in message
+    assert "account dates 2026-07-15 → 2026-07-16 (Europe/Brussels)" in message
     assert "https://business.facebook.com/adsmanager/manage/ads" in message
     assert "super-secret" not in message
     assert "caused" not in message.lower()
@@ -273,6 +273,8 @@ async def test_daily_run_inserts_then_idempotently_reinforces_learning(database_
     await _insert_publication(
         database_engine, draft_id=601, audience="declutterers", performance=base, ads_url=None
     )
+    base["meta"]["latest"]["landing_page_views"] = 31
+    base["attribution"]["events"][0]["event_count"] = 11
     await _insert_publication(
         database_engine, draft_id=602, audience="declutterers", performance=base, ads_url=None
     )
@@ -335,10 +337,51 @@ async def test_daily_run_inserts_then_idempotently_reinforces_learning(database_
         assert persisted_variant["evidence_id"] == source["observation"]["evidence_id"]
         assert persisted_variant["compared_values"] == source["observation"]["metrics"]
         assert persisted_variant["sample_sizes"] == {
-            "impressions": 1000,
-            "meta_landing_page_views": 30,
-            "registrations": 10,
+            "impressions": source["observation"]["metrics"]["impressions"],
+            "meta_landing_page_views": source["observation"]["metrics"]["meta_landing_page_views"],
+            "registrations": source["observation"]["metrics"]["registrations"],
         }
+
+
+async def test_equal_metrics_never_persist_directional_learning(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    base = _complete_performance()
+    base["meta"]["latest"].update(
+        window_start="2026-07-14",
+        window_stop="2026-07-15",
+        window_definition="rolling-2-inclusive-calendar-days",
+    )
+    for draft_id in (611, 612):
+        await _insert_publication(
+            database_engine,
+            draft_id=draft_id,
+            audience="declutterers",
+            performance=base,
+            ads_url=None,
+        )
+
+    await run_daily_performance(
+        database_engine, AsyncMock(), object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+
+    async with database_engine.connect() as conn:
+        assert (await conn.execute(text("SELECT count(*) FROM learnings"))).scalar_one() == 0
+
+
+async def test_summary_labels_account_dates_and_explicit_utc_interval(database_engine):
+    await _prepared_summary_publication(database_engine)
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    await run_daily_performance(
+        database_engine, notifier, object(), now=datetime(2026, 7, 17, 9, tzinfo=UTC)
+    )
+
+    message = notifier.notify_founder.await_args.args[0]
+    assert "account dates 2026-07-14 → 2026-07-16 (Europe/Brussels)" in message
+    assert "UTC interval 2026-07-13T22:00:00+00:00 → 2026-07-16T22:00:00+00:00" in message
+    assert "2026-07-14 → 2026-07-16 UTC" not in message
 
 
 async def test_daily_slack_contains_complete_design_metrics_and_samples(database_engine):
@@ -511,11 +554,17 @@ async def test_concurrent_daily_replay_inserts_one_observation_and_learning(data
         window_definition="rolling-3-calendar-days",
     )
     for draft_id in (901, 902):
+        variant_performance = json.loads(json.dumps(base))
+        if draft_id == 902:
+            variant_performance["meta"]["latest"]["landing_page_views"] += 1
+            for event in variant_performance["attribution"]["events"]:
+                if event["event_type"] == "registration_completed":
+                    event["event_count"] += 1
         await _insert_publication(
             database_engine,
             draft_id=draft_id,
             audience="declutterers",
-            performance=base,
+            performance=variant_performance,
             ads_url=None,
         )
     now = datetime(2026, 7, 16, 9, tzinfo=UTC)
@@ -549,11 +598,17 @@ async def test_new_window_reinforces_once_and_retains_replayable_prior_evidence(
         window_definition="rolling-3-calendar-days",
     )
     for draft_id in (1001, 1002):
+        variant_performance = json.loads(json.dumps(base))
+        if draft_id == 1002:
+            variant_performance["meta"]["latest"]["landing_page_views"] += 1
+            for event in variant_performance["attribution"]["events"]:
+                if event["event_type"] == "registration_completed":
+                    event["event_count"] += 1
         await _insert_publication(
             database_engine,
             draft_id=draft_id,
             audience="declutterers",
-            performance=base,
+            performance=variant_performance,
             ads_url=None,
         )
     await run_daily_performance(

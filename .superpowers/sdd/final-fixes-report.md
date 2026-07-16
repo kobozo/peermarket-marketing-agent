@@ -53,3 +53,23 @@ feature flag defaults are unchanged.
 - `git diff --check`: clean.
 
 No push, deployment, production read, or production write was performed.
+
+## Final tie and window-label follow-up
+
+Strict TDD covered the last Important and Minor findings:
+
+- RED: the pure decision returned an eligible directional winner for equal
+  metric rates; the daily layer persisted two directional learning rows; the
+  retrieval path had no defensive eligibility filter; and Slack labeled Meta
+  account-calendar dates as UTC.
+- GREEN: equal delivery or conversion metric values now return ineligible with
+  reason `no_observed_difference` and no outcome. The daily persistence layer
+  therefore creates or reinforces no reusable learning for a tie. Draft
+  retrieval additionally requires persisted `decision.eligible=true` and a
+  non-zero absolute difference, so a neutral/legacy row cannot enter the prompt.
+- Non-tie ordering remains deterministic by metric value and publication ID.
+- Daily summaries label account dates with the stored account timezone and
+  show the stored half-open UTC interval explicitly.
+- Focused pure, database, prompt, and formatting coverage passed 67 tests.
+- Full suite passed 454 tests in 53.00s; final defensive focused coverage
+  passed 5 tests, with Ruff, format, and diff checks clean.

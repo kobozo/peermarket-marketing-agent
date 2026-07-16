@@ -28,6 +28,45 @@ from peermarket_agent.slack_notifier import SlackNotifier
 log = structlog.get_logger(__name__)
 
 
+async def recent_relevant_learnings(
+    engine: AsyncEngine,
+    *,
+    channel: str,
+    objective: str,
+    language: str,
+    audience: str,
+) -> tuple[str, ...]:
+    """Return only bounded, eligible, exact-dimension reusable learnings."""
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT text FROM learnings WHERE "
+                        "split_part(scope, ':', 1) IN ('delivery', 'conversion') "
+                        "AND split_part(scope, ':', 2)=:channel "
+                        "AND split_part(scope, ':', 3)=:objective "
+                        "AND split_part(scope, ':', 4)=:language "
+                        "AND split_part(scope, ':', 5)=:audience "
+                        "AND evidence_links->'decision'->>'eligible'='true' "
+                        "AND trim(BOTH '0.' FROM COALESCE("
+                        "evidence_links->'decision'->'outcome'->>'absolute_difference', ''))<>'' "
+                        "ORDER BY id DESC LIMIT 5"
+                    ),
+                    {
+                        "channel": channel,
+                        "objective": objective,
+                        "language": language,
+                        "audience": audience,
+                    },
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return tuple(rows)
+
+
 def _human_cta_to_meta_enum(human: str) -> str:
     mapping = {
         "Learn More": "LEARN_MORE",
@@ -132,31 +171,13 @@ async def run_draft_command(
         if action_type_name == "meta_ad_creative":
             audience_key = action_args.get("audience_profile_key") or pick_audience()
             action_args["audience_profile_key"] = audience_key
-            async with engine.connect() as conn:
-                learning_rows = (
-                    (
-                        await conn.execute(
-                            text(
-                                "SELECT text FROM learnings WHERE "
-                                "split_part(scope, ':', 1) IN ('delivery', 'conversion') "
-                                "AND split_part(scope, ':', 2)=:channel "
-                                "AND split_part(scope, ':', 3)=:objective "
-                                "AND split_part(scope, ':', 4)=:language "
-                                "AND split_part(scope, ':', 5)=:audience "
-                                "ORDER BY id DESC LIMIT 5"
-                            ),
-                            {
-                                "channel": "meta",
-                                "objective": "OUTCOME_TRAFFIC",
-                                "language": action_args["language"],
-                                "audience": audience_key,
-                            },
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-            action_args["learnings"] = tuple(learning_rows)
+            action_args["learnings"] = await recent_relevant_learnings(
+                engine,
+                channel="meta",
+                objective="OUTCOME_TRAFFIC",
+                language=action_args["language"],
+                audience=audience_key,
+            )
         channel, language, copy_text, gen_cost, metadata = await _produce_copy_for_action(
             claude=claude,
             brand_voice_md=brand_voice_md,

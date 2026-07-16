@@ -120,6 +120,14 @@ def eligible_learning(
             / Decimal(variant.landing_page_views)
             for variant in comparisons
         }
+    if len(set(values.values())) == 1:
+        return LearningDecision(
+            False,
+            "no_observed_difference",
+            evidence_ids=evidence_ids,
+            learning_type=selected_type,
+            metric=metric,
+        )
     ordered = sorted(
         comparisons, key=lambda item: (-values[item.publication_id], item.publication_id)
     )

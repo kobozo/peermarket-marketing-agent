@@ -296,6 +296,7 @@ def _summary(rows: list[dict], observations: list[dict]) -> str:
         metrics = observation["metrics"]
         display = lambda value: "unavailable" if value is None else str(value)  # noqa: E731
         window = observation["window"]
+        utc_alignment = window.get("utc_alignment") or {}
         line = (
             f"• Publication #{row['publication_id']} — "
             f"approved budget {display(metrics['approved_budget_cents'])} cents; "
@@ -319,7 +320,10 @@ def _summary(rows: list[dict], observations: list[dict]) -> str:
             f"{display(metrics['cost_per_first_published_listing_cents'])}; "
             f"identity verification conversion "
             f"{display(metrics['identity_verification_conversion'])}; "
-            f"attribution window {window['start']} → {window['stop']} UTC "
+            f"attribution account dates {window['start']} → {window['stop']} "
+            f"({window.get('account_timezone', 'timezone unavailable')}); "
+            f"UTC interval {utc_alignment.get('start', 'unavailable')} → "
+            f"{utc_alignment.get('stop_exclusive', 'unavailable')} "
             f"({window['definition']}); sample sizes: impressions "
             f"{display(metrics['impressions'])}, Meta LPV "
             f"{display(metrics['meta_landing_page_views'])}, registrations "

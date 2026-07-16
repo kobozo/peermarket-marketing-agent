@@ -1,5 +1,6 @@
 """CLI draft command tests — end-to-end orchestration."""
 
+import json
 import os
 from unittest.mock import AsyncMock
 
@@ -236,10 +237,21 @@ async def test_meta_generation_uses_only_five_recent_relevant_learnings(prepared
     async with prepared_db.begin() as conn:
         for index in range(7):
             await conn.execute(
-                text("INSERT INTO learnings (scope, text) VALUES (:scope, :learning)"),
+                text(
+                    "INSERT INTO learnings (scope, text, evidence_links) VALUES "
+                    "(:scope, :learning, CAST(:evidence AS JSONB))"
+                ),
                 {
                     "scope": "delivery:meta:OUTCOME_TRAFFIC:NL:declutterers:rolling-3",
                     "learning": f"relevant-{index}",
+                    "evidence": json.dumps(
+                        {
+                            "decision": {
+                                "eligible": True,
+                                "outcome": {"absolute_difference": "0.01"},
+                            }
+                        }
+                    ),
                 },
             )
         await conn.execute(
@@ -284,6 +296,39 @@ async def test_meta_generation_uses_only_five_recent_relevant_learnings(prepared
     assert "relevant-6" in prompt and "relevant-2" in prompt
     assert "relevant-1" not in prompt and "relevant-0" not in prompt
     assert "do-not-use" not in prompt
+
+
+async def test_meta_prompt_defensively_excludes_neutral_tie_learning(prepared_db):
+    async with prepared_db.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO learnings (scope, text, evidence_links) VALUES "
+                "(:scope, 'tie-must-not-appear', CAST(:evidence AS JSONB))"
+            ),
+            {
+                "scope": "delivery:meta:OUTCOME_TRAFFIC:NL:declutterers:rolling-3",
+                "evidence": json.dumps(
+                    {
+                        "decision": {
+                            "eligible": True,
+                            "reason": "delivery_thresholds_met",
+                            "outcome": {"absolute_difference": "0.00"},
+                        }
+                    }
+                ),
+            },
+        )
+    from peermarket_agent.agent.cli_draft import recent_relevant_learnings
+
+    learnings = await recent_relevant_learnings(
+        prepared_db,
+        channel="meta",
+        objective="OUTCOME_TRAFFIC",
+        language="NL",
+        audience="declutterers",
+    )
+
+    assert learnings == ()
 
 
 async def test_run_draft_credit_low_dms_founder_and_reraises(prepared_db):
