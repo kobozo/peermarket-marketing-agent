@@ -211,8 +211,10 @@ async def test_full_happy_path(monkeypatch, engine_with_meta_draft):
     assert create_kwargs["audience_profile_key"] == "declutterers"
     assert create_kwargs["daily_budget_eur"] == 10
     assert create_kwargs["config"].page_id == "61592144690879"
-    assert f"draft-{draft_id}" in create_kwargs["landing_page_url"]
-    assert "utm_source=meta" in create_kwargs["landing_page_url"]
+    assert create_kwargs["landing_page_url"] == (
+        "https://peermarket.eu/?utm_source=facebook&utm_medium=paid_social"
+        f"&utm_campaign=peermarket&utm_content=draft-{draft_id}"
+    )
 
     activate_mock.assert_awaited_once()
     notifier.notify_founder.assert_awaited_once()
@@ -719,19 +721,17 @@ async def test_published_terminal_replacement_runs_authorized_lifecycle_without_
         "peermarket_agent.meta_pipeline.get_meta_ad_statuses", AsyncMock(return_value=terminal)
     )
     _patch_replacement_preparation(monkeypatch)
-    monkeypatch.setattr(
-        "peermarket_agent.meta_pipeline.create_meta_ad_paused",
-        AsyncMock(
-            return_value=MetaAdResult(
-                ad_id=new_ids["ad_id"],
-                ad_set_id=new_ids["ad_set_id"],
-                campaign_id=new_ids["campaign_id"],
-                creative_id=new_ids["creative_id"],
-                ads_manager_url="https://example.test/new-a",
-                status="PAUSED",
-            )
-        ),
+    create_mock = AsyncMock(
+        return_value=MetaAdResult(
+            ad_id=new_ids["ad_id"],
+            ad_set_id=new_ids["ad_set_id"],
+            campaign_id=new_ids["campaign_id"],
+            creative_id=new_ids["creative_id"],
+            ads_manager_url="https://example.test/new-a",
+            status="PAUSED",
+        )
     )
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_ad_paused", create_mock)
     monkeypatch.setattr(
         "peermarket_agent.meta_pipeline.activate_meta_ad",
         AsyncMock(
@@ -780,6 +780,7 @@ async def test_published_terminal_replacement_runs_authorized_lifecycle_without_
     assert draft_status == "published"
     assert observed_statuses
     assert "approved" not in observed_statuses
+    assert create_mock.await_args.kwargs["landing_page_url"] == "https://peermarket.eu/"
 
 
 async def test_private_lifecycle_without_replacement_authorization_is_noop_for_published(

@@ -7,6 +7,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.config import Settings
 from peermarket_agent.meta_ads import (
     MetaAdsDisabled,
@@ -445,14 +446,6 @@ async def _mark_published(
             raise RuntimeError(f"draft was not {expected} during publication finalization")
 
 
-def _build_landing_url(draft_id: int) -> str:
-    return (
-        f"{_LANDING_PAGE}"
-        f"?utm_source=meta&utm_medium=paid&utm_campaign=phase2"
-        f"&utm_content=draft-{draft_id}"
-    )
-
-
 async def process_approved_meta_draft(
     *,
     engine: AsyncEngine,
@@ -677,7 +670,11 @@ async def _process_approved_meta_draft(
                 headline=metadata["headline"],
                 description=metadata["description"],
                 cta_type=metadata["cta_type"],
-                landing_page_url=_build_landing_url(draft_id),
+                landing_page_url=(
+                    _LANDING_PAGE
+                    if authorized_published_replacement
+                    else build_campaign_url(_LANDING_PAGE, draft_id)
+                ),
                 image_bytes=image_bytes,
                 audience_profile_key=metadata["audience_profile_key"],
                 daily_budget_eur=budget_cents // 100,
