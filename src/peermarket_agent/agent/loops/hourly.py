@@ -1,7 +1,9 @@
 """Loop A — heartbeat, aggregate KPIs, and read-only Meta monitoring."""
 
+import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import text
@@ -13,6 +15,7 @@ from peermarket_agent.performance import classify_delivery, derive_performance
 from peermarket_agent.publications import save_performance_snapshot
 
 log = structlog.get_logger(__name__)
+_ALERT_CLAIM_LEASE = timedelta(minutes=5)
 
 
 @dataclass
@@ -79,21 +82,18 @@ async def _publications(engine: AsyncEngine) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def _notify(notifier, message: str) -> None:
+async def _deliver(notifier, message: str) -> bool:
     if notifier is None:
-        return
+        return False
     try:
-        await notifier.notify_founder(message)
+        return bool(await notifier.notify_founder(message))
     except Exception:
-        log.exception("hourly_meta.alert_failed")
+        log.warning("hourly_meta.alert_failed")
+        return False
 
 
-def _alert_payload(
-    previous: dict, condition: str, statuses: dict, now: datetime
-) -> tuple[dict, str | None]:
-    problem = condition in {"no_delivery", "rejected_or_error"}
-    old = previous.get("alert_state") or {}
-    observed = {
+def _observed_state(statuses: dict) -> dict:
+    return {
         key: {
             field: value.get(field)
             for field in ("status", "effective_status", "issues")
@@ -102,33 +102,150 @@ def _alert_payload(
         for key, value in sorted(statuses.items())
         if isinstance(value, dict)
     }
-    same_problem = (
-        problem
-        and old.get("condition") == condition
-        and old.get("observed_state") == observed
-        and old.get("active") is True
+
+
+def _claimed_at(claim: dict) -> datetime | None:
+    try:
+        value = datetime.fromisoformat(claim["claimed_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if value.tzinfo is not None and value.utcoffset() is not None else None
+
+
+async def _write_performance(conn, draft_id: int, performance: dict) -> None:
+    await conn.execute(
+        text(
+            "UPDATE publications SET performance=CAST(:performance AS JSONB), "
+            "updated_at=NOW() WHERE draft_id=:draft_id"
+        ),
+        {"draft_id": draft_id, "performance": json.dumps(performance)},
     )
-    if problem:
-        state = {
+
+
+async def _claim_alert(
+    engine: AsyncEngine,
+    draft_id: int,
+    *,
+    namespace: str,
+    condition: str,
+    observed_state: dict,
+    active: bool,
+    now: datetime,
+) -> tuple[str, str] | None:
+    """Claim one transition after re-evaluating durable state under row lock."""
+    state_key = f"{namespace}_state"
+    claim_key = f"{namespace}_claim"
+    async with engine.begin() as conn:
+        performance = (
+            await conn.execute(
+                text("SELECT performance FROM publications WHERE draft_id=:draft_id FOR UPDATE"),
+                {"draft_id": draft_id},
+            )
+        ).scalar_one_or_none()
+        if performance is None:
+            return None
+        performance = dict(performance)
+        state = performance.get(state_key) or {}
+        claim = performance.get(claim_key) or {}
+        claimed_at = _claimed_at(claim)
+        if claimed_at is not None and now - claimed_at < _ALERT_CLAIM_LEASE:
+            return None
+        if active:
+            if (
+                state.get("active") is True
+                and state.get("condition") == condition
+                and state.get("observed_state") == observed_state
+            ):
+                return None
+            message = (
+                "Aggregate attribution unavailable; Meta collection continued"
+                if namespace == "attribution_alert"
+                else f"Meta delivery problem: {condition}"
+            )
+        else:
+            if state.get("active") is not True:
+                return None
+            message = f"Meta delivery recovered from {state.get('condition')}"
+        token = str(uuid4())
+        performance[claim_key] = {
+            "claim_token": token,
+            "claimed_at": now.isoformat(),
             "condition": condition,
-            "observed_state": observed,
-            "active": True,
-            "changed_at": old.get("changed_at") if same_problem else now,
+            "observed_state": observed_state,
+            "active": active,
         }
-        return state, None if same_problem else f"Meta delivery problem: {condition}"
-    if old.get("active") is True:
-        return {
-            "condition": condition,
-            "observed_state": observed,
-            "active": False,
-            "changed_at": now,
-        }, f"Meta delivery recovered from {old.get('condition')}"
-    return {
-        "condition": condition,
-        "observed_state": observed,
-        "active": False,
-        "changed_at": old.get("changed_at", now),
-    }, None
+        await _write_performance(conn, draft_id, performance)
+    return token, message
+
+
+async def _finish_alert(
+    engine: AsyncEngine,
+    draft_id: int,
+    *,
+    namespace: str,
+    token: str,
+    delivered: bool,
+    now: datetime,
+) -> None:
+    """Finalize confirmed delivery or release a failed claim for retry."""
+    state_key = f"{namespace}_state"
+    claim_key = f"{namespace}_claim"
+    async with engine.begin() as conn:
+        performance = (
+            await conn.execute(
+                text("SELECT performance FROM publications WHERE draft_id=:draft_id FOR UPDATE"),
+                {"draft_id": draft_id},
+            )
+        ).scalar_one_or_none()
+        if performance is None:
+            return
+        performance = dict(performance)
+        claim = performance.get(claim_key) or {}
+        if claim.get("claim_token") != token:
+            return
+        if delivered:
+            performance[state_key] = {
+                "condition": claim["condition"],
+                "observed_state": claim["observed_state"],
+                "active": claim["active"],
+                "delivered_at": now.isoformat(),
+            }
+        performance.pop(claim_key, None)
+        await _write_performance(conn, draft_id, performance)
+
+
+async def _send_claimed_alert(
+    engine: AsyncEngine,
+    draft_id: int,
+    notifier,
+    *,
+    namespace: str,
+    condition: str,
+    observed_state: dict,
+    active: bool,
+    now: datetime,
+) -> None:
+    claimed = await _claim_alert(
+        engine,
+        draft_id,
+        namespace=namespace,
+        condition=condition,
+        observed_state=observed_state,
+        active=active,
+        now=now,
+    )
+    if claimed is None:
+        return
+    token, message = claimed
+    delivered = await _deliver(notifier, f"Draft #{draft_id}: {message}")
+    await _finish_alert(
+        engine,
+        draft_id,
+        namespace=namespace,
+        token=token,
+        delivered=delivered,
+        now=now,
+    )
 
 
 async def collect_meta_performance(
@@ -162,12 +279,7 @@ async def collect_meta_performance(
             meta = derive_performance((previous.get("meta") or {}).get("latest"), current)
             meta.update({"statuses": statuses, "last_successful_retrieval": now, "error": None})
             condition = classify_delivery(statuses, current, publication["published_at"], now, 2)
-            alert_state, alert = _alert_payload(previous, condition, statuses, now)
-            payload = {
-                "meta": meta,
-                "delivery": {"condition": condition},
-                "alert_state": alert_state,
-            }
+            payload = {"meta": meta, "delivery": {"condition": condition}}
             if settings.peermarket_attribution_enabled:
                 if attribution_error:
                     payload["attribution"] = {
@@ -186,8 +298,16 @@ async def collect_meta_performance(
                     }
             await save_performance_snapshot(engine, draft_id, payload)
             updated.append(draft_id)
-            if alert:
-                await _notify(notifier, f"Draft #{draft_id}: {alert}")
+            await _send_claimed_alert(
+                engine,
+                draft_id,
+                notifier,
+                namespace="alert",
+                condition=condition,
+                observed_state=_observed_state(statuses),
+                active=condition in {"no_delivery", "rejected_or_error"},
+                now=now,
+            )
         except Exception:
             log.warning("hourly_meta.publication_failed", draft_id=draft_id)
             failure_payload = {
@@ -205,13 +325,16 @@ async def collect_meta_performance(
             failed.append(draft_id)
 
     if attribution_error and publications:
-        already_alerted = all(
-            ((row.get("performance") or {}).get("attribution") or {}).get("error")
-            == "Aggregate attribution unavailable"
-            for row in publications
+        await _send_claimed_alert(
+            engine,
+            publications[0]["draft_id"],
+            notifier,
+            namespace="attribution_alert",
+            condition="aggregate_attribution_unavailable",
+            observed_state={"available": False},
+            active=True,
+            now=now,
         )
-        if not already_alerted:
-            await _notify(notifier, "Aggregate attribution unavailable; Meta collection continued")
     return CollectionResult(updated=updated, failed=failed)
 
 

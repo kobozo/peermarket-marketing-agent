@@ -1,7 +1,9 @@
 """Hourly Loop A — heartbeat, KPI, and isolated Meta collection."""
 
+import asyncio
+import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -153,6 +155,7 @@ async def test_one_meta_failure_does_not_block_other_publications(engine, monkey
 async def test_no_delivery_alert_is_deduplicated_and_recovers_once(engine, monkeypatch):
     await _publication(engine, 156, "ad-1")
     notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
     monkeypatch.setattr(
         "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses", AsyncMock(return_value=ACTIVE)
     )
@@ -188,6 +191,7 @@ async def test_missing_attribution_view_alerts_once_without_blocking_meta(engine
     peermarket = AsyncMock()
     peermarket.fetch_attribution.side_effect = PermissionError("password=secret")
     notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
     monkeypatch.setattr(
         "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses", AsyncMock(return_value=ACTIVE)
     )
@@ -209,3 +213,187 @@ async def test_missing_attribution_view_alerts_once_without_blocking_meta(engine
         ).scalar_one()
     assert performance["attribution"]["error"] == "Aggregate attribution unavailable"
     assert "secret" not in str(performance)
+
+
+async def test_concurrent_collectors_claim_one_problem_sender(engine, monkeypatch):
+    await _publication(engine, 156, "ad-1")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1", impressions=0)),
+    )
+    notifier = AsyncMock()
+
+    async def delivered(message):
+        await asyncio.sleep(0.05)
+        return True
+
+    notifier.notify_founder.side_effect = delivered
+
+    await asyncio.gather(
+        collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW),
+        collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW),
+    )
+
+    notifier.notify_founder.assert_awaited_once()
+
+
+@pytest.mark.parametrize("first_result", [False, RuntimeError("slack down")])
+async def test_problem_alert_delivery_failure_remains_retryable(engine, monkeypatch, first_result):
+    await _publication(engine, 156, "ad-1")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1", impressions=0)),
+    )
+    notifier = AsyncMock()
+    if isinstance(first_result, Exception):
+        notifier.notify_founder.side_effect = [first_result, True]
+    else:
+        notifier.notify_founder.side_effect = [first_result, True]
+
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+    async with engine.connect() as conn:
+        after_failure = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
+        ).scalar_one()
+    assert "alert_state" not in after_failure
+    assert "alert_claim" not in after_failure
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+
+    assert notifier.notify_founder.await_count == 2
+    async with engine.connect() as conn:
+        performance = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
+        ).scalar_one()
+    assert performance["alert_state"]["active"] is True
+    assert "claim_token" not in performance.get("alert_claim", {})
+
+
+async def test_stale_problem_claim_can_be_reclaimed(engine, monkeypatch):
+    await _publication(engine, 156, "ad-1")
+    stale = {
+        "alert_claim": {
+            "claim_token": "crashed-worker",
+            "claimed_at": (NOW - timedelta(minutes=10)).isoformat(),
+            "condition": "no_delivery",
+            "observed_state": ACTIVE,
+            "active": True,
+        }
+    }
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE publications SET performance=CAST(:p AS JSONB) WHERE draft_id=156"),
+            {"p": json.dumps(stale)},
+        )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1", impressions=0)),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+
+    notifier.notify_founder.assert_awaited_once()
+
+
+@pytest.mark.parametrize("recovery_result", [False, RuntimeError("slack down")])
+async def test_recovery_delivery_failure_remains_retryable(engine, monkeypatch, recovery_result):
+    await _publication(engine, 156, "ad-1")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    insights = AsyncMock(return_value=_snapshot("ad-1", impressions=0))
+    monkeypatch.setattr("peermarket_agent.agent.loops.hourly.fetch_meta_insights", insights)
+    notifier = AsyncMock()
+    notifier.notify_founder.side_effect = [True, recovery_result, True]
+
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+    insights.return_value = _snapshot("ad-1", impressions=10)
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+    async with engine.connect() as conn:
+        after_failure = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
+        ).scalar_one()
+    assert after_failure["alert_state"]["active"] is True
+    assert "alert_claim" not in after_failure
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+
+    assert notifier.notify_founder.await_count == 3
+    async with engine.connect() as conn:
+        performance = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
+        ).scalar_one()
+    assert performance["alert_state"]["active"] is False
+
+
+@pytest.mark.parametrize("first_result", [False, RuntimeError("slack down")])
+async def test_attribution_alert_delivery_failure_remains_retryable(
+    engine, monkeypatch, first_result
+):
+    await _publication(engine, 156, "ad-1")
+    peermarket = AsyncMock()
+    peermarket.fetch_attribution.side_effect = PermissionError("denied")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1")),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder.side_effect = [first_result, True]
+    settings = _settings(peermarket_attribution_enabled=True)
+
+    await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
+    async with engine.connect() as conn:
+        after_failure = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
+        ).scalar_one()
+    assert "attribution_alert_state" not in after_failure
+    assert "attribution_alert_claim" not in after_failure
+    await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
+
+    assert notifier.notify_founder.await_count == 2
+
+
+async def test_concurrent_collectors_claim_one_attribution_sender(engine, monkeypatch):
+    await _publication(engine, 156, "ad-1")
+    peermarket = AsyncMock()
+    peermarket.fetch_attribution.side_effect = PermissionError("denied")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1")),
+    )
+    notifier = AsyncMock()
+
+    async def delivered(message):
+        await asyncio.sleep(0.05)
+        return True
+
+    notifier.notify_founder.side_effect = delivered
+    settings = _settings(peermarket_attribution_enabled=True)
+
+    await asyncio.gather(
+        collect_meta_performance(engine, settings, peermarket, notifier, now=NOW),
+        collect_meta_performance(engine, settings, peermarket, notifier, now=NOW),
+    )
+
+    notifier.notify_founder.assert_awaited_once()
