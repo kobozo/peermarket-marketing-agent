@@ -27,6 +27,40 @@ class MetaReplacementHistoryError(RuntimeError):
     """A started replacement attempt could not be durably finalized."""
 
 
+async def save_performance_snapshot(engine: AsyncEngine, draft_id: int, payload: dict) -> None:
+    """Merge a partial performance snapshot while holding the publication row lock."""
+    async with engine.begin() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT performance FROM publications WHERE draft_id = :draft_id FOR UPDATE"
+                    ),
+                    {"draft_id": draft_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ValueError(f"publication not found for draft #{draft_id}")
+        performance = dict(row.get("performance") or {})
+        for namespace, value in payload.items():
+            existing = performance.get(namespace)
+            performance[namespace] = (
+                {**existing, **value}
+                if isinstance(existing, dict) and isinstance(value, dict)
+                else value
+            )
+        await connection.execute(
+            text(
+                "UPDATE publications SET performance = CAST(:performance AS JSONB), "
+                "updated_at = NOW() WHERE draft_id = :draft_id"
+            ),
+            {"draft_id": draft_id, "performance": json.dumps(performance)},
+        )
+
+
 async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublication | None:
     """Return the publication recorded for a draft, if one exists."""
     async with engine.connect() as connection:

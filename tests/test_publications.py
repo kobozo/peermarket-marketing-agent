@@ -1,5 +1,6 @@
 """Unit tests for durable Meta publication persistence."""
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from peermarket_agent.publications import (
     get_meta_publication,
     mark_meta_publication_active,
     record_meta_replacement_result,
+    save_performance_snapshot,
     upsert_meta_publication,
 )
 
@@ -368,3 +370,63 @@ async def test_replacement_finalizer_rejects_repeated_finalization_without_write
         )
 
     assert (await get_meta_publication(engine, draft_id)).replacement_history == before
+
+
+async def test_save_performance_snapshot_rejects_absent_publication(database_engine):
+    engine, draft_id = database_engine
+
+    with pytest.raises(ValueError, match="publication not found"):
+        await save_performance_snapshot(engine, draft_id, {"meta": {"impressions": 1}})
+
+
+async def test_save_performance_snapshot_locks_row_and_merges_namespaces():
+    engine = _Engine({"performance": {"attribution": {"registrations": 2}}})
+
+    await save_performance_snapshot(engine, 156, {"meta": {"impressions": 10}})
+
+    select_sql, select_params = engine.connection.calls[0]
+    update_sql, update_params = engine.connection.calls[1]
+    assert "SELECT performance FROM publications" in select_sql
+    assert "FOR UPDATE" in select_sql
+    assert select_params == {"draft_id": 156}
+    assert "UPDATE publications SET performance" in update_sql
+    assert json.loads(update_params["performance"]) == {
+        "attribution": {"registrations": 2},
+        "meta": {"impressions": 10},
+    }
+
+
+async def test_save_performance_snapshot_retains_fields_in_partially_updated_namespace():
+    engine = _Engine(
+        {"performance": {"alert_state": {"condition": "no_delivery", "sent_at": "earlier"}}}
+    )
+
+    await save_performance_snapshot(engine, 156, {"alert_state": {"condition": "healthy"}})
+
+    _, update_params = engine.connection.calls[1]
+    assert json.loads(update_params["performance"])["alert_state"] == {
+        "condition": "healthy",
+        "sent_at": "earlier",
+    }
+
+
+async def test_concurrent_performance_writes_preserve_other_namespaces(database_engine):
+    engine, draft_id = database_engine
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id))
+
+    await asyncio.gather(
+        save_performance_snapshot(engine, draft_id, {"meta": {"impressions": 10}}),
+        save_performance_snapshot(engine, draft_id, {"attribution": {"registrations": 2}}),
+    )
+
+    async with engine.connect() as connection:
+        performance = (
+            await connection.execute(
+                text("SELECT performance FROM publications WHERE draft_id = :draft_id"),
+                {"draft_id": draft_id},
+            )
+        ).scalar_one()
+    assert performance == {
+        "meta": {"impressions": 10},
+        "attribution": {"registrations": 2},
+    }

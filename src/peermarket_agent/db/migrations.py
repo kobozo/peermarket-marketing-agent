@@ -225,6 +225,9 @@ _STEPS: list[str] = [
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS ads_manager_url TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS replacement_history JSONB NOT NULL DEFAULT '[]'::JSONB",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+    "ALTER TABLE publications ALTER COLUMN performance SET DEFAULT '{}'::JSONB",
+    "UPDATE publications SET performance = '{}'::JSONB WHERE performance IS NULL",
+    "ALTER TABLE publications ALTER COLUMN performance SET NOT NULL",
     """UPDATE publications
        SET external_ids = jsonb_build_object('ad_id', external_id)
            || COALESCE(external_ids, '{}'::JSONB)
