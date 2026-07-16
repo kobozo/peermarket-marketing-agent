@@ -9,6 +9,7 @@ from typing import Any
 import anthropic
 import click
 import structlog
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.balance_alert import NUDGE_MESSAGE, is_credit_balance_error
@@ -19,6 +20,7 @@ from peermarket_agent.db.engine import get_engine
 from peermarket_agent.drafts import Draft, persist_draft
 from peermarket_agent.prompts.brand_voice import load_brand_voice
 from peermarket_agent.prompts.email_re_engagement import generate_email
+from peermarket_agent.prompts.meta_ad_creative import pick_audience
 from peermarket_agent.prompts.seo_pr import generate_seo_meta
 from peermarket_agent.prompts.tiktok_post import generate_tiktok_post
 from peermarket_agent.slack_notifier import SlackNotifier
@@ -87,6 +89,7 @@ async def _produce_copy_for_action(
             brand_voice_md=brand_voice_md,
             language=action_args["language"],
             audience_profile_key=audience_key,
+            learnings=tuple(action_args.get("learnings") or ()),
         )
         copy_text = (
             f"Audience: {audience_key}\n"
@@ -126,6 +129,34 @@ async def run_draft_command(
     """
     try:
         brand_voice_md = load_brand_voice()
+        if action_type_name == "meta_ad_creative":
+            audience_key = action_args.get("audience_profile_key") or pick_audience()
+            action_args["audience_profile_key"] = audience_key
+            async with engine.connect() as conn:
+                learning_rows = (
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT text FROM learnings WHERE "
+                                "split_part(scope, ':', 1) IN ('delivery', 'conversion') "
+                                "AND split_part(scope, ':', 2)=:channel "
+                                "AND split_part(scope, ':', 3)=:objective "
+                                "AND split_part(scope, ':', 4)=:language "
+                                "AND split_part(scope, ':', 5)=:audience "
+                                "ORDER BY id DESC LIMIT 5"
+                            ),
+                            {
+                                "channel": "meta",
+                                "objective": "OUTCOME_TRAFFIC",
+                                "language": action_args["language"],
+                                "audience": audience_key,
+                            },
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            action_args["learnings"] = tuple(learning_rows)
         channel, language, copy_text, gen_cost, metadata = await _produce_copy_for_action(
             claude=claude,
             brand_voice_md=brand_voice_md,

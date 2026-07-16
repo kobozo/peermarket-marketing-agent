@@ -62,7 +62,9 @@ class Settings(BaseSettings):
     meta_insights_enabled: bool = False
     peermarket_attribution_enabled: bool = False
     meta_insights_lookback_days: int = Field(default=3, ge=1, le=30)
+    meta_account_timezone: str = "Europe/Brussels"
     meta_no_delivery_grace_hours: int = Field(default=2, ge=0, le=168)
+    performance_snapshot_max_age_hours: int = Field(default=2, ge=1, le=168)
     learning_min_impressions: int = Field(default=1000, ge=1, le=10_000_000)
     learning_min_landing_page_views: int = Field(default=30, ge=1, le=1_000_000)
     learning_min_registrations: int = Field(default=10, ge=1, le=1_000_000)

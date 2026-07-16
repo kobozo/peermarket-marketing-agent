@@ -118,9 +118,12 @@ deciding on any further operator action.
 Deploy performance collection disabled first. The workflow defaults both
 `META_INSIGHTS_ENABLED` and `PEERMARKET_ATTRIBUTION_ENABLED` to `false`; keep
 those repository variables false through the initial deployment. The remaining
-repository-variable defaults are a 3-day Insights lookback, a 2-hour no-delivery
-grace period, and learning minimums of 1,000 impressions, 30 landing-page views,
-and 10 registrations. These are operational controls, not secrets.
+repository-variable defaults are a 3-day Insights lookback, the
+`Europe/Brussels` Meta account timezone, a 2-hour no-delivery grace period, a
+dedicated 2-hour snapshot freshness limit, and learning minimums of 1,000
+impressions, 30 landing-page views, and 10 registrations. These are operational
+controls, not secrets. Insights exclude the current partial account day and
+store account-calendar plus UTC-overlap identity for aggregate joins.
 
 After the reviewed workflow has deployed, use the read-only verifier against a
 known published draft:

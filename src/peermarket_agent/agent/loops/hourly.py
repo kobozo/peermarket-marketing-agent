@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import text
@@ -359,14 +360,23 @@ async def collect_meta_performance(
 ) -> CollectionResult:
     """Collect each publication independently without mutating Meta resources."""
     now = now or datetime.now(UTC)
-    start = (now - timedelta(days=2)).date()
-    stop = now.date()
+    account_timezone_name = getattr(settings, "meta_account_timezone", "Europe/Brussels")
+    lookback_days = getattr(settings, "meta_insights_lookback_days", 3)
+    account_timezone = ZoneInfo(account_timezone_name)
+    stop = now.astimezone(account_timezone).date() - timedelta(days=1)
+    start = stop - timedelta(days=lookback_days - 1)
+    utc_start = datetime.combine(start, datetime.min.time(), account_timezone).astimezone(UTC)
+    utc_stop_exclusive = datetime.combine(
+        stop + timedelta(days=1), datetime.min.time(), account_timezone
+    ).astimezone(UTC)
+    attribution_start = utc_start.date()
+    attribution_stop = (utc_stop_exclusive - timedelta(microseconds=1)).date()
     publications = await _publications(engine)
     attribution = None
     attribution_error = False
     if settings.peermarket_attribution_enabled:
         try:
-            attribution = await peermarket.fetch_attribution(start, stop)
+            attribution = await peermarket.fetch_attribution(attribution_start, attribution_stop)
         except Exception:
             attribution_error = True
             log.warning("hourly_meta.attribution_unavailable")
@@ -382,12 +392,31 @@ async def collect_meta_performance(
             statuses = await get_meta_ad_statuses(config, publication["external_ids"])
             snapshot = await fetch_meta_insights(config, ad_id, start, stop)
             current = dict(vars(snapshot))
+            current["window_start"] = start
+            current["window_stop"] = stop
             current["window_definition"] = (
                 f"rolling-{(stop - start).days + 1}-inclusive-calendar-days"
             )
+            current["account_timezone"] = account_timezone_name
+            current["account_window"] = {
+                "start": start.isoformat(),
+                "stop": stop.isoformat(),
+            }
+            current["utc_alignment"] = {
+                "start": utc_start.isoformat(),
+                "stop_exclusive": utc_stop_exclusive.isoformat(),
+                "overlap_start_day": attribution_start.isoformat(),
+                "overlap_stop_day": attribution_stop.isoformat(),
+            }
             meta = derive_performance((previous.get("meta") or {}).get("latest"), current)
             meta.update({"statuses": statuses, "last_successful_retrieval": now, "error": None})
-            condition = classify_delivery(statuses, current, publication["published_at"], now, 2)
+            condition = classify_delivery(
+                statuses,
+                current,
+                publication["published_at"],
+                now,
+                getattr(settings, "meta_no_delivery_grace_hours", 2),
+            )
             payload = {"meta": meta, "delivery": {"condition": condition}}
             if settings.peermarket_attribution_enabled:
                 if attribution_error:
@@ -417,8 +446,12 @@ async def collect_meta_performance(
                 active=condition in {"no_delivery", "rejected_or_error"},
                 now=now,
             )
-        except Exception:
-            log.warning("hourly_meta.publication_failed", draft_id=draft_id)
+        except Exception as error:
+            log.warning(
+                "hourly_meta.publication_failed",
+                draft_id=draft_id,
+                error_type=type(error).__name__,
+            )
             failure_payload = {
                 "meta": {"error": "Meta performance collection failed", "failed_at": now}
             }

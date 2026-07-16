@@ -138,3 +138,63 @@ def test_duplicate_evidence_is_not_two_true_variants():
     assert eligible_learning([variant(), variant()], DEFAULT_THRESHOLDS).reason == (
         "requires_comparable_variants"
     )
+
+
+def test_delivery_learning_does_not_require_registrations_and_records_outcome():
+    comparisons = [
+        variant(publication_id=1, landing_page_views=40, registrations=0),
+        variant(
+            evidence_id="publication:2:2026-07-15",
+            publication_id=2,
+            landing_page_views=50,
+            registrations=None,
+        ),
+    ]
+
+    decision = eligible_learning(comparisons, DEFAULT_THRESHOLDS, learning_type="delivery")
+
+    assert decision.reason == "delivery_thresholds_met"
+    assert decision.learning_type == "delivery"
+    assert decision.metric == "meta_landing_page_view_rate"
+    assert decision.outcome == {
+        "winner_publication_id": 2,
+        "loser_publication_id": 1,
+        "winner_value": "0.05",
+        "loser_value": "0.04",
+        "absolute_difference": "0.01",
+    }
+
+
+def test_conversion_learning_compares_registration_rate():
+    decision = eligible_learning(
+        [
+            variant(publication_id=1, landing_page_views=40, registrations=10),
+            variant(
+                evidence_id="publication:2:2026-07-15",
+                publication_id=2,
+                landing_page_views=50,
+                registrations=20,
+            ),
+        ],
+        DEFAULT_THRESHOLDS,
+        learning_type="conversion",
+    )
+
+    assert decision.reason == "conversion_thresholds_met"
+    assert decision.metric == "registration_per_meta_landing_page_view"
+    assert decision.outcome["winner_publication_id"] == 2
+    assert decision.outcome["winner_value"] == "0.4"
+
+
+def test_delivery_outcome_tie_is_deterministic_by_publication_id():
+    decision = eligible_learning(
+        [
+            variant(evidence_id="e-2", publication_id=2, landing_page_views=40),
+            variant(evidence_id="e-1", publication_id=1, landing_page_views=40),
+        ],
+        DEFAULT_THRESHOLDS,
+        learning_type="delivery",
+    )
+
+    assert decision.outcome["winner_publication_id"] == 1
+    assert decision.outcome["loser_publication_id"] == 2

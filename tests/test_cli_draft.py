@@ -232,6 +232,60 @@ async def test_run_draft_meta_persists_metadata(prepared_db):
     assert "PeerMarket is de Belgische" in meta["primary_text"]
 
 
+async def test_meta_generation_uses_only_five_recent_relevant_learnings(prepared_db):
+    async with prepared_db.begin() as conn:
+        for index in range(7):
+            await conn.execute(
+                text("INSERT INTO learnings (scope, text) VALUES (:scope, :learning)"),
+                {
+                    "scope": "delivery:meta:OUTCOME_TRAFFIC:NL:declutterers:rolling-3",
+                    "learning": f"relevant-{index}",
+                },
+            )
+        await conn.execute(
+            text("INSERT INTO learnings (scope, text) VALUES (:scope, 'do-not-use')"),
+            {"scope": "delivery:meta:OUTCOME_TRAFFIC:FR:declutterers:rolling-3"},
+        )
+    fake_claude = AsyncMock()
+    fake_claude.complete = AsyncMock(
+        side_effect=[
+            ClaudeResponse(
+                text=(
+                    '{"primary_text": "PeerMarket is de Belgische marktplaats waar elke verkoper '
+                    "zijn identiteit verifieert. Verkoop veilig en koop met vertrouwen. Plaats "
+                    'vandaag je eerste item gratis.", "headline": "Verkoop veilig", '
+                    '"description": "Geverifieerde verkopers", "cta_label": "Learn More", '
+                    '"suggested_daily_budget_eur": 10}'
+                ),
+                input_tokens=10,
+                output_tokens=10,
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+            ),
+            ClaudeResponse(
+                text='{"score": 90, "notes": "Good."}',
+                input_tokens=10,
+                output_tokens=10,
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+
+    await run_draft_command(
+        engine=prepared_db,
+        claude=fake_claude,
+        action_type_name="meta_ad_creative",
+        language="NL",
+        audience_profile_key="declutterers",
+    )
+
+    prompt = fake_claude.complete.await_args_list[0].kwargs["user"]
+    assert "relevant-6" in prompt and "relevant-2" in prompt
+    assert "relevant-1" not in prompt and "relevant-0" not in prompt
+    assert "do-not-use" not in prompt
+
+
 async def test_run_draft_credit_low_dms_founder_and_reraises(prepared_db):
     """Anthropic credit-low errors trigger Slack DM and propagate."""
     import httpx

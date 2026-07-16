@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import click
 from sqlalchemy import text
@@ -176,10 +177,15 @@ async def verify_draft(draft_id: int) -> dict[str, Any]:
     report["snapshot_fresh"] = _snapshot_is_fresh(
         last_retrieval,
         now,
-        max_age_hours=settings.meta_no_delivery_grace_hours,
+        max_age_hours=settings.performance_snapshot_max_age_hours,
     )
-    stop = now.date()
+    account_timezone = ZoneInfo(settings.meta_account_timezone)
+    stop = now.astimezone(account_timezone).date() - timedelta(days=1)
     start = stop - timedelta(days=settings.meta_insights_lookback_days - 1)
+    utc_start = datetime.combine(start, datetime.min.time(), account_timezone).astimezone(UTC)
+    utc_stop_exclusive = datetime.combine(
+        stop + timedelta(days=1), datetime.min.time(), account_timezone
+    ).astimezone(UTC)
 
     if settings.meta_insights_enabled:
         try:
@@ -198,13 +204,18 @@ async def verify_draft(draft_id: int) -> dict[str, Any]:
     if settings.peermarket_attribution_enabled:
         try:
             aggregates = await read_attribution(
-                settings.peermarket_prod_db_readonly_url, start, stop
+                settings.peermarket_prod_db_readonly_url,
+                utc_start.date(),
+                (utc_stop_exclusive - timedelta(microseconds=1)).date(),
             )
+            matching = [row for row in aggregates if row.utm_content == f"draft-{draft_id}"]
             report["attribution_available"] = True
             report["attribution_status"] = "available"
-            report["attribution_counts"] = {
-                "events": sum(int(row.event_count) for row in aggregates)
-            }
+            counts: dict[str, int] = {}
+            for row in matching:
+                count = getattr(row, "event_count", getattr(row, "count", 0))
+                counts[row.event_type] = counts.get(row.event_type, 0) + int(count)
+            report["attribution_counts"] = counts
         except Exception:
             pass
     return report

@@ -3,7 +3,7 @@
 import asyncio
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -189,6 +189,70 @@ async def test_hourly_snapshot_persists_explicit_requested_window_definition(eng
     assert performance["meta"]["latest"]["window_definition"] == (
         "rolling-3-inclusive-calendar-days"
     )
+
+
+async def test_collection_uses_configured_last_completed_account_days_and_utc_alignment(
+    engine, monkeypatch
+):
+    await _publication(engine, 155, "ad-0")
+    insights = AsyncMock(return_value=_snapshot("ad-0"))
+    peermarket = AsyncMock()
+    peermarket.fetch_attribution.return_value = []
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr("peermarket_agent.agent.loops.hourly.fetch_meta_insights", insights)
+    settings = _settings(
+        meta_insights_lookback_days=2,
+        meta_account_timezone="America/New_York",
+        peermarket_attribution_enabled=True,
+    )
+
+    await collect_meta_performance(
+        engine, settings, peermarket, AsyncMock(), now=datetime(2026, 7, 16, 2, tzinfo=UTC)
+    )
+
+    assert insights.await_args.args[2:] == (date(2026, 7, 13), date(2026, 7, 14))
+    peermarket.fetch_attribution.assert_awaited_once_with(date(2026, 7, 13), date(2026, 7, 15))
+    async with engine.connect() as conn:
+        latest = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=155"))
+        ).scalar_one()["meta"]["latest"]
+    assert latest["account_timezone"] == "America/New_York"
+    assert latest["account_window"] == {"start": "2026-07-13", "stop": "2026-07-14"}
+    assert latest["utc_alignment"] == {
+        "start": "2026-07-13T04:00:00+00:00",
+        "stop_exclusive": "2026-07-15T04:00:00+00:00",
+        "overlap_start_day": "2026-07-13",
+        "overlap_stop_day": "2026-07-15",
+    }
+
+
+async def test_collection_uses_configured_no_delivery_grace(engine, monkeypatch):
+    await _publication(engine, 156, "ad-1")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1", impressions=0)),
+    )
+
+    await collect_meta_performance(
+        engine,
+        _settings(meta_no_delivery_grace_hours=48),
+        AsyncMock(),
+        AsyncMock(),
+        now=NOW,
+    )
+
+    async with engine.connect() as conn:
+        performance = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
+        ).scalar_one()
+    assert performance["delivery"]["condition"] == "unknown"
 
 
 async def test_no_delivery_alert_is_deduplicated_and_recovers_once(engine, monkeypatch):

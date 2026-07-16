@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from decimal import Decimal
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,9 @@ class EvidenceVariant:
     landing_page_views: int
     registrations: int | None
     metric_values: dict[str, Any]
+    account_timezone: str | None = None
+    utc_start: str | None = None
+    utc_stop_exclusive: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,11 +42,16 @@ class LearningDecision:
     reason: str
     evidence_ids: tuple[str, ...] = ()
     sample: dict[str, int] | None = None
+    learning_type: str | None = None
+    metric: str | None = None
+    outcome: dict[str, int | str] | None = None
 
 
 def eligible_learning(
     comparisons: list[EvidenceVariant] | tuple[EvidenceVariant, ...],
     thresholds: EvidenceThresholds,
+    *,
+    learning_type: Literal["delivery", "conversion"] | None = None,
 ) -> LearningDecision:
     """Require distinct, exactly comparable variants and evidence from each."""
     evidence_ids = tuple(dict.fromkeys(variant.evidence_id for variant in comparisons))
@@ -77,6 +86,9 @@ def eligible_learning(
             variant.window_definition,
             variant.window_start,
             variant.window_stop,
+            variant.account_timezone,
+            variant.utc_start,
+            variant.utc_stop_exclusive,
         )
         for variant in comparisons
     }
@@ -88,14 +100,43 @@ def eligible_learning(
         for variant in comparisons
     ):
         return LearningDecision(False, "insufficient_delivery_evidence")
-    if any(
+    selected_type = learning_type or "conversion"
+    if selected_type == "conversion" and any(
         variant.registrations is None or variant.registrations < thresholds.registrations
         for variant in comparisons
     ):
         return LearningDecision(False, "insufficient_conversion_evidence")
+    if selected_type == "delivery":
+        metric = "meta_landing_page_view_rate"
+        values = {
+            variant.publication_id: Decimal(variant.landing_page_views)
+            / Decimal(variant.impressions)
+            for variant in comparisons
+        }
+    else:
+        metric = "registration_per_meta_landing_page_view"
+        values = {
+            variant.publication_id: Decimal(variant.registrations or 0)
+            / Decimal(variant.landing_page_views)
+            for variant in comparisons
+        }
+    ordered = sorted(
+        comparisons, key=lambda item: (-values[item.publication_id], item.publication_id)
+    )
+    winner = ordered[0]
+    loser = sorted(
+        comparisons, key=lambda item: (values[item.publication_id], -item.publication_id)
+    )[0]
+    outcome = {
+        "winner_publication_id": winner.publication_id,
+        "loser_publication_id": loser.publication_id,
+        "winner_value": str(values[winner.publication_id]),
+        "loser_value": str(values[loser.publication_id]),
+        "absolute_difference": str(values[winner.publication_id] - values[loser.publication_id]),
+    }
     return LearningDecision(
         True,
-        "thresholds_met",
+        "thresholds_met" if learning_type is None else f"{selected_type}_thresholds_met",
         evidence_ids=evidence_ids,
         sample={
             "variants": len(comparisons),
@@ -103,4 +144,7 @@ def eligible_learning(
             "landing_page_views": sum(variant.landing_page_views for variant in comparisons),
             "registrations": sum(variant.registrations or 0 for variant in comparisons),
         },
+        learning_type=selected_type,
+        metric=metric,
+        outcome=outcome,
     )

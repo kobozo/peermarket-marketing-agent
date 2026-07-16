@@ -288,7 +288,7 @@ async def test_daily_run_inserts_then_idempotently_reinforces_learning(database_
             .mappings()
             .all()
         )
-    assert len(rows) == 1
+    assert len(rows) == 2
     assert rows[0]["seen_n_times"] == 1
     evidence = rows[0]["evidence_links"]
     assert evidence["window"] == {
@@ -297,14 +297,21 @@ async def test_daily_run_inserts_then_idempotently_reinforces_learning(database_
         "definition": "rolling-2-calendar-days",
         "inclusive_days": 2,
     }
-    assert evidence["decision"] == {"eligible": True, "reason": "thresholds_met"}
-    assert evidence["dimensions"] == {
+    assert evidence["decision"]["eligible"] is True
+    assert evidence["decision"]["learning_type"] in {"delivery", "conversion"}
+    assert evidence["decision"]["reason"].endswith("_thresholds_met")
+    assert evidence["decision"]["metric"]
+    assert evidence["decision"]["outcome"]["winner_publication_id"] in {1, 2}
+    assert {
         "channel": "meta",
         "objective": "OUTCOME_TRAFFIC",
         "language": "NL",
         "audience": "declutterers",
         "window_definition": "rolling-2-calendar-days",
-    }
+    }.items() <= evidence["dimensions"].items()
+    assert evidence["dimensions"]["account_timezone"] == "Europe/Brussels"
+    assert evidence["dimensions"]["utc_start"]
+    assert evidence["dimensions"]["utc_stop_exclusive"]
     assert evidence["thresholds"] == {
         "impressions": 1_000,
         "landing_page_views": 30,
@@ -529,7 +536,7 @@ async def test_concurrent_daily_replay_inserts_one_observation_and_learning(data
         ).scalar_one()
         learning_count = (await conn.execute(text("SELECT count(*) FROM learnings"))).scalar_one()
     assert observations == 2
-    assert learning_count == 1
+    assert learning_count == 2
 
 
 async def test_new_window_reinforces_once_and_retains_replayable_prior_evidence(database_engine):
@@ -570,7 +577,14 @@ async def test_new_window_reinforces_once_and_retains_replayable_prior_evidence(
 
     async with database_engine.connect() as conn:
         row = (
-            (await conn.execute(text("SELECT evidence_links, seen_n_times FROM learnings")))
+            (
+                await conn.execute(
+                    text(
+                        "SELECT evidence_links, seen_n_times FROM learnings "
+                        "WHERE scope LIKE 'conversion:%'"
+                    )
+                )
+            )
             .mappings()
             .one()
         )
@@ -638,9 +652,9 @@ async def test_false_delivery_stays_pending_after_persisting_sanitized_summary(d
     assert row["claim_expires_at"] is None
     assert row["last_failure"] == "notification_not_confirmed"
     assert row["publication_ids"] == [1]
-    assert row["evidence_ids"] == [
-        "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days"
-    ]
+    assert row["evidence_ids"][0].startswith(
+        "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days:Europe/Brussels:"
+    )
     assert "secret" not in row["message"].lower()
 
 
@@ -851,6 +865,6 @@ async def test_existing_immutable_observation_without_outbox_is_recovered(databa
     notifier.notify_founder.assert_awaited_once()
     row = (await _summary_outbox(database_engine))[0]
     assert row["status"] == "sent"
-    assert row["evidence_ids"] == [
-        "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days"
-    ]
+    assert row["evidence_ids"][0].startswith(
+        "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days:Europe/Brussels:"
+    )

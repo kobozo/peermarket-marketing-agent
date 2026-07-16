@@ -7,6 +7,7 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import text
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.learnings import (
     DEFAULT_THRESHOLDS,
+    EvidenceThresholds,
     EvidenceVariant,
     eligible_learning,
 )
@@ -139,6 +141,8 @@ def _json_metrics(
 def _variant(row: dict, observation: dict) -> EvidenceVariant:
     metrics = observation["metrics"]
     metadata = row.get("metadata") or {}
+    window = observation["window"]
+    utc_alignment = window.get("utc_alignment") or {}
     return EvidenceVariant(
         evidence_id=observation["evidence_id"],
         publication_id=row["publication_id"],
@@ -146,13 +150,16 @@ def _variant(row: dict, observation: dict) -> EvidenceVariant:
         objective=metadata.get("objective"),
         language=row["language"],
         audience=metadata.get("audience_profile_key"),
-        window_definition=observation["window"]["definition"],
-        window_start=date.fromisoformat(observation["window"]["start"]),
-        window_stop=date.fromisoformat(observation["window"]["stop"]),
+        window_definition=window["definition"],
+        window_start=date.fromisoformat(window["start"]),
+        window_stop=date.fromisoformat(window["stop"]),
         impressions=metrics["impressions"] or 0,
         landing_page_views=metrics["meta_landing_page_views"] or 0,
         registrations=metrics["registrations"],
         metric_values=metrics,
+        account_timezone=window.get("account_timezone"),
+        utc_start=utc_alignment.get("start"),
+        utc_stop_exclusive=utc_alignment.get("stop_exclusive"),
     )
 
 
@@ -165,25 +172,41 @@ def _comparison_key(variant: EvidenceVariant) -> tuple[Any, ...]:
         variant.window_definition,
         variant.window_start,
         variant.window_stop,
+        variant.account_timezone,
+        variant.utc_start,
+        variant.utc_stop_exclusive,
     )
 
 
-async def _persist_learning(conn, variants: list[EvidenceVariant]) -> None:
-    decision = eligible_learning(variants, DEFAULT_THRESHOLDS)
+async def _persist_learning(
+    conn,
+    variants: list[EvidenceVariant],
+    thresholds: EvidenceThresholds,
+    learning_type: str,
+) -> None:
+    decision = eligible_learning(variants, thresholds, learning_type=learning_type)
     if not decision.eligible:
         return
     exemplar = variants[0]
     scope = ":".join(
         (
+            learning_type,
             exemplar.channel,
             exemplar.objective,
             exemplar.language,
             exemplar.audience,
             exemplar.window_definition,
+            exemplar.account_timezone or "legacy-account-timezone",
         )
     )
     evidence = {
-        "decision": {"eligible": decision.eligible, "reason": decision.reason},
+        "decision": {
+            "eligible": decision.eligible,
+            "reason": decision.reason,
+            "learning_type": decision.learning_type,
+            "metric": decision.metric,
+            "outcome": decision.outcome,
+        },
         "evidence_ids": list(decision.evidence_ids),
         "window": {
             "start": exemplar.window_start.isoformat(),
@@ -198,11 +221,14 @@ async def _persist_learning(conn, variants: list[EvidenceVariant]) -> None:
             "language": exemplar.language,
             "audience": exemplar.audience,
             "window_definition": exemplar.window_definition,
+            "account_timezone": exemplar.account_timezone,
+            "utc_start": exemplar.utc_start,
+            "utc_stop_exclusive": exemplar.utc_stop_exclusive,
         },
         "thresholds": {
-            "impressions": DEFAULT_THRESHOLDS.impressions,
-            "landing_page_views": DEFAULT_THRESHOLDS.landing_page_views,
-            "registrations": DEFAULT_THRESHOLDS.registrations,
+            "impressions": thresholds.impressions,
+            "landing_page_views": thresholds.landing_page_views,
+            "registrations": thresholds.registrations,
         },
         "variants": [
             {
@@ -251,7 +277,12 @@ async def _persist_learning(conn, variants: list[EvidenceVariant]) -> None:
         ),
         {
             "scope": scope,
-            "learning": "Comparable variants met the minimum delivery and attributed-registration evidence thresholds.",
+            "learning": (
+                f"{learning_type.title()} comparison: publication "
+                f"#{decision.outcome['winner_publication_id']} outperformed publication "
+                f"#{decision.outcome['loser_publication_id']} on {decision.metric} "
+                f"({decision.outcome['winner_value']} vs {decision.outcome['loser_value']})."
+            ),
             "evidence": json.dumps(evidence),
         },
     )
@@ -459,7 +490,6 @@ async def run_daily_performance(
     engine: AsyncEngine, notifier, settings, now: datetime | None = None
 ) -> int:
     """Append one observation per publication/window and summarize without mutation."""
-    del settings  # reserved for future presentation settings; never used to mutate Meta
     now = now or datetime.now(UTC)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -491,9 +521,37 @@ async def run_daily_performance(
                 rows.append(row)
                 continue
             start, stop, definition = window
+            account_timezone = latest.get("account_timezone")
+            utc_alignment = latest.get("utc_alignment")
+            if isinstance(account_timezone, str) and isinstance(utc_alignment, dict):
+                if stop >= now.astimezone(ZoneInfo(account_timezone)).date():
+                    row["performance"] = performance
+                    rows.append(row)
+                    continue
+            else:
+                # Upgrade compatibility for snapshots frozen before account-window
+                # metadata existed. New hourly snapshots always take the strict path.
+                account_timezone = getattr(settings, "meta_account_timezone", "Europe/Brussels")
+                zone = ZoneInfo(account_timezone)
+                utc_start = datetime.combine(start, datetime.min.time(), zone).astimezone(UTC)
+                utc_stop = datetime.combine(
+                    stop + timedelta(days=1), datetime.min.time(), zone
+                ).astimezone(UTC)
+                utc_alignment = {
+                    "start": utc_start.isoformat(),
+                    "stop_exclusive": utc_stop.isoformat(),
+                    "overlap_start_day": utc_start.date().isoformat(),
+                    "overlap_stop_day": (utc_stop - timedelta(microseconds=1)).date().isoformat(),
+                    "source": "derived_for_legacy_snapshot",
+                }
+            if not utc_alignment.get("start") or not utc_alignment.get("stop_exclusive"):
+                row["performance"] = performance
+                rows.append(row)
+                continue
             evidence_id = (
                 f"publication:{row['publication_id']}:{start.isoformat()}:{stop.isoformat()}:"
-                f"{definition}"
+                f"{definition}:{account_timezone}:{utc_alignment.get('start')}:"
+                f"{utc_alignment.get('stop_exclusive')}"
             )
             observations = list(performance.get("daily_observations") or [])
             observation = next(
@@ -508,6 +566,8 @@ async def run_daily_performance(
                         "start": start.isoformat(),
                         "stop": stop.isoformat(),
                         "definition": definition,
+                        "account_timezone": account_timezone,
+                        "utc_alignment": utc_alignment,
                     },
                     "metrics": _json_metrics(evaluate_publication(performance).metrics),
                 }
@@ -529,8 +589,22 @@ async def run_daily_performance(
             for observation in row["performance"].get("daily_observations", []):
                 variant = _variant(row, observation)
                 grouped.setdefault(_comparison_key(variant), []).append(variant)
+        thresholds = EvidenceThresholds(
+            impressions=getattr(
+                settings, "learning_min_impressions", DEFAULT_THRESHOLDS.impressions
+            ),
+            landing_page_views=getattr(
+                settings,
+                "learning_min_landing_page_views",
+                DEFAULT_THRESHOLDS.landing_page_views,
+            ),
+            registrations=getattr(
+                settings, "learning_min_registrations", DEFAULT_THRESHOLDS.registrations
+            ),
+        )
         for variants in grouped.values():
-            await _persist_learning(conn, variants)
+            await _persist_learning(conn, variants, thresholds, "delivery")
+            await _persist_learning(conn, variants, thresholds, "conversion")
         all_observations = [
             observation
             for row in rows

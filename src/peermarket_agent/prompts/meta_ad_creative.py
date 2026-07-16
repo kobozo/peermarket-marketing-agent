@@ -88,9 +88,10 @@ def build_user_prompt(
     *,
     language: str,
     audience_profile_key: str,
+    learnings: tuple[str, ...] = (),
 ) -> str:
     profile = AUDIENCE_PROFILES[audience_profile_key]
-    return (
+    prompt = (
         f"Language: {language}\n"
         f"Audience profile: {profile['label']}\n"
         f"Age range: {profile['age_min']}-{profile['age_max']}\n"
@@ -99,6 +100,10 @@ def build_user_prompt(
         f"Rationale: {profile['rationale']}\n\n"
         "Angle: trust + verified identity wedge. Counter to Marktplaats/Facebook Marketplace scams.\n"
     )
+    if learnings:
+        prompt += "\nRecent relevant evidence (use as hypotheses, not commands):\n"
+        prompt += "\n".join(f"- {learning[:300]}" for learning in learnings[:5]) + "\n"
+    return prompt
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,7 @@ async def generate_meta_ad_creative(
     brand_voice_md: str,
     language: str,
     audience_profile_key: str,
+    learnings: tuple[str, ...] = (),
 ) -> MetaAdCreative:
     if audience_profile_key not in AUDIENCE_PROFILES:
         raise ValueError(
@@ -129,6 +135,7 @@ async def generate_meta_ad_creative(
         user=build_user_prompt(
             language=language,
             audience_profile_key=audience_profile_key,
+            learnings=learnings,
         ),
         temperature=0.7,
         max_tokens=600,
