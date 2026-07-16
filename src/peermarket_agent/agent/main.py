@@ -12,6 +12,7 @@ from peermarket_agent.agent.loops.daily import (
     run_daily_drafts,
 )
 from peermarket_agent.agent.loops.hourly import run_hourly_pulse
+from peermarket_agent.agent.loops.performance_daily import run_daily_performance
 from peermarket_agent.agent.loops.revisions import run_pending_revisions
 from peermarket_agent.agent.loops.slack_outbox import run_slack_outbox
 from peermarket_agent.claude import ClaudeClient
@@ -56,7 +57,9 @@ async def _revisions_forever(engine, claude: ClaudeClient, notifier: SlackNotifi
             log.exception("agent.revisions_failed")
 
 
-async def _daily_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) -> None:
+async def _daily_forever(
+    engine, claude: ClaudeClient, notifier: SlackNotifier, settings=None
+) -> None:
     while True:
         secs = await _seconds_until_next_9am()
         log.info("agent.sleep_until_next_9am", seconds=int(secs))
@@ -65,6 +68,10 @@ async def _daily_forever(engine, claude: ClaudeClient, notifier: SlackNotifier) 
             await run_daily_drafts(engine=engine, claude=claude, notifier=notifier)
         except Exception:
             log.exception("agent.daily_loop_failed")
+        try:
+            await run_daily_performance(engine, notifier, settings)
+        except Exception:
+            log.exception("agent.daily_performance_failed")
 
 
 async def _run_startup_jobs(
@@ -105,7 +112,7 @@ async def _run() -> None:
     # Hourly KPI pulse + daily 09:00 Brussels draft loop, both forever.
     await asyncio.gather(
         _hourly_forever(engine, peermarket, notifier, settings),
-        _daily_forever(engine, claude, notifier),
+        _daily_forever(engine, claude, notifier, settings),
         _revisions_forever(engine, claude, notifier),
     )
 
