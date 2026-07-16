@@ -51,6 +51,8 @@ def test_settings_loaded_from_env(monkeypatch):
     assert s.github_app_installation_id == 67890
     assert s.meta_page_id == "61592144690879"
     assert s.timezone == "Europe/Brussels"
+    assert s.meta_account_timezone == "Europe/Brussels"
+    assert s.performance_snapshot_max_age_hours == 2
 
 
 def test_meta_auto_activate_defaults_to_false(monkeypatch):

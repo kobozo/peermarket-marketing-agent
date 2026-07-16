@@ -225,6 +225,9 @@ _STEPS: list[str] = [
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS ads_manager_url TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS replacement_history JSONB NOT NULL DEFAULT '[]'::JSONB",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+    "ALTER TABLE publications ALTER COLUMN performance SET DEFAULT '{}'::JSONB",
+    "UPDATE publications SET performance = '{}'::JSONB WHERE performance IS NULL",
+    "ALTER TABLE publications ALTER COLUMN performance SET NOT NULL",
     """UPDATE publications
        SET external_ids = jsonb_build_object('ad_id', external_id)
            || COALESCE(external_ids, '{}'::JSONB)
@@ -308,9 +311,42 @@ _STEPS: list[str] = [
          )""",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_draft_id_unique "
     "ON publications (draft_id) WHERE draft_id IS NOT NULL",
+    """CREATE TABLE IF NOT EXISTS operational_alert_state (
+        alert_key TEXT PRIMARY KEY,
+        state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        claim JSONB NOT NULL DEFAULT '{}'::JSONB,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
+    """CREATE TABLE IF NOT EXISTS daily_performance_summary_outbox (
+        id BIGSERIAL PRIMARY KEY,
+        summary_key TEXT NOT NULL UNIQUE,
+        window_start DATE NOT NULL,
+        window_stop DATE NOT NULL,
+        window_definition TEXT NOT NULL,
+        publication_ids JSONB NOT NULL,
+        evidence_ids JSONB NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','sent')),
+        attempt_count INT NOT NULL DEFAULT 0,
+        last_attempt_at TIMESTAMPTZ,
+        sent_at TIMESTAMPTZ,
+        claim_token TEXT,
+        claim_expires_at TIMESTAMPTZ,
+        last_failure TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_daily_performance_summary_pending "
+    "ON daily_performance_summary_outbox (status, window_start, id)",
+    "ALTER TABLE daily_performance_summary_outbox "
+    "ADD COLUMN IF NOT EXISTS summary_kind TEXT NOT NULL DEFAULT 'evidence_summary'",
+    "ALTER TABLE daily_performance_summary_outbox ADD COLUMN IF NOT EXISTS run_day DATE",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_start DROP NOT NULL",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_stop DROP NOT NULL",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_definition DROP NOT NULL",
 ]
 
 

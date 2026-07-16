@@ -1,14 +1,20 @@
 """Unit tests for durable Meta publication persistence."""
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from types import MappingProxyType
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from peermarket_agent.db.migrations import run_migrations
+from peermarket_agent.meta_insights import MetaInsightSnapshot
+from peermarket_agent.performance import derive_performance
 from peermarket_agent.publications import (
     MetaPublication,
     MetaReplacementHistoryError,
@@ -16,6 +22,7 @@ from peermarket_agent.publications import (
     get_meta_publication,
     mark_meta_publication_active,
     record_meta_replacement_result,
+    save_performance_snapshot,
     upsert_meta_publication,
 )
 
@@ -368,3 +375,159 @@ async def test_replacement_finalizer_rejects_repeated_finalization_without_write
         )
 
     assert (await get_meta_publication(engine, draft_id)).replacement_history == before
+
+
+async def test_save_performance_snapshot_rejects_absent_publication(database_engine):
+    engine, draft_id = database_engine
+
+    with pytest.raises(ValueError, match="publication not found"):
+        await save_performance_snapshot(engine, draft_id, {"meta": {"impressions": 1}})
+
+
+async def test_save_performance_snapshot_locks_row_and_merges_namespaces():
+    engine = _Engine({"performance": {"attribution": {"registrations": 2}}})
+
+    await save_performance_snapshot(engine, 156, {"meta": {"impressions": 10}})
+
+    select_sql, select_params = engine.connection.calls[0]
+    update_sql, update_params = engine.connection.calls[1]
+    assert "SELECT performance FROM publications" in select_sql
+    assert "FOR UPDATE" in select_sql
+    assert select_params == {"draft_id": 156}
+    assert "UPDATE publications SET performance" in update_sql
+    assert json.loads(update_params["performance"]) == {
+        "attribution": {"registrations": 2},
+        "meta": {"impressions": 10},
+    }
+
+
+async def test_save_performance_snapshot_retains_fields_in_partially_updated_namespace():
+    engine = _Engine(
+        {"performance": {"alert_state": {"condition": "no_delivery", "sent_at": "earlier"}}}
+    )
+
+    await save_performance_snapshot(engine, 156, {"alert_state": {"condition": "healthy"}})
+
+    _, update_params = engine.connection.calls[1]
+    assert json.loads(update_params["performance"])["alert_state"] == {
+        "condition": "healthy",
+        "sent_at": "earlier",
+    }
+
+
+async def test_save_performance_snapshot_deep_merges_nested_performance_fields(database_engine):
+    engine, draft_id = database_engine
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id))
+    await save_performance_snapshot(
+        engine,
+        draft_id,
+        {
+            "meta": {
+                "latest": {"impressions": 10, "clicks": 2},
+                "window": {"start": "2026-07-14", "stop": "2026-07-16"},
+            }
+        },
+    )
+
+    await save_performance_snapshot(
+        engine,
+        draft_id,
+        {"meta": {"latest": {"impressions": 11}}},
+    )
+
+    async with engine.connect() as connection:
+        stored = (
+            await connection.execute(
+                text("SELECT performance FROM publications WHERE draft_id = :draft_id"),
+                {"draft_id": draft_id},
+            )
+        ).scalar_one()
+    assert stored["meta"] == {
+        "latest": {"impressions": 11, "clicks": 2},
+        "window": {"start": "2026-07-14", "stop": "2026-07-16"},
+    }
+
+
+async def test_save_performance_snapshot_normalizes_real_meta_snapshot_payload(database_engine):
+    engine, draft_id = database_engine
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id))
+    snapshot = MetaInsightSnapshot(
+        ad_id="ad-1",
+        window_start=date(2026, 7, 14),
+        window_stop=date(2026, 7, 16),
+        retrieved_at=datetime(2026, 7, 16, 14, 30, tzinfo=UTC),
+        spend_cents=217,
+        impressions=125,
+        reach=100,
+        clicks=10,
+        inline_link_clicks=6,
+        outbound_clicks=4,
+        landing_page_views=3,
+        ctr=Decimal("8.00"),
+        cpc_cents=22,
+        cpm_cents=1736,
+        frequency=Decimal("1.250"),
+        actions=MappingProxyType({"landing_page_view": 3}),
+    )
+    payload = {"meta": derive_performance(None, vars(snapshot))}
+
+    await save_performance_snapshot(engine, draft_id, payload)
+
+    async with engine.connect() as connection:
+        stored = (
+            await connection.execute(
+                text("SELECT performance FROM publications WHERE draft_id = :draft_id"),
+                {"draft_id": draft_id},
+            )
+        ).scalar_one()
+    latest = stored["meta"]["latest"]
+    assert latest["window_start"] == "2026-07-14"
+    assert latest["retrieved_at"] == "2026-07-16T14:30:00+00:00"
+    assert latest["ctr"] == "8.00"
+    assert latest["frequency"] == "1.250"
+    assert latest["actions"] == {"landing_page_view": 3}
+
+
+async def test_save_performance_snapshot_rejects_unsupported_payload_type():
+    engine = _Engine({"performance": {}})
+
+    with pytest.raises(TypeError, match="unsupported performance value"):
+        await save_performance_snapshot(engine, 156, {"meta": {"invalid": object()}})
+
+
+async def test_save_performance_snapshot_normalizes_nested_lists_and_tuples():
+    engine = _Engine({"performance": {}})
+
+    await save_performance_snapshot(
+        engine,
+        156,
+        {"observations": [("first", Decimal("1.20")), [date(2026, 7, 16)]]},
+    )
+
+    _, update_params = engine.connection.calls[1]
+    assert json.loads(update_params["performance"])["observations"] == [
+        ["first", "1.20"],
+        ["2026-07-16"],
+    ]
+
+
+async def test_concurrent_performance_writes_preserve_other_namespaces(database_engine):
+    engine, draft_id = database_engine
+    await upsert_meta_publication(engine, MetaPublication(draft_id=draft_id))
+
+    await asyncio.gather(
+        save_performance_snapshot(engine, draft_id, {"meta": {"impressions": 10}}),
+        save_performance_snapshot(engine, draft_id, {"attribution": {"registrations": 2}}),
+    )
+
+    async with engine.connect() as connection:
+        performance = (
+            await connection.execute(
+                text("SELECT performance FROM publications WHERE draft_id = :draft_id"),
+                {"draft_id": draft_id},
+            )
+        ).scalar_one()
+    assert performance == {
+        "meta": {"impressions": 10},
+        "attribution": {"registrations": 2},
+    }

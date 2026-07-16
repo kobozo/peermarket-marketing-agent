@@ -1,8 +1,11 @@
 """Durable, idempotent persistence for Meta publication state."""
 
 import json
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -25,6 +28,78 @@ class MetaPublication:
 
 class MetaReplacementHistoryError(RuntimeError):
     """A started replacement attempt could not be durably finalized."""
+
+
+async def save_performance_snapshot(engine: AsyncEngine, draft_id: int, payload: dict) -> None:
+    """Merge a partial performance snapshot while holding the publication row lock."""
+    async with engine.begin() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT performance FROM publications WHERE draft_id = :draft_id FOR UPDATE"
+                    ),
+                    {"draft_id": draft_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ValueError(f"publication not found for draft #{draft_id}")
+        performance = dict(row.get("performance") or {})
+        performance = _deep_merge(performance, _json_performance_value(payload))
+        await connection.execute(
+            text(
+                "UPDATE publications SET performance = CAST(:performance AS JSONB), "
+                "updated_at = NOW() WHERE draft_id = :draft_id"
+            ),
+            {
+                "draft_id": draft_id,
+                "performance": json.dumps(
+                    performance, allow_nan=False, separators=(",", ":"), sort_keys=True
+                ),
+            },
+        )
+
+
+def _deep_merge(existing: dict, update: dict) -> dict:
+    merged = dict(existing)
+    for key, value in update.items():
+        previous = merged.get(key)
+        merged[key] = (
+            _deep_merge(previous, value)
+            if isinstance(previous, dict) and isinstance(value, dict)
+            else value
+        )
+    return merged
+
+
+def _json_performance_value(value: object) -> object:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        raise TypeError("unsupported performance value: non-finite float")
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise TypeError("unsupported performance value: naive datetime")
+        return value.astimezone(UTC).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("unsupported performance value: mapping keys must be strings")
+            normalized[key] = _json_performance_value(item)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_json_performance_value(item) for item in value]
+    raise TypeError(f"unsupported performance value: {type(value).__name__}")
 
 
 async def get_meta_publication(engine: AsyncEngine, draft_id: int) -> MetaPublication | None:

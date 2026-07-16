@@ -24,6 +24,8 @@ REQUIRED_TABLES = {
     "learnings",
     "draft_revision_feedback",
     "slack_outbox",
+    "operational_alert_state",
+    "daily_performance_summary_outbox",
 }
 
 
