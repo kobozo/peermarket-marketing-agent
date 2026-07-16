@@ -341,6 +341,12 @@ _STEPS: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_daily_performance_summary_pending "
     "ON daily_performance_summary_outbox (status, window_start, id)",
+    "ALTER TABLE daily_performance_summary_outbox "
+    "ADD COLUMN IF NOT EXISTS summary_kind TEXT NOT NULL DEFAULT 'evidence_summary'",
+    "ALTER TABLE daily_performance_summary_outbox ADD COLUMN IF NOT EXISTS run_day DATE",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_start DROP NOT NULL",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_stop DROP NOT NULL",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_definition DROP NOT NULL",
 ]
 
 

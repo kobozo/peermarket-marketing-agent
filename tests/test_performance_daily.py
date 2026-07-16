@@ -425,8 +425,17 @@ async def test_missing_or_invalid_source_window_creates_no_completed_observation
             await conn.execute(text("SELECT performance FROM publications WHERE draft_id=701"))
         ).scalar_one()
     assert "daily_observations" not in performance
-    notifier.notify_founder.assert_not_awaited()
-    assert await _summary_outbox(database_engine) == []
+    notifier.notify_founder.assert_awaited_once_with("Publication #1 — source window unavailable")
+    rows = await _summary_outbox(database_engine)
+    assert len(rows) == 1
+    assert rows[0]["summary_kind"] == "source_window_unavailable"
+    assert rows[0]["run_day"].isoformat() == "2026-07-16"
+    assert rows[0]["window_start"] is None
+    assert rows[0]["window_stop"] is None
+    assert rows[0]["window_definition"] is None
+    assert rows[0]["evidence_ids"] == []
+    async with database_engine.connect() as conn:
+        assert (await conn.execute(text("SELECT count(*) FROM learnings"))).scalar_one() == 0
 
 
 async def test_explicit_one_day_inclusive_source_window_is_valid(database_engine):
@@ -580,7 +589,8 @@ async def _summary_outbox(database_engine):
             for row in (
                 await conn.execute(
                     text(
-                        "SELECT summary_key, window_start, window_stop, window_definition, "
+                        "SELECT summary_key, summary_kind, run_day, window_start, window_stop, "
+                        "window_definition, "
                         "publication_ids, evidence_ids, message, status, attempt_count, "
                         "last_attempt_at, sent_at, claim_token, claim_expires_at, last_failure "
                         "FROM daily_performance_summary_outbox ORDER BY window_start, id"
@@ -632,6 +642,76 @@ async def test_false_delivery_stays_pending_after_persisting_sanitized_summary(d
         "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days"
     ]
     assert "secret" not in row["message"].lower()
+
+
+async def test_unavailable_window_false_delivery_retries_same_diagnostic(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    await _insert_publication(
+        database_engine,
+        draft_id=1201,
+        audience="declutterers",
+        ads_url=None,
+        performance={"meta": {"latest": {}}, "attribution": {"available": False}},
+    )
+    now = datetime(2026, 7, 16, 9, tzinfo=UTC)
+    failed = AsyncMock()
+    failed.notify_founder.return_value = False
+    await run_daily_performance(database_engine, failed, object(), now=now)
+    pending = (await _summary_outbox(database_engine))[0]
+    assert pending["status"] == "pending"
+    assert pending["attempt_count"] == 1
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    await run_daily_performance(database_engine, notifier, object(), now=now)
+
+    notifier.notify_founder.assert_awaited_once_with("Publication #1 — source window unavailable")
+    rows = await _summary_outbox(database_engine)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "sent"
+    assert rows[0]["attempt_count"] == 2
+
+
+async def test_unavailable_window_same_day_idempotent_and_next_day_reports_again(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    await _insert_publication(
+        database_engine,
+        draft_id=1301,
+        audience="declutterers",
+        ads_url=None,
+        performance={"meta": {"latest": {}}, "attribution": {"available": False}},
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+    day_one = datetime(2026, 7, 16, 9, tzinfo=UTC)
+
+    await run_daily_performance(database_engine, notifier, object(), now=day_one)
+    await run_daily_performance(database_engine, notifier, object(), now=day_one)
+
+    assert notifier.notify_founder.await_count == 1
+    assert len(await _summary_outbox(database_engine)) == 1
+    await run_daily_performance(
+        database_engine,
+        notifier,
+        object(),
+        now=datetime(2026, 7, 17, 9, tzinfo=UTC),
+    )
+    assert notifier.notify_founder.await_count == 2
+    rows = await _summary_outbox(database_engine)
+    assert [row["run_day"].isoformat() for row in rows] == ["2026-07-16", "2026-07-17"]
+    assert {row["summary_key"] for row in rows} == {
+        "daily-performance-unavailable:1:2026-07-16",
+        "daily-performance-unavailable:1:2026-07-17",
+    }
+    async with database_engine.connect() as conn:
+        performance = (
+            await conn.execute(text("SELECT performance FROM publications WHERE id=1"))
+        ).scalar_one()
+        learning_count = (await conn.execute(text("SELECT count(*) FROM learnings"))).scalar_one()
+    assert "daily_observations" not in performance
+    assert learning_count == 0
 
 
 async def test_delivery_exception_stays_pending_without_persisting_exception_text(database_engine):

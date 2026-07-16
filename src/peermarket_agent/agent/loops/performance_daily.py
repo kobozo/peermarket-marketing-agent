@@ -342,6 +342,30 @@ async def _enqueue_summary(conn, rows: list[dict], observations: list[dict]) -> 
         )
 
 
+async def _enqueue_unavailable_diagnostics(conn, rows: list[dict], run_day: date) -> None:
+    """Persist one non-evidence diagnostic per publication and UTC run day."""
+    for row in rows:
+        latest = (row["performance"].get("meta") or {}).get("latest") or {}
+        if _valid_window(latest) is not None:
+            continue
+        publication_id = row["publication_id"]
+        await conn.execute(
+            text(
+                "INSERT INTO daily_performance_summary_outbox "
+                "(summary_key, summary_kind, run_day, publication_ids, evidence_ids, message) "
+                "VALUES (:key, 'source_window_unavailable', :run_day, "
+                "CAST(:publication_ids AS JSONB), '[]'::JSONB, :message) "
+                "ON CONFLICT (summary_key) DO NOTHING"
+            ),
+            {
+                "key": f"daily-performance-unavailable:{publication_id}:{run_day.isoformat()}",
+                "run_day": run_day,
+                "publication_ids": json.dumps([publication_id]),
+                "message": f"Publication #{publication_id} — source window unavailable",
+            },
+        )
+
+
 async def _claim_next_summary(engine: AsyncEngine, now: datetime) -> tuple[str, str] | None:
     """Claim only the oldest pending summary so newer windows cannot overtake it."""
     async with engine.begin() as conn:
@@ -351,7 +375,7 @@ async def _claim_next_summary(engine: AsyncEngine, now: datetime) -> tuple[str, 
                     text(
                         "SELECT id, message, claim_token, claim_expires_at "
                         "FROM daily_performance_summary_outbox WHERE status='pending' "
-                        "ORDER BY window_start, window_stop, id LIMIT 1 FOR UPDATE"
+                        "ORDER BY id LIMIT 1 FOR UPDATE"
                     )
                 )
             )
@@ -513,6 +537,7 @@ async def run_daily_performance(
             for observation in row["performance"].get("daily_observations", [])
         ]
         await _enqueue_summary(conn, rows, all_observations)
+        await _enqueue_unavailable_diagnostics(conn, rows, now.astimezone(UTC).date())
 
     await _drain_summaries(engine, notifier, now)
     log.info("daily_performance.complete", observations_inserted=len(inserted))

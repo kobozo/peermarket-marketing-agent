@@ -169,3 +169,32 @@ reported `54 passed in 6.97s` against local PostgreSQL on port 55432.
 Final focused-plus-adjacent verification reported `128 passed in 16.33s`;
 repository-wide Ruff check passed, all 98 Python files were already formatted,
 and `git diff --check` was clean.
+
+## Missing-source-window diagnostic follow-up (2026-07-16)
+
+The final regression pass prevents eligible Meta publications with incomplete
+source-window metadata from disappearing silently.
+
+### TDD evidence and behavior
+
+- RED: five diagnostic regressions failed because no durable diagnostic was
+  enqueued and the outbox lacked diagnostic identity columns.
+- GREEN: the focused daily, migration, main-loop, and learning slice reported
+  `56 passed in 7.93s`.
+- Each invalid/missing source-window publication now enqueues the exact
+  sanitized message `Publication #<id> — source window unavailable`.
+- Diagnostic identity is deterministic by publication ID, UTC run day, and
+  unavailable kind. Same-day runs are idempotent; a still-unavailable
+  publication may report again on the next UTC day.
+- Diagnostics use `summary_kind` and `run_day`; source `window_start`,
+  `window_stop`, and `window_definition` remain null, and `evidence_ids` is an
+  empty array. No metrics, observation, comparison, or learning is fabricated.
+- Diagnostics use the same persist-before-send pending row, oldest-ID claim,
+  lease, sanitized false/exception failure, retry, and atomic sent transition
+  as evidence summaries. Older pending rows cannot be overtaken.
+- The migration is upgrade-safe: it adds diagnostic columns idempotently and
+  relaxes only the source-window nullability needed for explicitly unavailable
+  diagnostics.
+- Final focused-plus-adjacent verification reported `130 passed in 17.17s`;
+  repository-wide Ruff check passed, all 98 Python files were formatted, and
+  `git diff --check` was clean.
