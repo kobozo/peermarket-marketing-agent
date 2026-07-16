@@ -15,6 +15,10 @@ class DraftDict(TypedDict):
     channel: str
     brand_score: int
     copy: str
+    script: str
+    shots: list[str]
+    on_screen_text: list[str]
+    recording_notes: str
 
 
 class RevisedDraftDict(DraftDict):
@@ -45,7 +49,20 @@ def format_draft_dm(draft: DraftDict) -> str:
         f"{draft['language']} · channel: {draft['channel']}"
     )
     ack = f"\n\nReply *✅ {draft['id']}* to approve, *❌ {draft['id']}* to reject."
-    return f"{header}\n\n{draft['copy']}{ack}"
+    if draft["action_type_name"] != "tiktok_post_organic":
+        return f"{header}\n\n{draft['copy']}{ack}"
+
+    shots = draft.get("shots") or []
+    overlays = draft.get("on_screen_text") or []
+    brief = (
+        "\n\n*Recording brief*\n"
+        f"*Spoken script:* {draft.get('script', '')}\n"
+        f"*Shots:* {'; '.join(shots)}\n"
+        f"*On-screen text:* {'; '.join(overlays)}\n"
+        f"*Recording notes:* {draft.get('recording_notes', '')}\n\n"
+        "After approval, reply with one or more videos in this Slack thread."
+    )
+    return f"{header}\n\n{draft['copy']}{brief}{ack}"
 
 
 def format_summary_dm(*, drafts_persisted: int, drafts_attempted: int) -> str:

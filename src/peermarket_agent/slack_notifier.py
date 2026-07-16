@@ -37,6 +37,19 @@ class SlackNotifier:
             log.exception("slack_notifier.send_failed")
             return False
 
+    async def post_draft_thread(self, draft_id: int, text: str) -> tuple[str, str]:
+        result = await self.send_message(text)
+        log.info("slack_notifier.draft_thread_posted", draft_id=draft_id, message_ts=result.ts)
+        return result.channel_id, result.ts
+
+    async def post_thread_reply(self, channel_id: str, thread_ts: str, text: str) -> bool:
+        try:
+            await self.send_message(text, channel_id=channel_id, thread_ts=thread_ts)
+            return True
+        except Exception:
+            log.exception("slack_notifier.thread_reply_failed", channel_id=channel_id, thread_ts=thread_ts)
+            return False
+
     async def send_message(
         self,
         text: str,

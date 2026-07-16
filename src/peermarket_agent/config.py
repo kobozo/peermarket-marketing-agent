@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     slack_signing_secret: str = ""
     slack_founder_user_id: str = ""  # DM target for credit-low + other founder alerts
 
+    # Uploaded video processing
+    video_media_root: Path = Path("data/video-media")
+    video_max_file_bytes: int = 209715200
+    video_max_clips: int = 8
+    video_max_duration_seconds: int = 60
+    video_retention_days: int = 30
+
     # Database
     agent_db_url: str  # local Postgres on VM 129
     peermarket_prod_db_readonly_url: str

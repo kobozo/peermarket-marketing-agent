@@ -75,3 +75,22 @@ async def test_notify_founder_handles_slack_errors(monkeypatch):
     notifier = SlackNotifier(bot_token="xoxb-test", founder_user_id="U123")
     sent = await notifier.notify_founder("hello")
     assert sent is False
+
+
+async def test_post_draft_thread_returns_root_message_reference(monkeypatch):
+    fake_client = AsyncMock()
+    fake_client.chat_postMessage = AsyncMock(
+        return_value={"ok": True, "channel": "C123", "ts": "1710000000.123456"}
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.slack_notifier.AsyncWebClient",
+        lambda *a, **kw: fake_client,
+    )
+    notifier = SlackNotifier(bot_token="xoxb-test", founder_user_id="U123")
+
+    reference = await notifier.post_draft_thread(42, "Record this script in a thread.")
+
+    assert reference == ("C123", "1710000000.123456")
+    fake_client.chat_postMessage.assert_awaited_once_with(
+        channel="U123", text="Record this script in a thread."
+    )

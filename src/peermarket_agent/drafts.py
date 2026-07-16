@@ -25,6 +25,25 @@ class Draft:
     metadata: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class VideoAsset:
+    """A Slack video file attached to a draft's review thread."""
+
+    draft_id: int
+    slack_file_id: str
+    thread_ts: str
+    path: str
+    role: Literal["source", "combined"]
+    mime_type: str
+    size_bytes: int
+    duration_seconds: float | None
+    width: int | None
+    height: int | None
+    status: str
+    review: dict
+    message_ts: str = ""
+
+
 def draft_insert_params(draft: Draft) -> dict:
     """Return the shared SQL parameters for inserting an immutable draft variant."""
     return {
@@ -70,6 +89,52 @@ async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
             )
         ).fetchone()
     return int(new_id_row[0])
+
+
+def _video_asset_from_row(row) -> VideoAsset:
+    return VideoAsset(
+        draft_id=row[0], slack_file_id=row[1], thread_ts=row[2], path=row[3], role=row[4],
+        mime_type=row[5], size_bytes=row[6], duration_seconds=row[7], width=row[8],
+        height=row[9], status=row[10], review=row[11], message_ts=row[12],
+    )
+
+
+async def persist_video_asset(engine: AsyncEngine, asset: VideoAsset) -> int:
+    async with engine.begin() as conn:
+        row = (await conn.execute(text(
+            "INSERT INTO video_assets (draft_id, slack_file_id, thread_ts, message_ts, path, role, mime_type, size_bytes, duration_seconds, width, height, status, review) "
+            "VALUES (:draft_id, :slack_file_id, :thread_ts, :message_ts, :path, :role, :mime_type, :size_bytes, :duration_seconds, :width, :height, :status, CAST(:review AS JSONB)) "
+            "ON CONFLICT (draft_id, slack_file_id) DO NOTHING RETURNING id"
+        ), {**asset.__dict__, "review": json.dumps(asset.review or {})})).fetchone()
+        if row is not None:
+            return int(row[0])
+        row = (await conn.execute(text(
+            "SELECT id FROM video_assets WHERE draft_id=:draft_id AND slack_file_id=:slack_file_id"
+        ), {"draft_id": asset.draft_id, "slack_file_id": asset.slack_file_id})).fetchone()
+    return int(row[0])
+
+
+async def claim_video_asset(engine: AsyncEngine, asset: VideoAsset) -> tuple[VideoAsset, bool]:
+    lock_key = f"video-asset:{asset.draft_id}:{asset.slack_file_id}"
+    async with engine.begin() as conn:
+        await conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key})
+        row = (await conn.execute(text(
+            "SELECT draft_id, slack_file_id, thread_ts, path, role, mime_type, size_bytes, duration_seconds, width, height, status, review, message_ts FROM video_assets WHERE draft_id=:draft_id AND slack_file_id=:slack_file_id"
+        ), {"draft_id": asset.draft_id, "slack_file_id": asset.slack_file_id})).fetchone()
+        if row is not None:
+            return _video_asset_from_row(row), False
+        await conn.execute(text(
+            "INSERT INTO video_assets (draft_id, slack_file_id, thread_ts, message_ts, path, role, mime_type, size_bytes, duration_seconds, width, height, status, review) VALUES (:draft_id, :slack_file_id, :thread_ts, :message_ts, :path, :role, :mime_type, :size_bytes, :duration_seconds, :width, :height, :status, CAST(:review AS JSONB))"
+        ), {**asset.__dict__, "review": json.dumps(asset.review or {})})
+    return asset, True
+
+
+async def get_video_asset_by_slack_file(engine: AsyncEngine, draft_id: int, slack_file_id: str) -> VideoAsset | None:
+    async with engine.connect() as conn:
+        row = (await conn.execute(text(
+            "SELECT draft_id, slack_file_id, thread_ts, path, role, mime_type, size_bytes, duration_seconds, width, height, status, review, message_ts FROM video_assets WHERE draft_id=:draft_id AND slack_file_id=:slack_file_id"
+        ), {"draft_id": draft_id, "slack_file_id": slack_file_id})).fetchone()
+    return _video_asset_from_row(row) if row is not None else None
 
 
 async def count_drafts_for_action(engine: AsyncEngine, action_type_name: str) -> int:

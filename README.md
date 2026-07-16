@@ -146,3 +146,17 @@ availability. Leave either flag false if its check is unavailable. Do not lower
 learning thresholds or enable paid-media behavior merely to make a rollout
 check pass; adjust thresholds only in a separate reviewed change backed by
 sufficient production evidence.
+
+### TikTok human-video review
+
+Approved TikTok drafts include a spoken script, shot list, overlays, and
+recording notes. Reply to the draft's Slack thread with one or more founder
+recordings. The bridge privately downloads and validates `.mp4`, `.mov`, and
+`.webm` files, normalizes and combines clips when needed, and posts Claude's
+technical/script review in the same thread. It never publishes automatically.
+
+The bot needs `files:read`, `chat:write`, relevant channel/group/IM history
+scopes, and Socket Mode `connections:write`. Configure `VIDEO_MEDIA_ROOT`,
+`VIDEO_MAX_FILE_BYTES`, `VIDEO_MAX_CLIPS`, `VIDEO_MAX_DURATION_SECONDS`, and
+`VIDEO_RETENTION_DAYS`; systemd creates the media directory with mode `0700`
+and verifies `ffmpeg` and `ffprobe`. Retention remains manual.
