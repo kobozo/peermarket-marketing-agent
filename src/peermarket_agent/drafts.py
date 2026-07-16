@@ -25,6 +25,25 @@ class Draft:
     metadata: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class VideoAsset:
+    """A Slack video file attached to a draft's review thread."""
+
+    draft_id: int
+    slack_file_id: str
+    thread_ts: str
+    path: str
+    role: Literal["source", "combined"]
+    mime_type: str
+    size_bytes: int
+    duration_seconds: float | None
+    width: int | None
+    height: int | None
+    status: str
+    review: dict
+    message_ts: str = ""
+
+
 async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
     """Insert a draft row, return its id. Raises ValueError if action_type unknown."""
     async with engine.begin() as conn:
@@ -61,6 +80,137 @@ async def persist_draft(engine: AsyncEngine, draft: Draft) -> int:
             )
         ).fetchone()
     return int(new_id_row[0])
+
+
+async def persist_video_asset(engine: AsyncEngine, asset: VideoAsset) -> int:
+    """Persist a Slack video asset, returning its existing ID on duplicate upload."""
+    async with engine.begin() as conn:
+        inserted_row = (
+            await conn.execute(
+                text(
+                    "INSERT INTO video_assets "
+                    "(draft_id, slack_file_id, thread_ts, message_ts, path, role, mime_type, size_bytes, "
+                    " duration_seconds, width, height, status, review) "
+                    "VALUES (:draft_id, :slack_file_id, :thread_ts, :message_ts, :path, :role, :mime_type, "
+                    " :size_bytes, :duration_seconds, :width, :height, :status, CAST(:review AS JSONB)) "
+                    "ON CONFLICT (draft_id, slack_file_id) DO NOTHING "
+                    "RETURNING id"
+                ),
+                {
+                    "draft_id": asset.draft_id,
+                    "slack_file_id": asset.slack_file_id,
+                    "thread_ts": asset.thread_ts,
+                    "message_ts": asset.message_ts,
+                    "path": asset.path,
+                    "role": asset.role,
+                    "mime_type": asset.mime_type,
+                    "size_bytes": asset.size_bytes,
+                    "duration_seconds": asset.duration_seconds,
+                    "width": asset.width,
+                    "height": asset.height,
+                    "status": asset.status,
+                    "review": json.dumps(asset.review or {}),
+                },
+            )
+        ).fetchone()
+        if inserted_row is not None:
+            return int(inserted_row[0])
+
+        existing_row = (
+            await conn.execute(
+                text(
+                    "SELECT id FROM video_assets "
+                    "WHERE draft_id = :draft_id AND slack_file_id = :slack_file_id"
+                ),
+                {"draft_id": asset.draft_id, "slack_file_id": asset.slack_file_id},
+            )
+        ).fetchone()
+    return int(existing_row[0])
+
+
+def _video_asset_from_row(row) -> VideoAsset:
+    return VideoAsset(
+        draft_id=row[0],
+        slack_file_id=row[1],
+        thread_ts=row[2],
+        path=row[3],
+        role=row[4],
+        mime_type=row[5],
+        size_bytes=row[6],
+        duration_seconds=row[7],
+        width=row[8],
+        height=row[9],
+        status=row[10],
+        review=row[11],
+        message_ts=row[12],
+    )
+
+
+async def claim_video_asset(engine: AsyncEngine, asset: VideoAsset) -> tuple[VideoAsset, bool]:
+    """Atomically claim a Slack upload, returning an existing claim to duplicate workers."""
+    lock_key = f"video-asset:{asset.draft_id}:{asset.slack_file_id}"
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": lock_key},
+        )
+        existing = (
+            await conn.execute(
+                text(
+                    "SELECT draft_id, slack_file_id, thread_ts, path, role, mime_type, size_bytes, "
+                    "duration_seconds, width, height, status, review, message_ts "
+                    "FROM video_assets WHERE draft_id = :draft_id AND slack_file_id = :slack_file_id"
+                ),
+                {"draft_id": asset.draft_id, "slack_file_id": asset.slack_file_id},
+            )
+        ).fetchone()
+        if existing is not None:
+            return _video_asset_from_row(existing), False
+        await conn.execute(
+            text(
+                "INSERT INTO video_assets "
+                "(draft_id, slack_file_id, thread_ts, message_ts, path, role, mime_type, size_bytes, "
+                " duration_seconds, width, height, status, review) "
+                "VALUES (:draft_id, :slack_file_id, :thread_ts, :message_ts, :path, :role, :mime_type, "
+                " :size_bytes, :duration_seconds, :width, :height, :status, CAST(:review AS JSONB))"
+            ),
+            {
+                "draft_id": asset.draft_id,
+                "slack_file_id": asset.slack_file_id,
+                "thread_ts": asset.thread_ts,
+                "message_ts": asset.message_ts,
+                "path": asset.path,
+                "role": asset.role,
+                "mime_type": asset.mime_type,
+                "size_bytes": asset.size_bytes,
+                "duration_seconds": asset.duration_seconds,
+                "width": asset.width,
+                "height": asset.height,
+                "status": asset.status,
+                "review": json.dumps(asset.review or {}),
+            },
+        )
+    return asset, True
+
+
+async def get_video_asset_by_slack_file(
+    engine: AsyncEngine, draft_id: int, slack_file_id: str
+) -> VideoAsset | None:
+    """Return a draft's video asset for a Slack file ID, if present."""
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT draft_id, slack_file_id, thread_ts, path, role, mime_type, size_bytes, "
+                    "duration_seconds, width, height, status, review, message_ts "
+                    "FROM video_assets WHERE draft_id = :draft_id AND slack_file_id = :slack_file_id"
+                ),
+                {"draft_id": draft_id, "slack_file_id": slack_file_id},
+            )
+        ).fetchone()
+    if row is None:
+        return None
+    return _video_asset_from_row(row)
 
 
 async def count_drafts_for_action(engine: AsyncEngine, action_type_name: str) -> int:

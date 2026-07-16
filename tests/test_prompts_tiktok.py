@@ -18,6 +18,11 @@ def test_system_prompt_includes_brand_voice():
     assert "Belgian dry humor" in sys
     assert "TikTok organic" in sys
     assert "JSON" in sys
+    assert "20-40 second" in sys
+    assert '"script"' in sys
+    assert '"shots"' in sys
+    assert '"on_screen_text"' in sys
+    assert '"recording_notes"' in sys
 
 
 def test_user_prompt_specifies_language_and_theme():
@@ -35,7 +40,12 @@ async def test_generate_tiktok_post_parses_json_response():
     fake_client = AsyncMock()
     fake_client.complete = AsyncMock(
         return_value=ClaudeResponse(
-            text='{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats nu"}',
+            text=(
+                '{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", '
+                '"cta": "Plaats nu", "script": "Marktplaats moe? Verkoop veilig op PeerMarket. '
+                'Plaats nu.", "shots": ["Praat in camera", "Toon telefoon"], '
+                '"on_screen_text": ["Verkoop veilig"], "recording_notes": "Film verticaal bij daglicht."}'
+            ),
             input_tokens=200,
             output_tokens=40,
             model="claude-sonnet-4-6",
@@ -51,6 +61,10 @@ async def test_generate_tiktok_post_parses_json_response():
     assert result.hook == "Marktplaats moe?"
     assert result.body == "Verkoop veilig op PeerMarket."
     assert result.cta == "Plaats nu"
+    assert result.script.startswith("Marktplaats moe?")
+    assert result.shots == ["Praat in camera", "Toon telefoon"]
+    assert result.on_screen_text == ["Verkoop veilig"]
+    assert result.recording_notes == "Film verticaal bij daglicht."
     assert result.cost_cents == 1
 
 

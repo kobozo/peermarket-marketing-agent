@@ -33,7 +33,12 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats nu"}',
+                text=(
+                    '{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", '
+                    '"cta": "Plaats nu", "script": "Marktplaats moe? Verkoop veilig op PeerMarket. '
+                    'Plaats nu.", "shots": ["Praat in camera", "Toon telefoon"], '
+                    '"on_screen_text": ["Verkoop veilig"], "recording_notes": "Film verticaal bij daglicht."}'
+                ),
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -61,8 +66,8 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
     async with prepared_db.connect() as conn:
         row = (
             await conn.execute(
-                text(
-                    "SELECT copy, brand_score, channel, language, status FROM drafts WHERE id = :id"
+                    text(
+                    "SELECT copy, brand_score, channel, language, status, metadata FROM drafts WHERE id = :id"
                 ),
                 {"id": draft_id},
             )
@@ -72,6 +77,12 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
     assert row[2] == "tiktok"
     assert row[3] == "NL"
     assert row[4] == "queued"
+    assert row[5] == {
+        "script": "Marktplaats moe? Verkoop veilig op PeerMarket. Plaats nu.",
+        "shots": ["Praat in camera", "Toon telefoon"],
+        "on_screen_text": ["Verkoop veilig"],
+        "recording_notes": "Film verticaal bij daglicht.",
+    }
 
 
 async def test_run_draft_rejects_low_score_draft_does_not_persist(prepared_db):
@@ -79,7 +90,11 @@ async def test_run_draft_rejects_low_score_draft_does_not_persist(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "wrong tone", "body": "amazing offer!!!", "cta": "buy now!"}',
+                text=(
+                    '{"hook": "wrong tone", "body": "amazing offer!!!", "cta": "buy now!", '
+                    '"script": "Wrong tone script.", "shots": ["Face camera"], '
+                    '"on_screen_text": ["Buy now"], "recording_notes": "Film vertically."}'
+                ),
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",

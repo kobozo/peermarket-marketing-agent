@@ -59,6 +59,24 @@ _STEPS: list[str] = [
         decided_at TIMESTAMPTZ,
         decided_by TEXT
     )""",
+    """CREATE TABLE IF NOT EXISTS video_assets (
+        id BIGSERIAL PRIMARY KEY,
+        draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        slack_file_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        message_ts TEXT NOT NULL DEFAULT '',
+        path TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('source','combined')),
+        mime_type TEXT NOT NULL,
+        size_bytes BIGINT NOT NULL,
+        duration_seconds DOUBLE PRECISION,
+        width INT,
+        height INT,
+        status TEXT NOT NULL,
+        review JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (draft_id, slack_file_id)
+    )""",
     """CREATE TABLE IF NOT EXISTS publications (
         id BIGSERIAL PRIMARY KEY,
         draft_id BIGINT REFERENCES drafts(id),
@@ -132,8 +150,10 @@ _STEPS: list[str] = [
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
     "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+    "ALTER TABLE video_assets ADD COLUMN IF NOT EXISTS message_ts TEXT NOT NULL DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_video_assets_draft_created_at ON video_assets (draft_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
 ]
 

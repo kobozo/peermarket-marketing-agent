@@ -1,5 +1,6 @@
 """Slack bridge handler tests — no real Slack."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -89,3 +90,76 @@ async def test_handle_im_without_ack_falls_back_to_hello(monkeypatch, fake_say):
     fake_say.assert_awaited_once()
     args, kwargs = fake_say.await_args
     assert "PeerMarket marketing agent" in (kwargs.get("text") or args[0])
+
+
+async def test_handle_im_dispatches_thread_video_upload_in_background(monkeypatch, fake_say):
+    from peermarket_agent.slack_bridge import app as bridge_app
+
+    fake_engine = object()
+    dispatched = AsyncMock()
+    monkeypatch.setattr(bridge_app, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(
+        bridge_app,
+        "get_settings",
+        lambda: SimpleNamespace(slack_founder_user_id="U123"),
+    )
+    monkeypatch.setattr(bridge_app, "_route_video_upload", dispatched)
+    event = {
+        "channel": "C123",
+        "channel_type": "channel",
+        "thread_ts": "1710000000.123456",
+        "user": "U123",
+        "files": [
+            {
+                "id": "F123",
+                "name": "recording.mp4",
+                "mimetype": "video/mp4",
+                "size": 1234,
+            }
+        ],
+    }
+
+    await bridge_app.handle_im(event=event, say=fake_say)
+    await __import__("asyncio").sleep(0)
+
+    dispatched.assert_awaited_once()
+    assert dispatched.await_args.args[0] is fake_engine
+    assert dispatched.await_args.args[1].file_id == "F123"
+    fake_say.assert_not_called()
+
+
+@pytest.mark.parametrize("founder_user_id", ["", "U999"])
+async def test_handle_im_routes_supported_video_from_unauthorized_uploader_for_thread_rejection(
+    monkeypatch, fake_say, founder_user_id
+):
+    from peermarket_agent.slack_bridge import app as bridge_app
+
+    fake_engine = object()
+    dispatched = AsyncMock()
+    monkeypatch.setattr(bridge_app, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(
+        bridge_app,
+        "get_settings",
+        lambda: SimpleNamespace(slack_founder_user_id=founder_user_id),
+    )
+    monkeypatch.setattr(bridge_app, "_route_video_upload", dispatched)
+    event = {
+        "channel": "C123",
+        "channel_type": "channel",
+        "thread_ts": "1710000000.123456",
+        "user": "U123",
+        "files": [
+            {
+                "id": "F123",
+                "name": "recording.mp4",
+                "mimetype": "video/mp4",
+                "size": 1234,
+            }
+        ],
+    }
+
+    await bridge_app.handle_im(event=event, say=fake_say)
+    await __import__("asyncio").sleep(0)
+
+    dispatched.assert_awaited_once()
+    fake_say.assert_not_called()

@@ -51,8 +51,21 @@ async def _produce_copy_for_action(
             language=action_args["language"],
             theme=action_args.get("theme", "declutter"),
         )
-        copy_text = f"{post.hook}\n\n{post.body}\n\n{post.cta}"
-        return "tiktok", action_args["language"], copy_text, post.cost_cents, {}
+        copy_text = (
+            f"{post.hook}\n\n{post.body}\n\n{post.cta}\n\n"
+            f"Recording brief\n"
+            f"Script: {post.script}\n"
+            f"Shots: {'; '.join(post.shots)}\n"
+            f"On-screen text: {'; '.join(post.on_screen_text)}\n"
+            f"Recording notes: {post.recording_notes}"
+        )
+        metadata = {
+            "script": post.script,
+            "shots": post.shots,
+            "on_screen_text": post.on_screen_text,
+            "recording_notes": post.recording_notes,
+        }
+        return "tiktok", action_args["language"], copy_text, post.cost_cents, metadata
     elif action_type_name == "email_re_engagement":
         email = await generate_email(
             claude=claude,

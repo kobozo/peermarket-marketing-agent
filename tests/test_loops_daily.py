@@ -66,7 +66,10 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             # 3) TikTok gen
             ClaudeResponse(
                 text=(
-                    '{"hook": "Marktplaats moe?", "body": "Veilig verkopen.", "cta": "Plaats nu"}'
+                    '{"hook": "Marktplaats moe?", "body": "Veilig verkopen.", "cta": "Plaats nu", '
+                    '"script": "Marktplaats moe? Veilig verkopen. Plaats nu.", '
+                    '"shots": ["Praat in camera"], "on_screen_text": ["Veilig verkopen"], '
+                    '"recording_notes": "Film verticaal bij daglicht."}'
                 ),
                 input_tokens=200,
                 output_tokens=40,
@@ -105,13 +108,15 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
 
     fake_notifier = AsyncMock()
     fake_notifier.notify_founder = AsyncMock(return_value=True)
+    fake_notifier.post_draft_thread = AsyncMock(return_value=("C123", "1700000000.000001"))
 
     persisted = await run_daily_drafts(
         engine=prepared_db, claude=fake_claude, notifier=fake_notifier
     )
     assert persisted == 3
-    # 3 draft DMs + 1 summary = 4 notify calls
-    assert fake_notifier.notify_founder.await_count == 4
+    # 2 non-TikTok DMs + 1 summary; TikTok uses its thread root as its notification.
+    assert fake_notifier.notify_founder.await_count == 3
+    assert fake_notifier.post_draft_thread.await_count == 1
 
     # KPI row recorded
     async with prepared_db.connect() as conn:
@@ -152,7 +157,12 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
             ),
             # TikTok ok
             ClaudeResponse(
-                text=('{"hook": "ok?", "body": "Veilig verkopen.", "cta": "Plaats nu"}'),
+                text=(
+                    '{"hook": "ok?", "body": "Veilig verkopen.", "cta": "Plaats nu", '
+                    '"script": "Ok? Veilig verkopen. Plaats nu.", "shots": ["Praat in camera"], '
+                    '"on_screen_text": ["Veilig verkopen"], '
+                    '"recording_notes": "Film verticaal."}'
+                ),
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -184,10 +194,11 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
     )
     fake_notifier = AsyncMock()
     fake_notifier.notify_founder = AsyncMock(return_value=True)
+    fake_notifier.post_draft_thread = AsyncMock(return_value=("C123", "1700000000.000002"))
 
     persisted = await run_daily_drafts(
         engine=prepared_db, claude=fake_claude, notifier=fake_notifier
     )
     assert persisted == 2
-    # 2 draft DMs + 1 summary
-    assert fake_notifier.notify_founder.await_count == 3
+    # 1 email DM + 1 summary; TikTok uses its thread root.
+    assert fake_notifier.notify_founder.await_count == 2

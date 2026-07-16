@@ -1,5 +1,7 @@
 """Tests for env-driven configuration."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -49,6 +51,20 @@ def test_settings_loaded_from_env(monkeypatch):
     assert s.github_app_id == 12345
     assert s.github_app_installation_id == 67890
     assert s.timezone == "Europe/Brussels"
+    assert s.video_media_root == Path("data/video-media")
+    assert s.video_retention_days == 30
+
+
+def test_settings_loads_video_media_overrides(monkeypatch, tmp_path):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("VIDEO_MEDIA_ROOT", str(tmp_path / "slack-media"))
+    monkeypatch.setenv("VIDEO_RETENTION_DAYS", "14")
+    get_settings.cache_clear()
+
+    settings = Settings()
+
+    assert settings.video_media_root == tmp_path / "slack-media"
+    assert settings.video_retention_days == 14
 
 
 def test_settings_cached(monkeypatch):
@@ -96,3 +112,23 @@ def test_settings_loads_pem_from_file(monkeypatch, tmp_path):
     get_settings.cache_clear()
     s = get_settings()
     assert s.github_app_private_key == pem_body
+
+
+def _set_required_env(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+    monkeypatch.setenv("AGENT_DB_URL", "postgresql+asyncpg://x:y@localhost/z")
+    monkeypatch.setenv("GITHUB_APP_ID", "12345")
+    monkeypatch.setenv(
+        "GITHUB_APP_PRIVATE_KEY",
+        "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
+    )
+    monkeypatch.setenv("GITHUB_APP_INSTALLATION_ID", "67890")
+    monkeypatch.setenv("PEERMARKET_PROD_DB_READONLY_URL", "postgresql+asyncpg://r:o@host/peer")
+    monkeypatch.setenv("RECRAFT_API_KEY", "rk-test")
+    monkeypatch.setenv("RESEND_API_KEY", "re-test")
+    monkeypatch.setenv("BACKBLAZE_B2_KEY_ID", "kid")
+    monkeypatch.setenv("BACKBLAZE_B2_APP_KEY", "akey")
+    monkeypatch.setenv("BACKBLAZE_B2_BUCKET", "peermarket-agent-backups")
+    monkeypatch.setenv("BACKBLAZE_B2_ENDPOINT", "s3.eu-central-003.backblazeb2.com")

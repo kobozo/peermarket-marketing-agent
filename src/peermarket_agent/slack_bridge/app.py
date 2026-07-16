@@ -10,12 +10,19 @@ import structlog
 from fastapi import FastAPI
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.web.async_client import AsyncWebClient
 from uvicorn import Config, Server
 
+from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.config import get_settings
 from peermarket_agent.db.engine import get_engine
 from peermarket_agent.slack_bridge.ack_handler import handle_ack
 from peermarket_agent.slack_bridge.ack_parser import parse_ack
+from peermarket_agent.slack_bridge.video_events import (
+    VideoUpload,
+    extract_video_upload,
+)
+from peermarket_agent.video_workflow import process_video_upload
 
 log = structlog.get_logger(__name__)
 
@@ -35,6 +42,10 @@ async def handle_app_mention(event: dict, say) -> None:
 async def handle_im(event: dict, say) -> None:
     if event.get("bot_id"):
         return
+    upload = extract_video_upload(event)
+    if upload is not None:
+        asyncio.create_task(_route_video_upload(get_engine(), upload))
+        return
     if event.get("channel_type") != "im":
         return
     text_msg = event.get("text") or ""
@@ -47,6 +58,24 @@ async def handle_im(event: dict, say) -> None:
         await say(text=result.reply_text)
         return
     await say(text=_HELLO_TEXT)
+
+
+async def _route_video_upload(engine, upload: VideoUpload) -> None:
+    """Run the secure media workflow in the background for one Slack event."""
+    settings = get_settings()
+    result = await process_video_upload(
+        engine,
+        AsyncWebClient(token=settings.slack_bot_token),
+        ClaudeClient(api_key=settings.anthropic_api_key),
+        upload,
+        settings,
+    )
+    log.info(
+        "slack_video.processed",
+        file_id=upload.file_id,
+        status=result.status,
+        output_path=str(result.output_path) if result.output_path else None,
+    )
 
 
 def build_app(slack_bot_token: str) -> AsyncApp:

@@ -8,6 +8,10 @@ _BASE_DRAFT = {
     "channel": "tiktok",
     "brand_score": 88,
     "copy": "Marktplaats moe? Verkoop veilig op PeerMarket.",
+    "script": "Marktplaats moe? Verkoop veilig op PeerMarket. Plaats nu.",
+    "shots": ["Praat in camera", "Toon telefoon"],
+    "on_screen_text": ["Verkoop veilig"],
+    "recording_notes": "Film verticaal bij daglicht.",
 }
 
 
@@ -19,6 +23,12 @@ def test_format_tiktok_draft():
     assert "Marktplaats moe?" in msg
     assert "✅ 42" in msg
     assert "❌ 42" in msg
+    assert "Recording brief" in msg
+    assert "Marktplaats moe? Verkoop veilig op PeerMarket. Plaats nu." in msg
+    assert "Praat in camera" in msg
+    assert "Verkoop veilig" in msg
+    assert "Film verticaal bij daglicht." in msg
+    assert "reply with one or more videos in this Slack thread" in msg
 
 
 def test_format_meta_draft():

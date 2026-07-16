@@ -14,6 +14,7 @@ REQUIRED_TABLES = {
     "action_types",
     "trust_scores",
     "drafts",
+    "video_assets",
     "publications",
     "budget_ledger",
     "kpis_hourly",
@@ -74,3 +75,16 @@ async def test_creatives_archive_has_vector_column(engine):
         )
         # pgvector reports as 'USER-DEFINED'
         assert result.scalar() == "USER-DEFINED"
+
+
+async def test_video_assets_include_slack_message_timestamp(engine):
+    await run_migrations(engine)
+    async with engine.connect() as conn:
+        timestamp_type = await conn.scalar(
+            text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'video_assets' AND column_name = 'message_ts'"
+            )
+        )
+
+    assert timestamp_type == "text"
