@@ -40,6 +40,7 @@ peermarket-slack-bridge = "peermarket_agent.slack_bridge.app:cli"
 peermarket-migrate = "peermarket_agent.db.migrations:cli"
 peermarket-agent-draft = "peermarket_agent.agent.cli_draft:cli"
 peermarket-meta = "peermarket_agent.cli_meta:cli"
+peermarket-performance = "peermarket_agent.cli_performance:cli"
 
 [build-system]
 requires = ["hatchling"]

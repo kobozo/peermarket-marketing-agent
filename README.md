@@ -112,3 +112,34 @@ peermarket-meta replace-terminal-draft \
 Do not blindly retry this command after a failure. Inspect the current IDs,
 draft status, publication state, and finalized replacement-history entry before
 deciding on any further operator action.
+
+### Staged Meta performance rollout
+
+Deploy performance collection disabled first. The workflow defaults both
+`META_INSIGHTS_ENABLED` and `PEERMARKET_ATTRIBUTION_ENABLED` to `false`; keep
+those repository variables false through the initial deployment. The remaining
+repository-variable defaults are a 3-day Insights lookback, a 2-hour no-delivery
+grace period, and learning minimums of 1,000 impressions, 30 landing-page views,
+and 10 registrations. These are operational controls, not secrets.
+
+After the reviewed workflow has deployed, use the read-only verifier against a
+known published draft:
+
+```bash
+peermarket-performance verify --draft-id 156
+```
+
+The command reads the publication, live Meta statuses and Insights, the
+aggregate-only attribution view, and stored snapshot freshness. Its JSON output
+is limited to IDs, statuses, counts, availability/freshness checks, and feature
+flags; it never prints credentials or raw attribution rows and never changes a
+Meta resource or database row.
+
+Enable `META_INSIGHTS_ENABLED` first, redeploy through GitHub Actions, wait for
+one scheduled collection, and verify that `meta_available` and `snapshot_fresh`
+are true. Review delivery counts before enabling
+`PEERMARKET_ATTRIBUTION_ENABLED`, redeploy again, and verify aggregate-view
+availability. Leave either flag false if its check is unavailable. Do not lower
+learning thresholds or enable paid-media behavior merely to make a rollout
+check pass; adjust thresholds only in a separate reviewed change backed by
+sufficient production evidence.

@@ -3,7 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     meta_page_id: str = ""
     meta_insights_enabled: bool = False
     peermarket_attribution_enabled: bool = False
+    meta_insights_lookback_days: int = Field(default=3, ge=1, le=30)
+    meta_no_delivery_grace_hours: int = Field(default=2, ge=0, le=168)
+    learning_min_impressions: int = Field(default=1000, ge=1, le=10_000_000)
+    learning_min_landing_page_views: int = Field(default=30, ge=1, le=1_000_000)
+    learning_min_registrations: int = Field(default=10, ge=1, le=1_000_000)
 
     # Resend (email)
     resend_api_key: str
