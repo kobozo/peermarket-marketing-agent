@@ -320,6 +320,27 @@ _STEPS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
+    """CREATE TABLE IF NOT EXISTS daily_performance_summary_outbox (
+        id BIGSERIAL PRIMARY KEY,
+        summary_key TEXT NOT NULL UNIQUE,
+        window_start DATE NOT NULL,
+        window_stop DATE NOT NULL,
+        window_definition TEXT NOT NULL,
+        publication_ids JSONB NOT NULL,
+        evidence_ids JSONB NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','sent')),
+        attempt_count INT NOT NULL DEFAULT 0,
+        last_attempt_at TIMESTAMPTZ,
+        sent_at TIMESTAMPTZ,
+        claim_token TEXT,
+        claim_expires_at TIMESTAMPTZ,
+        last_failure TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_daily_performance_summary_pending "
+    "ON daily_performance_summary_outbox (status, window_start, id)",
 ]
 
 

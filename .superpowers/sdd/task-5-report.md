@@ -121,3 +121,51 @@ external configuration was mutated.
 - `uv run ruff check src tests` -> all checks passed.
 - `uv run ruff format --check src tests` -> 98 files already formatted.
 - `git diff --check` -> clean.
+
+## Durable daily-summary delivery follow-up (2026-07-16)
+
+### RED evidence
+
+The durable-delivery regressions initially reported `7 failed, 36 passed`:
+
+- no daily summary outbox table existed;
+- a false notifier result was discarded rather than retained for retry;
+- notifier exceptions escaped and could expose their raw message;
+- a newer daily window superseded an older failed send;
+- concurrent runs sent the same summary twice;
+- successful replays sent again; and
+- stale claims had no durable retry mechanism.
+
+A separate recovery regression then failed because an immutable observation
+created before the outbox migration was not backfilled into a pending summary.
+
+### Implemented delivery contract
+
+- Added the idempotent `daily_performance_summary_outbox` migration with a
+  unique immutable summary key, exact source-window identity, publication and
+  evidence references, sanitized message, pending/sent status, attempt and sent
+  timestamps, claim token/lease, and bounded failure category.
+- Summary rows are inserted in the same transaction as immutable observations
+  and learnings, before any Slack call. Existing observations are also
+  idempotently reconstructed into missing outbox rows during rollout/recovery.
+- The drain claims only the oldest pending window under a row lock. An active
+  oldest lease prevents a concurrent worker from overtaking it; an expired
+  lease is reclaimed. Newer windows drain only after all older sends are
+  confirmed.
+- Slack delivery occurs outside the database transaction. A truthy result marks
+  the token-matched row sent atomically. False or exception releases the claim,
+  leaves the row pending, records only `notification_not_confirmed` or
+  `notification_exception`, and stops the drain so immediate retries cannot
+  loop or reorder windows.
+- Sent summaries and concurrent runs are idempotent. No Meta resource, budget,
+  production system, PII, credential, or raw exception text is read or mutated
+  by this path.
+
+### Focused GREEN
+
+`tests/test_performance_daily.py tests/test_learnings.py tests/test_migrations.py tests/test_agent_main.py`
+reported `54 passed in 6.97s` against local PostgreSQL on port 55432.
+
+Final focused-plus-adjacent verification reported `128 passed in 16.33s`;
+repository-wide Ruff check passed, all 98 Python files were already formatted,
+and `git diff --check` was clean.

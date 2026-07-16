@@ -2,9 +2,11 @@
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from typing import Any
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import text
@@ -17,6 +19,7 @@ from peermarket_agent.learnings import (
 )
 
 log = structlog.get_logger(__name__)
+_SUMMARY_CLAIM_LEASE = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -297,6 +300,137 @@ def _summary(rows: list[dict], observations: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def _enqueue_summary(conn, rows: list[dict], observations: list[dict]) -> None:
+    """Persist immutable window summaries before any notification attempt."""
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    for observation in observations:
+        window = observation["window"]
+        key = (window["start"], window["stop"], window["definition"])
+        grouped.setdefault(key, []).append(observation)
+    for (start, stop, definition), window_observations in grouped.items():
+        ordered = sorted(window_observations, key=lambda item: item["publication_id"])
+        publication_ids = [item["publication_id"] for item in ordered]
+        evidence_ids = [item["evidence_id"] for item in ordered]
+        identity = json.dumps(
+            {
+                "window": [start, stop, definition],
+                "publication_ids": publication_ids,
+                "evidence_ids": evidence_ids,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        summary_key = "daily-performance:" + sha256(identity.encode()).hexdigest()
+        await conn.execute(
+            text(
+                "INSERT INTO daily_performance_summary_outbox "
+                "(summary_key, window_start, window_stop, window_definition, "
+                "publication_ids, evidence_ids, message) VALUES "
+                "(:key, :start, :stop, :definition, CAST(:publication_ids AS JSONB), "
+                "CAST(:evidence_ids AS JSONB), :message) "
+                "ON CONFLICT (summary_key) DO NOTHING"
+            ),
+            {
+                "key": summary_key,
+                "start": date.fromisoformat(start),
+                "stop": date.fromisoformat(stop),
+                "definition": definition,
+                "publication_ids": json.dumps(publication_ids),
+                "evidence_ids": json.dumps(evidence_ids),
+                "message": _summary(rows, ordered),
+            },
+        )
+
+
+async def _claim_next_summary(engine: AsyncEngine, now: datetime) -> tuple[str, str] | None:
+    """Claim only the oldest pending summary so newer windows cannot overtake it."""
+    async with engine.begin() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT id, message, claim_token, claim_expires_at "
+                        "FROM daily_performance_summary_outbox WHERE status='pending' "
+                        "ORDER BY window_start, window_stop, id LIMIT 1 FOR UPDATE"
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        if row["claim_token"] and row["claim_expires_at"] and row["claim_expires_at"] > now:
+            return None
+        token = str(uuid4())
+        await conn.execute(
+            text(
+                "UPDATE daily_performance_summary_outbox SET claim_token=:token, "
+                "claim_expires_at=:expires, attempt_count=attempt_count+1, "
+                "last_attempt_at=:now, last_failure=NULL WHERE id=:id"
+            ),
+            {
+                "id": row["id"],
+                "token": token,
+                "expires": now + _SUMMARY_CLAIM_LEASE,
+                "now": now,
+            },
+        )
+    return token, row["message"]
+
+
+async def _finish_summary(
+    engine: AsyncEngine,
+    token: str,
+    *,
+    delivered: bool,
+    failure: str | None,
+    now: datetime,
+) -> None:
+    async with engine.begin() as conn:
+        if delivered:
+            await conn.execute(
+                text(
+                    "UPDATE daily_performance_summary_outbox SET status='sent', sent_at=:now, "
+                    "claim_token=NULL, claim_expires_at=NULL, last_failure=NULL "
+                    "WHERE status='pending' AND claim_token=:token"
+                ),
+                {"token": token, "now": now},
+            )
+        else:
+            await conn.execute(
+                text(
+                    "UPDATE daily_performance_summary_outbox SET claim_token=NULL, "
+                    "claim_expires_at=NULL, last_failure=:failure "
+                    "WHERE status='pending' AND claim_token=:token"
+                ),
+                {"token": token, "failure": failure},
+            )
+
+
+async def _drain_summaries(engine: AsyncEngine, notifier, now: datetime) -> None:
+    while claimed := await _claim_next_summary(engine, now):
+        token, message = claimed
+        failure = None
+        try:
+            delivered = bool(await notifier.notify_founder(message))
+            if not delivered:
+                failure = "notification_not_confirmed"
+        except Exception:
+            delivered = False
+            failure = "notification_exception"
+        await _finish_summary(
+            engine,
+            token,
+            delivered=delivered,
+            failure=failure,
+            now=now,
+        )
+        if not delivered:
+            log.warning("daily_performance.summary_pending", failure=failure)
+            return
+
+
 async def run_daily_performance(
     engine: AsyncEngine, notifier, settings, now: datetime | None = None
 ) -> int:
@@ -305,7 +439,6 @@ async def run_daily_performance(
     now = now or datetime.now(UTC)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
-    today = now.astimezone(UTC).date()
     inserted: list[dict] = []
     rows: list[dict] = []
     async with engine.begin() as conn:
@@ -374,23 +507,13 @@ async def run_daily_performance(
                 grouped.setdefault(_comparison_key(variant), []).append(variant)
         for variants in grouped.values():
             await _persist_learning(conn, variants)
+        all_observations = [
+            observation
+            for row in rows
+            for observation in row["performance"].get("daily_observations", [])
+        ]
+        await _enqueue_summary(conn, rows, all_observations)
 
-    summary_observations = inserted or [
-        observation
-        for row in rows
-        for observation in row["performance"].get("daily_observations", [])
-        if observation["window"]["stop"] == today.isoformat()
-    ]
-    message = _summary(rows, summary_observations)
-    unavailable_rows = [
-        row
-        for row in rows
-        if _valid_window((row["performance"].get("meta") or {}).get("latest") or {}) is None
-    ]
-    for row in unavailable_rows:
-        message += f"\n• Publication #{row['publication_id']} — source window unavailable"
-        if row.get("ads_manager_url"):
-            message += f"; Ads Manager: {row['ads_manager_url']}"
-    await notifier.notify_founder(message)
+    await _drain_summaries(engine, notifier, now)
     log.info("daily_performance.complete", observations_inserted=len(inserted))
     return len(inserted)

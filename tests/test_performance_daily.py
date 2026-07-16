@@ -3,7 +3,7 @@ import json
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from sqlalchemy import text
@@ -425,7 +425,8 @@ async def test_missing_or_invalid_source_window_creates_no_completed_observation
             await conn.execute(text("SELECT performance FROM publications WHERE draft_id=701"))
         ).scalar_one()
     assert "daily_observations" not in performance
-    assert "window unavailable" in notifier.notify_founder.await_args.args[0]
+    notifier.notify_founder.assert_not_awaited()
+    assert await _summary_outbox(database_engine) == []
 
 
 async def test_explicit_one_day_inclusive_source_window_is_valid(database_engine):
@@ -569,4 +570,207 @@ async def test_new_window_reinforces_once_and_retains_replayable_prior_evidence(
     assert [run["window"]["stop"] for run in row["evidence_links"]["runs"]] == [
         "2026-07-16",
         "2026-07-17",
+    ]
+
+
+async def _summary_outbox(database_engine):
+    async with database_engine.connect() as conn:
+        return [
+            dict(row)
+            for row in (
+                await conn.execute(
+                    text(
+                        "SELECT summary_key, window_start, window_stop, window_definition, "
+                        "publication_ids, evidence_ids, message, status, attempt_count, "
+                        "last_attempt_at, sent_at, claim_token, claim_expires_at, last_failure "
+                        "FROM daily_performance_summary_outbox ORDER BY window_start, id"
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        ]
+
+
+async def _prepared_summary_publication(database_engine, draft_id=1101):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    performance = _complete_performance()
+    performance["meta"]["latest"].update(
+        window_start="2026-07-14",
+        window_stop="2026-07-16",
+        window_definition="rolling-3-inclusive-calendar-days",
+    )
+    await _insert_publication(
+        database_engine,
+        draft_id=draft_id,
+        audience="declutterers",
+        performance=performance,
+        ads_url="https://business.facebook.com/adsmanager/manage/ads?act=123",
+    )
+
+
+async def test_false_delivery_stays_pending_after_persisting_sanitized_summary(database_engine):
+    await _prepared_summary_publication(database_engine)
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = False
+
+    await run_daily_performance(
+        database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 1
+    assert row["last_attempt_at"] is not None
+    assert row["sent_at"] is None
+    assert row["claim_token"] is None
+    assert row["claim_expires_at"] is None
+    assert row["last_failure"] == "notification_not_confirmed"
+    assert row["publication_ids"] == [1]
+    assert row["evidence_ids"] == [
+        "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days"
+    ]
+    assert "secret" not in row["message"].lower()
+
+
+async def test_delivery_exception_stays_pending_without_persisting_exception_text(database_engine):
+    await _prepared_summary_publication(database_engine)
+    notifier = AsyncMock()
+    notifier.notify_founder.side_effect = RuntimeError("password=super-secret")
+
+    await run_daily_performance(
+        database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "pending"
+    assert row["last_failure"] == "notification_exception"
+    assert "super-secret" not in str(row)
+
+
+async def test_next_day_retries_old_pending_before_sending_new_summary(database_engine):
+    await _prepared_summary_publication(database_engine)
+    first_notifier = AsyncMock()
+    first_notifier.notify_founder.return_value = False
+    await run_daily_performance(
+        database_engine, first_notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+    async with database_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE publications SET performance=jsonb_set(jsonb_set(performance, "
+                "'{meta,latest,window_start}', '\"2026-07-15\"'), "
+                "'{meta,latest,window_stop}', '\"2026-07-17\"')"
+            )
+        )
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    await run_daily_performance(
+        database_engine, notifier, object(), now=datetime(2026, 7, 17, 9, tzinfo=UTC)
+    )
+
+    assert notifier.notify_founder.await_count == 2
+    old_message, new_message = [item.args[0] for item in notifier.notify_founder.await_args_list]
+    assert "2026-07-14 → 2026-07-16" in old_message
+    assert "2026-07-15 → 2026-07-17" in new_message
+    rows = await _summary_outbox(database_engine)
+    assert [row["status"] for row in rows] == ["sent", "sent"]
+    assert [row["attempt_count"] for row in rows] == [2, 1]
+
+
+async def test_concurrent_runs_claim_one_summary_sender(database_engine):
+    await _prepared_summary_publication(database_engine)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def deliver(_message):
+        entered.set()
+        await release.wait()
+        return True
+
+    notifier = AsyncMock()
+    notifier.notify_founder.side_effect = deliver
+    first = asyncio.create_task(
+        run_daily_performance(
+            database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+        )
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        run_daily_performance(
+            database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+        )
+    )
+    await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.gather(first, second)
+
+    notifier.notify_founder.assert_awaited_once()
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "sent"
+    assert row["attempt_count"] == 1
+
+
+async def test_stale_claim_is_retried(database_engine):
+    await _prepared_summary_publication(database_engine)
+    first = AsyncMock()
+    first.notify_founder.return_value = False
+    now = datetime(2026, 7, 16, 9, tzinfo=UTC)
+    await run_daily_performance(database_engine, first, object(), now=now)
+    async with database_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE daily_performance_summary_outbox SET claim_token='abandoned', "
+                "claim_expires_at=:expired WHERE status='pending'"
+            ),
+            {"expired": datetime(2026, 7, 16, 8, tzinfo=UTC)},
+        )
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    await run_daily_performance(database_engine, notifier, object(), now=now)
+
+    notifier.notify_founder.assert_awaited_once()
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "sent"
+    assert row["attempt_count"] == 2
+
+
+async def test_successful_summary_is_idempotent_across_daily_replay(database_engine):
+    await _prepared_summary_publication(database_engine)
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+    now = datetime(2026, 7, 16, 9, tzinfo=UTC)
+
+    await run_daily_performance(database_engine, notifier, object(), now=now)
+    await run_daily_performance(database_engine, notifier, object(), now=now)
+
+    notifier.notify_founder.assert_has_awaits([call(notifier.notify_founder.await_args.args[0])])
+    assert notifier.notify_founder.await_count == 1
+    rows = await _summary_outbox(database_engine)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "sent"
+    assert rows[0]["attempt_count"] == 1
+
+
+async def test_existing_immutable_observation_without_outbox_is_recovered(database_engine):
+    await _prepared_summary_publication(database_engine)
+    failed = AsyncMock()
+    failed.notify_founder.return_value = False
+    now = datetime(2026, 7, 16, 9, tzinfo=UTC)
+    await run_daily_performance(database_engine, failed, object(), now=now)
+    async with database_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM daily_performance_summary_outbox"))
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    assert await run_daily_performance(database_engine, notifier, object(), now=now) == 0
+
+    notifier.notify_founder.assert_awaited_once()
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "sent"
+    assert row["evidence_ids"] == [
+        "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days"
     ]
