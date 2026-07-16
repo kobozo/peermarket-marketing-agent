@@ -4,6 +4,7 @@ Orchestrates: generate → score → persist-if-passing.
 """
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import anthropic
@@ -28,6 +29,25 @@ from peermarket_agent.slack_notifier import SlackNotifier
 log = structlog.get_logger(__name__)
 
 
+def _eligible_nonzero_difference(evidence: object) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    decision = evidence.get("decision")
+    if not isinstance(decision, dict) or decision.get("eligible") is not True:
+        return False
+    outcome = decision.get("outcome")
+    if not isinstance(outcome, dict):
+        return False
+    raw_difference = outcome.get("absolute_difference")
+    if isinstance(raw_difference, bool) or raw_difference is None:
+        return False
+    try:
+        difference = Decimal(str(raw_difference))
+    except (InvalidOperation, ValueError):
+        return False
+    return difference.is_finite() and difference != 0
+
+
 async def recent_relevant_learnings(
     engine: AsyncEngine,
     *,
@@ -42,16 +62,13 @@ async def recent_relevant_learnings(
             (
                 await conn.execute(
                     text(
-                        "SELECT text FROM learnings WHERE "
+                        "SELECT text, evidence_links FROM learnings WHERE "
                         "split_part(scope, ':', 1) IN ('delivery', 'conversion') "
                         "AND split_part(scope, ':', 2)=:channel "
                         "AND split_part(scope, ':', 3)=:objective "
                         "AND split_part(scope, ':', 4)=:language "
                         "AND split_part(scope, ':', 5)=:audience "
-                        "AND evidence_links->'decision'->>'eligible'='true' "
-                        "AND trim(BOTH '0.' FROM COALESCE("
-                        "evidence_links->'decision'->'outcome'->>'absolute_difference', ''))<>'' "
-                        "ORDER BY id DESC LIMIT 5"
+                        "ORDER BY id DESC LIMIT 25"
                     ),
                     {
                         "channel": channel,
@@ -61,10 +78,12 @@ async def recent_relevant_learnings(
                     },
                 )
             )
-            .scalars()
+            .mappings()
             .all()
         )
-    return tuple(rows)
+    return tuple(
+        row["text"] for row in rows if _eligible_nonzero_difference(row["evidence_links"])
+    )[:5]
 
 
 def _human_cta_to_meta_enum(human: str) -> str:

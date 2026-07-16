@@ -331,6 +331,46 @@ async def test_meta_prompt_defensively_excludes_neutral_tie_learning(prepared_db
     assert learnings == ()
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        False,
+        "",
+        "wat",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "0",
+        "0.00",
+        "-0.00",
+        "0e0",
+        "0E-10",
+    ],
+)
+def test_learning_difference_filter_rejects_missing_malformed_nonfinite_and_zero(value):
+    from peermarket_agent.agent.cli_draft import _eligible_nonzero_difference
+
+    evidence = {"decision": {"eligible": True, "outcome": {"absolute_difference": value}}}
+    assert _eligible_nonzero_difference(evidence) is False
+
+
+@pytest.mark.parametrize("value", ["0.01", "-0.01", "1e-10", 2, 0.5])
+def test_learning_difference_filter_accepts_finite_mathematical_nonzero(value):
+    from peermarket_agent.agent.cli_draft import _eligible_nonzero_difference
+
+    evidence = {"decision": {"eligible": True, "outcome": {"absolute_difference": value}}}
+    assert _eligible_nonzero_difference(evidence) is True
+
+
+def test_learning_difference_filter_requires_boolean_true_eligibility():
+    from peermarket_agent.agent.cli_draft import _eligible_nonzero_difference
+
+    evidence = {"decision": {"eligible": "true", "outcome": {"absolute_difference": "0.01"}}}
+    assert _eligible_nonzero_difference(evidence) is False
+
+
 async def test_run_draft_credit_low_dms_founder_and_reraises(prepared_db):
     """Anthropic credit-low errors trigger Slack DM and propagate."""
     import httpx

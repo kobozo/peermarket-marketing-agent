@@ -73,3 +73,17 @@ Strict TDD covered the last Important and Minor findings:
 - Focused pure, database, prompt, and formatting coverage passed 67 tests.
 - Full suite passed 454 tests in 53.00s; final defensive focused coverage
   passed 5 tests, with Ruff, format, and diff checks clean.
+
+## Decimal-safe retrieval follow-up
+
+- RED: 19 parser-matrix cases failed because the defensive filter was an SQL
+  string-trim heuristic and no pure numeric decision function existed.
+- GREEN: retrieval now reads at most the 25 newest exact-dimension candidates,
+  parses `decision.outcome.absolute_difference` with `Decimal` in Python, and
+  returns at most five prompt learnings.
+- The filter requires JSON boolean `eligible=true`; rejects missing values,
+  booleans, malformed text, NaN, positive/negative Infinity, and every tested
+  mathematical zero representation (`0`, `0.00`, `-0.00`, `0e0`, `0E-10`);
+  and accepts only finite, mathematically non-zero decimal values.
+- Focused parser, bounded retrieval, and prompt coverage passed 21 tests.
+- Full suite passed 473 tests in 53.90s; Ruff, format, and diff checks passed.
