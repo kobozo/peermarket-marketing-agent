@@ -58,12 +58,16 @@ def classify_delivery(
         return "rejected_or_error"
     if observed_states & _TERMINAL_STATES:
         return "terminal"
-    if observed_states & _REVIEW_STATES:
-        return "reviewing"
 
     configured_states = {
         str(resource.get("status", "")).upper() for resource in resources if resource.get("status")
     }
+    if configured_states == {"ACTIVE"} and any(
+        not resource.get("effective_status") for resource in resources
+    ):
+        return "unknown"
+    if observed_states & _REVIEW_STATES:
+        return "reviewing"
     effective_states = {
         str(resource.get("effective_status", "")).upper()
         for resource in resources

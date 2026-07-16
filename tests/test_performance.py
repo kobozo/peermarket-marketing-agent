@@ -101,3 +101,13 @@ def test_grace_comparison_rejects_naive_datetimes(field):
 
     with pytest.raises(ValueError, match="timezone-aware"):
         classify_delivery(ACTIVE, {}, values["published_at"], values["now"], 2)
+
+
+@pytest.mark.parametrize("missing_value", [None, ""])
+def test_configured_active_with_missing_effective_status_is_unknown(missing_value):
+    statuses = {
+        **ACTIVE,
+        "ad": {"status": "ACTIVE", "effective_status": missing_value},
+    }
+
+    assert classify_delivery(statuses, {"impressions": 10}, NOW, NOW, 2) == "unknown"
