@@ -1,107 +1,79 @@
-# Task 2 Report: Meta Activate, Verify, and Roll Back
+# Task 2 report: Read-only Meta Insights client
 
 ## Status
 
-Complete. Connector-level creation, activation, verification, and rollback primitives are implemented without adding activation orchestration to the pipeline.
+Complete. Implemented and committed the read-only Meta Insights adapter without pushing or touching production.
+
+Commit: `3f2d7e7 feat: collect normalized Meta Insights`
 
 ## TDD evidence
 
-### RED
+- RED: `uv run pytest -q tests/test_meta_insights.py` failed during collection with the expected `ModuleNotFoundError: No module named 'peermarket_agent.meta_insights'`.
+- GREEN: after the minimum implementation, the focused suite reported `8 passed in 0.11s`.
+- Post-format GREEN: the focused suite again reported `8 passed in 0.11s`.
 
-- Added ordered activation and accepted-review-state tests first.
-- Added activation-failure rollback and structured-error tests first.
-- `uv run pytest tests/test_meta_ads.py -q` failed during collection because `MetaActivationResult` and the activation interfaces did not exist.
-- During self-review, added a credential-redaction regression test. It failed because the rollback exception exposed the configured system-user token.
+## Implemented contract
 
-### GREEN
+- Frozen `MetaInsightSnapshot` with exact date window and UTC `retrieved_at`.
+- `async fetch_meta_insights(...)` delegates Meta SDK initialization, the read-only `Ad.get_insights` call, and paginated cursor consumption to `asyncio.to_thread`.
+- Exact delivery fields requested; paginated counters and action arrays normalized and summed.
+- Missing fields/actions normalize to zero; ratio fields use denominator guards.
+- Spend and derived currency metrics use `Decimal` and half-up cent rounding.
+- Transient/rate-limit failures use bounded exponential backoff with at most three attempts.
+- Permanent failures are not retried.
+- `MetaInsightsError.transient` is exposed while messages contain only sanitized code/type/status metadata, never raw SDK messages or credentials.
+- No Meta mutation API is imported or called.
 
-- Renamed the paused creation interface to `create_meta_ad_paused(...)` and mechanically updated its existing import/call sites.
-- Added `MetaActivationResult`, preserving configured and effective status values separately for campaign, ad set, and ad.
-- Added `activate_meta_ad(config, ids)` with campaign → ad set → ad activation ordering.
-- Added `get_meta_ad_statuses(config, ids)` using explicit `status` and `effective_status` reads.
-- Accepted `ACTIVE`, `IN_PROCESS`, and `PENDING_REVIEW` as valid effective states only when configured status is `ACTIVE`.
-- Added `pause_meta_ad(config, ids)` with best-effort ad → ad set → campaign ordering.
-- Activation failures now report phase, resource IDs, observed statuses, and rollback errors while excluding configured credentials.
-- All synchronous Meta SDK operations remain inside `asyncio.to_thread` at the async boundary.
-- Resource creation remains fully `PAUSED`; no pipeline activation/reconciliation orchestration was added.
+## Tests
 
-## Self-review
+SDK-boundary mocks prove:
 
-- Confirmed no changes to `publications.py` or its Task 1 interfaces.
-- Confirmed activation does not create or retry a hierarchy.
-- Confirmed rollback continues after an individual pause failure.
-- Confirmed verification rejects non-`ACTIVE` configured state and effective states outside the explicit allowlist.
-- Confirmed the only pipeline change is the required paused-creator symbol rename; behavior remains unchanged.
-- Added token redaction after identifying that SDK rollback exception text could contain credentials.
+- missing-field/action and Decimal normalization;
+- multi-page aggregation and per-action summing;
+- exact fields, date window, UTC retrieval timestamp, and frozen snapshot;
+- transient recovery on the third attempt;
+- rate-limit exhaustion at exactly three attempts;
+- permanent no-retry and credential redaction;
+- denominator guards for ratios;
+- rejection of attempt counts above the hard bound before SDK access.
 
 ## Verification
 
-- `uv run pytest tests/test_meta_ads.py -q` → `14 passed`
-- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
-- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `148 passed`
-- `git diff --check` → clean
+- `uv run pytest -q tests/test_meta_insights.py` -> `8 passed`
+- `uv run ruff format --check src/peermarket_agent/meta_insights.py tests/test_meta_insights.py` -> 2 files already formatted
+- `uv run ruff check src/peermarket_agent/meta_insights.py tests/test_meta_insights.py` -> all checks passed
+- `git diff --check` -> clean
+- staged diff before commit contained exactly the two requested source/test files
 
-## Initial activation setup follow-up
+## Self-review
 
-### RED
+No blocking findings. Scope is restricted to collection/normalization, credentials are passed only to SDK initialization, cursor iteration remains off the event loop, and retry classification does not retry permanent permission/configuration errors.
 
-- Added a regression where the first SDK initialization attempt raises a diagnostic containing the system-user token, and every rollback initialization attempt fails the same way.
-- Focused tests failed because initial `_init_api` ran outside the activation error boundary and escaped as a raw credential-bearing `RuntimeError`.
+## Important review findings follow-up
 
-### GREEN
+All three Important findings were fixed with regression-first TDD.
 
-- Credential validation and initial SDK initialization now run inside the structured activation boundary with phase `setup`.
-- A setup failure retains the supplied resource IDs, records empty observed statuses when status reads cannot initialize, and captures the sanitized rollback setup diagnostic.
-- The structured `MetaAdsError` is constructed during handling but raised only after leaving the original exception handler, eliminating both explicit `__cause__` and implicit `__context__` credential leakage.
-- Existing parent-to-child activation, explicit status verification, and child-to-parent rollback ordering are unchanged.
+### RED evidence
 
-### Verification
+After adding the three regression cases, `uv run pytest -q tests/test_meta_insights.py` reported `3 failed, 7 passed`:
 
-- `uv run pytest tests/test_meta_ads.py -q` → `18 passed`
-- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
-- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `152 passed`
-- `git diff --check` → clean
+- caller mutation changed `snapshot.actions`;
+- deterministic concurrent initialization cross-bound the first ad to the second token through the SDK global default;
+- attacker-controlled `api_error_type` content surfaced credentials in `MetaInsightsError`.
 
-## Concerns
+### Fixes
 
-None blocking. Pipeline-level reconciliation and activation invocation remain intentionally deferred to the later orchestration task.
+- `MetaInsightSnapshot.actions` is now an immutable `Mapping`; `__post_init__` takes a defensive `dict` copy and wraps it in `MappingProxyType`.
+- The worker captures the concrete API returned by `FacebookAdsApi.init` and injects it into `Ad(ad_id, api=api)`. The installed SDK implementation was inspected to confirm `init` returns that API instance.
+- Error messages now contain only a closed, normalized category and integer code. Arbitrary SDK type/message metadata is never interpolated.
+- Sanitized errors are raised after leaving the `except` handler, preventing the credential-bearing source exception from being retained as `__context__`; tests also prove no `__cause__` remains.
 
-## Security follow-up
+### GREEN evidence
 
-### RED
+- Focused suite after implementation: `10 passed in 0.12s`.
+- Fresh suite after formatting/import fixes: `10 passed in 0.13s`.
+- Ruff format check: both files already formatted.
+- Ruff lint: all checks passed.
+- `git diff --check`: clean.
 
-- Added a regression whose activation SDK exception contained the configured system-user token and inspected both `MetaAdsError.__cause__` and the formatted chained traceback. Focused tests failed because the original `RuntimeError` remained attached as `__cause__`.
-- Added a regression with two-character app secret and system-user token values embedded as standalone diagnostic values. Focused tests failed because the previous minimum-length guard left both credentials visible.
-
-### GREEN
-
-- Activation now raises its sanitized structured `MetaAdsError` with `from None`, suppressing the credential-bearing SDK exception from chained tracebacks and leaving no explicit cause.
-- Added centralized credential redaction for every non-empty configured app secret and system-user token. Longer credentials use exact literal replacement; short credentials use token-boundary matching so standalone secret values are removed without corrupting ordinary words that merely contain the same characters.
-- Focused connector tests now pass with 16 tests, including both security regressions.
-
-### Verification
-
-- `uv run pytest tests/test_meta_ads.py -q` → `16 passed`
-- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
-- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `150 passed`
-- `git diff --check` → clean
-
-## Rollback setup follow-up
-
-### RED
-
-- Added a regression where ad-set activation fails, status observation succeeds, and rollback API initialization then raises a diagnostic containing the system-user token.
-- Focused tests failed because the rollback initialization exception escaped, replaced the required structured activation `MetaAdsError`, retained implicit exception context, and exposed the credential.
-
-### GREEN
-
-- Rollback credential/API initialization is now contained as a sanitized `rollback_errors["setup"]` entry, preserving the original activation phase, IDs, and observed statuses.
-- Resource construction and pause updates now execute independently in ad → ad set → campaign order, so a constructor or update failure is sanitized and does not prevent remaining rollback attempts.
-- The final structured activation error remains raised with suppressed chaining, so rollback setup diagnostics cannot reintroduce a credential-bearing cause or traceback.
-
-### Verification
-
-- `uv run pytest tests/test_meta_ads.py -q` → `17 passed`
-- `uv run ruff check src/peermarket_agent/meta_ads.py src/peermarket_agent/meta_pipeline.py tests/test_meta_ads.py tests/test_meta_pipeline.py` → `All checks passed!`
-- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q` → `151 passed`
-- `git diff --check` → clean
+No API, production, push, or Meta mutation action was performed.

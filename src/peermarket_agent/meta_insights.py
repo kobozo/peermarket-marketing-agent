@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any
 
 from facebook_business.adobjects.ad import Ad
@@ -48,7 +49,10 @@ class MetaInsightSnapshot:
     cpc_cents: int | None
     cpm_cents: int | None
     frequency: Decimal | None
-    actions: dict[str, int]
+    actions: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "actions", MappingProxyType(dict(self.actions)))
 
 
 class MetaInsightsError(RuntimeError):
@@ -69,20 +73,18 @@ def _call_error_attribute(error: Exception, name: str) -> Any:
     return value
 
 
-def _error_details(error: Exception) -> tuple[int | None, str | None, int | None]:
+def _error_details(error: Exception) -> tuple[int | None, int | None]:
     code = _call_error_attribute(error, "api_error_code")
-    error_type = _call_error_attribute(error, "api_error_type")
     status = _call_error_attribute(error, "http_status")
     return (
         code if isinstance(code, int) else None,
-        error_type if isinstance(error_type, str) else None,
         status if isinstance(status, int) else None,
     )
 
 
 def _is_transient(error: Exception) -> bool:
     explicitly_transient = _call_error_attribute(error, "api_transient_error")
-    code, _, status = _error_details(error)
+    code, status = _error_details(error)
     return bool(
         explicitly_transient
         or code in _RATE_LIMIT_CODES
@@ -92,10 +94,26 @@ def _is_transient(error: Exception) -> bool:
     )
 
 
+def _error_category(error: Exception, *, transient: bool) -> str:
+    code, status = _error_details(error)
+    if code == 190:
+        return "authentication"
+    if code in {10, 200, 294}:
+        return "permission"
+    if code in _RATE_LIMIT_CODES or status == 429:
+        return "rate_limit"
+    if status is not None and status >= 500:
+        return "server"
+    if transient:
+        return "transient"
+    return "unknown"
+
+
 def _sanitized_error(error: Exception, *, transient: bool) -> MetaInsightsError:
-    code, error_type, status = _error_details(error)
+    code, _ = _error_details(error)
+    category = _error_category(error, transient=transient)
     return MetaInsightsError(
-        f"Meta Insights request failed (code={code}, type={error_type}, status={status})",
+        f"Meta Insights request failed (category={category}, code={code})",
         transient=transient,
     )
 
@@ -143,12 +161,12 @@ def _fetch_rows(
     start: date,
     stop: date,
 ) -> list[Mapping[str, object]]:
-    FacebookAdsApi.init(
+    api = FacebookAdsApi.init(
         app_id=config.app_id,
         app_secret=config.app_secret,
         access_token=config.system_user_token,
     )
-    cursor = Ad(ad_id).get_insights(
+    cursor = Ad(ad_id, api=api).get_insights(
         fields=_FIELDS,
         params={
             "time_range": {"since": start.isoformat(), "until": stop.isoformat()},
@@ -223,15 +241,16 @@ async def fetch_meta_insights(
         raise ValueError("max_attempts must be between 1 and 3")
 
     for attempt in range(1, max_attempts + 1):
+        failure: MetaInsightsError | None = None
         try:
             rows = await asyncio.to_thread(_fetch_rows, config, ad_id, start, stop)
             return _normalize(rows, ad_id=ad_id, start=start, stop=stop)
         except Exception as error:
-            if isinstance(error, MetaInsightsError):
-                raise
             transient = _is_transient(error)
             if not transient or attempt == max_attempts:
-                raise _sanitized_error(error, transient=transient) from None
-            await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 1.0))
+                failure = _sanitized_error(error, transient=transient)
+        if failure is not None:
+            raise failure
+        await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 1.0))
 
     raise AssertionError("unreachable")

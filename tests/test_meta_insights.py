@@ -1,12 +1,15 @@
+import asyncio
 from dataclasses import FrozenInstanceError
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from threading import Barrier
 
 import pytest
 
 from peermarket_agent.meta_ads import MetaConfig
 from peermarket_agent.meta_insights import (
     MetaInsightsError,
+    MetaInsightSnapshot,
     fetch_meta_insights,
 )
 
@@ -68,11 +71,16 @@ def meta_api(monkeypatch):
         requests = []
         initialized_with = []
 
+    class BoundApi:
+        def __init__(self, access_token):
+            self.access_token = access_token
+
     api = MetaApi()
 
     class FakeAd:
-        def __init__(self, ad_id):
+        def __init__(self, ad_id, api=None):
             self.ad_id = ad_id
+            self.api = api
 
         def get_insights(self, *, fields, params):
             api.calls += 1
@@ -84,7 +92,7 @@ def meta_api(monkeypatch):
     monkeypatch.setattr("peermarket_agent.meta_insights.Ad", FakeAd)
     monkeypatch.setattr(
         "peermarket_agent.meta_insights.FacebookAdsApi.init",
-        lambda **kwargs: api.initialized_with.append(kwargs),
+        lambda **kwargs: api.initialized_with.append(kwargs) or BoundApi(kwargs["access_token"]),
     )
     monkeypatch.setattr("peermarket_agent.meta_insights.asyncio.sleep", _no_sleep)
     return api
@@ -186,6 +194,71 @@ async def test_fetch_uses_exact_fields_window_and_utc_retrieval_time(meta_api):
         snapshot.ad_id = "changed"
 
 
+def test_snapshot_actions_are_deeply_immutable_and_defensively_copied():
+    source_actions = {"landing_page_view": 3}
+    snapshot = MetaInsightSnapshot(
+        ad_id="ad-1",
+        window_start=START,
+        window_stop=STOP,
+        retrieved_at=datetime(2026, 7, 16, tzinfo=UTC),
+        spend_cents=217,
+        impressions=100,
+        reach=80,
+        clicks=8,
+        inline_link_clicks=5,
+        outbound_clicks=3,
+        landing_page_views=3,
+        ctr=Decimal("8"),
+        cpc_cents=27,
+        cpm_cents=2170,
+        frequency=Decimal("1.25"),
+        actions=source_actions,
+    )
+
+    source_actions["landing_page_view"] = 99
+
+    assert snapshot.actions == {"landing_page_view": 3}
+    with pytest.raises(TypeError):
+        snapshot.actions["landing_page_view"] = 4
+
+
+async def test_concurrent_fetches_bind_each_ad_to_its_own_initialized_api(monkeypatch):
+    barrier = Barrier(2)
+    global_default = {"api": None}
+
+    class BoundApi:
+        def __init__(self, token):
+            self.token = token
+
+    def fake_init(**kwargs):
+        api = BoundApi(kwargs["access_token"])
+        global_default["api"] = api
+        barrier.wait(timeout=2)
+        return api
+
+    class FakeAd:
+        def __init__(self, ad_id, api=None):
+            self.ad_id = ad_id
+            self.api = api if api is not None else global_default["api"]
+
+        def get_insights(self, *, fields, params):
+            del fields, params
+            return [{"actions": [{"action_type": self.api.token, "value": "1"}]}]
+
+    monkeypatch.setattr("peermarket_agent.meta_insights.FacebookAdsApi.init", fake_init)
+    monkeypatch.setattr("peermarket_agent.meta_insights.Ad", FakeAd)
+    first = MetaConfig("app", "secret", "token-ad-1", "act_1", "page")
+    second = MetaConfig("app", "secret", "token-ad-2", "act_1", "page")
+
+    first_snapshot, second_snapshot = await asyncio.gather(
+        fetch_meta_insights(first, "ad-1", START, STOP),
+        fetch_meta_insights(second, "ad-2", START, STOP),
+    )
+
+    assert first_snapshot.actions == {"token-ad-1": 1}
+    assert second_snapshot.actions == {"token-ad-2": 1}
+
+
 async def test_transient_failure_retries_at_most_three_attempts(meta_api):
     meta_api.failures = [
         FakeMetaError("temporary", transient=True),
@@ -216,7 +289,7 @@ async def test_permanent_failure_is_not_retried_and_credentials_are_redacted(met
         FakeMetaError(
             "bad token secret-token and super-secret",
             code=190,
-            error_type="OAuthException",
+            error_type="OAuthException secret-token super-secret",
             status=400,
         )
     ]
@@ -230,7 +303,10 @@ async def test_permanent_failure_is_not_retried_and_credentials_are_redacted(met
     assert "secret-token" not in message
     assert "super-secret" not in message
     assert "bad token" not in message
-    assert message == "Meta Insights request failed (code=190, type=OAuthException, status=400)"
+    assert "OAuthException" not in message
+    assert message == "Meta Insights request failed (category=authentication, code=190)"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 async def test_empty_denominators_produce_no_ratio_metrics(meta_api):
