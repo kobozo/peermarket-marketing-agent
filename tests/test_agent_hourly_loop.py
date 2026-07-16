@@ -85,6 +85,23 @@ async def _publication(engine, draft_id, ad_id, *, published_at=None):
         )
 
 
+async def _attribution_alert(engine):
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT state, claim FROM operational_alert_state "
+                        "WHERE alert_key='aggregate_attribution_availability'"
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    return dict(row or {"state": {}, "claim": {}})
+
+
 def _settings(**overrides):
     values = dict(
         meta_insights_enabled=True,
@@ -359,12 +376,9 @@ async def test_attribution_alert_delivery_failure_remains_retryable(
     settings = _settings(peermarket_attribution_enabled=True)
 
     await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
-    async with engine.connect() as conn:
-        after_failure = (
-            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=156"))
-        ).scalar_one()
-    assert "attribution_alert_state" not in after_failure
-    assert "attribution_alert_claim" not in after_failure
+    after_failure = await _attribution_alert(engine)
+    assert after_failure["state"] == {}
+    assert after_failure["claim"] == {}
     await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
 
     assert notifier.notify_founder.await_count == 2
@@ -397,3 +411,38 @@ async def test_concurrent_collectors_claim_one_attribution_sender(engine, monkey
     )
 
     notifier.notify_founder.assert_awaited_once()
+
+
+async def test_attribution_outage_survives_publication_lifecycle_and_recovers_once(
+    engine, monkeypatch
+):
+    await _publication(engine, 156, "ad-1")
+    await _publication(engine, 157, "ad-2")
+    peermarket = AsyncMock()
+    peermarket.fetch_attribution.side_effect = PermissionError("denied")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(side_effect=lambda config, ad_id, start, stop: _snapshot(ad_id)),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+    settings = _settings(peermarket_attribution_enabled=True)
+
+    await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE publications SET state='terminal' WHERE draft_id=156"))
+    await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
+
+    notifier.notify_founder.assert_awaited_once()
+
+    peermarket.fetch_attribution.side_effect = None
+    peermarket.fetch_attribution.return_value = []
+    await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
+    await collect_meta_performance(engine, settings, peermarket, notifier, now=NOW)
+
+    assert notifier.notify_founder.await_count == 2
+    assert "recovered" in notifier.notify_founder.await_args.args[0].lower()

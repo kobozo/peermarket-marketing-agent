@@ -157,11 +157,7 @@ async def _claim_alert(
                 and state.get("observed_state") == observed_state
             ):
                 return None
-            message = (
-                "Aggregate attribution unavailable; Meta collection continued"
-                if namespace == "attribution_alert"
-                else f"Meta delivery problem: {condition}"
-            )
+            message = f"Meta delivery problem: {condition}"
         else:
             if state.get("active") is not True:
                 return None
@@ -248,6 +244,116 @@ async def _send_claimed_alert(
     )
 
 
+async def _claim_operational_alert(
+    engine: AsyncEngine, *, active: bool, now: datetime
+) -> tuple[str, str] | None:
+    """Claim the singleton aggregate-attribution availability transition."""
+    alert_key = "aggregate_attribution_availability"
+    condition = "aggregate_attribution_unavailable" if active else "available"
+    observed_state = {"available": not active}
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO operational_alert_state (alert_key) VALUES (:alert_key) "
+                "ON CONFLICT (alert_key) DO NOTHING"
+            ),
+            {"alert_key": alert_key},
+        )
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT state, claim FROM operational_alert_state "
+                        "WHERE alert_key=:alert_key FOR UPDATE"
+                    ),
+                    {"alert_key": alert_key},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        state = dict(row["state"] or {})
+        claim = dict(row["claim"] or {})
+        claimed_at = _claimed_at(claim)
+        if claimed_at is not None and now - claimed_at < _ALERT_CLAIM_LEASE:
+            return None
+        if active:
+            if state.get("active") is True and state.get("condition") == condition:
+                return None
+            message = "Aggregate attribution unavailable; Meta collection continued"
+        else:
+            if state.get("active") is not True:
+                return None
+            message = "Aggregate attribution recovered"
+        token = str(uuid4())
+        claim = {
+            "claim_token": token,
+            "claimed_at": now.isoformat(),
+            "condition": condition,
+            "observed_state": observed_state,
+            "active": active,
+        }
+        await conn.execute(
+            text(
+                "UPDATE operational_alert_state SET claim=CAST(:claim AS JSONB), "
+                "updated_at=NOW() WHERE alert_key=:alert_key"
+            ),
+            {"alert_key": alert_key, "claim": json.dumps(claim)},
+        )
+    return token, message
+
+
+async def _finish_operational_alert(
+    engine: AsyncEngine, *, token: str, delivered: bool, now: datetime
+) -> None:
+    alert_key = "aggregate_attribution_availability"
+    async with engine.begin() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT state, claim FROM operational_alert_state "
+                        "WHERE alert_key=:alert_key FOR UPDATE"
+                    ),
+                    {"alert_key": alert_key},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return
+        claim = dict(row["claim"] or {})
+        if claim.get("claim_token") != token:
+            return
+        state = dict(row["state"] or {})
+        if delivered:
+            state = {
+                "condition": claim["condition"],
+                "observed_state": claim["observed_state"],
+                "active": claim["active"],
+                "delivered_at": now.isoformat(),
+            }
+        await conn.execute(
+            text(
+                "UPDATE operational_alert_state SET state=CAST(:state AS JSONB), "
+                "claim='{}'::JSONB, updated_at=NOW() WHERE alert_key=:alert_key"
+            ),
+            {"alert_key": alert_key, "state": json.dumps(state)},
+        )
+
+
+async def _send_attribution_availability_alert(
+    engine: AsyncEngine, notifier, *, unavailable: bool, now: datetime
+) -> None:
+    claimed = await _claim_operational_alert(engine, active=unavailable, now=now)
+    if claimed is None:
+        return
+    token, message = claimed
+    delivered = await _deliver(notifier, message)
+    await _finish_operational_alert(engine, token=token, delivered=delivered, now=now)
+
+
 async def collect_meta_performance(
     engine: AsyncEngine, settings, peermarket, notifier, now: datetime | None = None
 ) -> CollectionResult:
@@ -324,16 +430,9 @@ async def collect_meta_performance(
                 log.warning("hourly_meta.failure_diagnostic_not_saved", draft_id=draft_id)
             failed.append(draft_id)
 
-    if attribution_error and publications:
-        await _send_claimed_alert(
-            engine,
-            publications[0]["draft_id"],
-            notifier,
-            namespace="attribution_alert",
-            condition="aggregate_attribution_unavailable",
-            observed_state={"available": False},
-            active=True,
-            now=now,
+    if settings.peermarket_attribution_enabled:
+        await _send_attribution_availability_alert(
+            engine, notifier, unavailable=attribution_error, now=now
         )
     return CollectionResult(updated=updated, failed=failed)
 

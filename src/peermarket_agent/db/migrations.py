@@ -311,6 +311,12 @@ _STEPS: list[str] = [
          )""",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_draft_id_unique "
     "ON publications (draft_id) WHERE draft_id IS NOT NULL",
+    """CREATE TABLE IF NOT EXISTS operational_alert_state (
+        alert_key TEXT PRIMARY KEY,
+        state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        claim JSONB NOT NULL DEFAULT '{}'::JSONB,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
