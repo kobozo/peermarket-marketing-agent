@@ -2,24 +2,36 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import click
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from peermarket_agent.config import get_settings
 from peermarket_agent.mcp_servers.peermarket_readonly import PeermarketReadonly
 from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
 
+_CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+
+
+@asynccontextmanager
+async def readonly_connection(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
+    """Open a PostgreSQL transaction that rejects every write statement."""
+    async with engine.begin() as connection:
+        await connection.execute(text("SET TRANSACTION READ ONLY"))
+        yield connection
+
 
 async def read_publication(dsn: str, draft_id: int) -> dict[str, Any] | None:
     """Read the minimum publication fields needed by the verifier."""
     engine = create_async_engine(dsn, future=True, pool_pre_ping=True)
     try:
-        async with engine.connect() as connection:
+        async with readonly_connection(engine) as connection:
             row = (
                 (
                     await connection.execute(
@@ -83,9 +95,13 @@ def _safe_statuses(statuses: dict) -> dict:
     }
 
 
-def _snapshot_is_fresh(publication: dict, now: datetime, lookback_days: int) -> bool:
-    stored = (publication.get("performance") or {}).get("meta") or {}
-    value = stored.get("last_successful_retrieval")
+def _snapshot_is_fresh(
+    value: object,
+    now: datetime,
+    *,
+    max_age_hours: int,
+    clock_skew_tolerance: timedelta = _CLOCK_SKEW_TOLERANCE,
+) -> bool:
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value)
@@ -93,7 +109,25 @@ def _snapshot_is_fresh(publication: dict, now: datetime, lookback_days: int) -> 
             return False
     if not isinstance(value, datetime) or value.tzinfo is None:
         return False
-    return now - value.astimezone(UTC) <= timedelta(days=lookback_days)
+    age = now - value.astimezone(UTC)
+    return -clock_skew_tolerance <= age <= timedelta(hours=max_age_hours)
+
+
+def _verification_failures(report: dict[str, Any]) -> list[str]:
+    if report.get("publication_read_available") is False:
+        return ["publication_read_failed"]
+    if report.get("publication_exists") is False:
+        return ["publication_missing"]
+    failures = []
+    flags = report["feature_flags"]
+    if flags["meta_insights_enabled"]:
+        if report["meta_status"] != "available":
+            failures.append("meta_unavailable")
+        elif not report["snapshot_fresh"]:
+            failures.append("snapshot_stale")
+    if flags["peermarket_attribution_enabled"] and report["attribution_status"] != "available":
+        failures.append("attribution_unavailable")
+    return failures
 
 
 async def verify_draft(draft_id: int) -> dict[str, Any]:
@@ -108,6 +142,10 @@ async def verify_draft(draft_id: int) -> dict[str, Any]:
         "publication_exists": False,
         "meta_available": False,
         "attribution_available": False,
+        "meta_status": "unavailable" if settings.meta_insights_enabled else "disabled",
+        "attribution_status": (
+            "unavailable" if settings.peermarket_attribution_enabled else "disabled"
+        ),
         "snapshot_fresh": False,
     }
     try:
@@ -132,30 +170,43 @@ async def verify_draft(draft_id: int) -> dict[str, Any]:
         "external_ids": ids,
     }
     now = datetime.now(UTC)
+    last_retrieval = ((publication.get("performance") or {}).get("meta") or {}).get(
+        "last_successful_retrieval"
+    )
     report["snapshot_fresh"] = _snapshot_is_fresh(
-        publication, now, settings.meta_insights_lookback_days
+        last_retrieval,
+        now,
+        max_age_hours=settings.meta_no_delivery_grace_hours,
     )
     stop = now.date()
     start = stop - timedelta(days=settings.meta_insights_lookback_days - 1)
 
-    try:
-        statuses = await read_meta_statuses(_meta_config(settings), ids)
-        snapshot = await read_meta_insights(_meta_config(settings), ids["ad_id"], start, stop)
-        report["meta_available"] = True
-        report["meta_statuses"] = _safe_statuses(statuses)
-        report["meta_counts"] = {
-            "impressions": int(snapshot.impressions),
-            "landing_page_views": int(snapshot.landing_page_views),
-        }
-    except Exception:
-        pass
+    if settings.meta_insights_enabled:
+        try:
+            statuses = await read_meta_statuses(_meta_config(settings), ids)
+            snapshot = await read_meta_insights(_meta_config(settings), ids["ad_id"], start, stop)
+            report["meta_available"] = True
+            report["meta_status"] = "available"
+            report["meta_statuses"] = _safe_statuses(statuses)
+            report["meta_counts"] = {
+                "impressions": int(snapshot.impressions),
+                "landing_page_views": int(snapshot.landing_page_views),
+            }
+        except Exception:
+            pass
 
-    try:
-        aggregates = await read_attribution(settings.peermarket_prod_db_readonly_url, start, stop)
-        report["attribution_available"] = True
-        report["attribution_counts"] = {"events": sum(int(row.event_count) for row in aggregates)}
-    except Exception:
-        pass
+    if settings.peermarket_attribution_enabled:
+        try:
+            aggregates = await read_attribution(
+                settings.peermarket_prod_db_readonly_url, start, stop
+            )
+            report["attribution_available"] = True
+            report["attribution_status"] = "available"
+            report["attribution_counts"] = {
+                "events": sum(int(row.event_count) for row in aggregates)
+            }
+        except Exception:
+            pass
     return report
 
 
@@ -168,7 +219,11 @@ def cli() -> None:
 @click.option("--draft-id", required=True, type=click.IntRange(min=1))
 def verify(draft_id: int) -> None:
     """Verify live read paths and snapshot freshness for one publication."""
-    click.echo(json.dumps(asyncio.run(verify_draft(draft_id)), sort_keys=True))
+    report = asyncio.run(verify_draft(draft_id))
+    click.echo(json.dumps(report, sort_keys=True))
+    failures = _verification_failures(report)
+    if failures:
+        raise click.ClickException("verification failed: " + ", ".join(failures))
 
 
 if __name__ == "__main__":
