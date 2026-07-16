@@ -241,16 +241,16 @@ EVENT_TYPES = {
 def record_campaign_event(db, touch, event_type, dedupe_key, user_id=None) -> bool:
     if event_type not in EVENT_TYPES:
         raise ValueError("unsupported campaign event")
-    db.add(CampaignEvent(
-        touch_id=touch.id, user_id=user_id, event_type=event_type,
-        dedupe_key=dedupe_key, created_at=datetime.now(timezone.utc),
-    ))
-    try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        return False
-    return True
+    result = db.execute(
+        postgresql.insert(CampaignEvent)
+        .values(
+            touch_id=touch.id, user_id=user_id, event_type=event_type,
+            dedupe_key=dedupe_key, created_at=datetime.now(timezone.utc),
+        )
+        .on_conflict_do_nothing(index_elements=["dedupe_key"])
+        .returning(CampaignEvent.id)
+    )
+    return result.scalar_one_or_none() is not None
 ```
 
 Use a response middleware only to attach the cookie; keep database work in a request-scoped helper so commits remain explicit. Validate lengths and allowed characters, ignore incomplete UTM sets, sign the random ID with a dedicated salt derived from `SESSION_SECRET`, and deduplicate landing views by visitor/content/UTC day. On registration, attach the internal user ID and record exactly one registration event.
