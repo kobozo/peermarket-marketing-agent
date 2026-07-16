@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     meta_ad_account_id: str = ""  # 'act_<numeric>'
     meta_auto_activate: bool = False
     meta_page_id: str = ""
+    meta_insights_enabled: bool = False
+    peermarket_attribution_enabled: bool = False
 
     # Resend (email)
     resend_api_key: str
