@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_seo
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 _INPUT_CENTS_PER_TOKEN = 0.0003
@@ -58,12 +59,7 @@ async def generate_seo_meta(
         max_tokens=300,
     )
     payload = parse_claude_json(resp.text)
+    validate_seo(payload)
     title = payload["title"]
     description = payload["description"]
-    if len(title) > 60:
-        raise ValueError(f"title too long ({len(title)} > 60): {title!r}")
-    if not (50 <= len(description) <= 160):
-        raise ValueError(
-            f"description length out of range ({len(description)} not in 50-160): {description!r}"
-        )
     return SeoMeta(title=title, description=description, cost_cents=_cost_cents(resp))

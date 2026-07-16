@@ -15,60 +15,148 @@ export AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_tes
 uv run pytest -v
 ```
 
-## Slack video review operations
+## Slack draft revisions
 
-The Slack bridge accepts founder-uploaded recording clips only when they are
-replies in an active TikTok draft thread. It downloads the private Slack file,
-checks it with `ffprobe`, normalizes it with `ffmpeg`, and posts the review
-result back into that same thread. This is a review and intake workflow only:
-it never auto-publishes to TikTok or any other channel. A human must make the
-final publishing decision through the existing approval workflow.
+Draft approval messages are durable Slack thread roots. The agent records the
+DM channel and root timestamp only after Slack accepts the root message. A
+plain-text founder reply in that known thread is revision feedback; replies to
+unknown roots, bot messages, edits, deletes, broadcasts, empty messages, and
+messages outside the founder's DM are ignored or receive a non-mutating
+explanation.
 
-### Slack app setup
+Explicit founder decisions always take precedence over revision prose. A reply
+that matches `✅ <draft-id>` or `❌ <draft-id>` is handled as an approval or
+rejection even when posted in a thread. Only the configured founder can submit
+feedback or decisions, and only the latest queued variant in a thread can be
+decided. Feedback never grants permission to publish or spend.
 
-The bot token needs these scopes:
+Each successful revision is a new, auditable draft. `parent_draft_id` points to
+the preceding variant, `root_draft_id` remains the first draft in the thread,
+and `revision_number` increases along the lineage. Persisting the new queued
+variant, marking its predecessor `superseded`, applying its feedback records,
+and enqueueing its Slack approval reply happen in one database transaction.
+Prior variants remain immutable; a `superseded` variant cannot be approved or
+published.
 
-- `files:read` to retrieve uploaded video metadata and private download URLs.
-- `chat:write` to create draft threads and post review replies.
-- `channels:history`, `groups:history`, `im:history`, and `mpim:history` to
-  read the parent message and replies when authorizing a draft thread.
-- `app_mentions:read` and the message event subscriptions used by the bridge
-  so it can receive mentions and messages.
+The first valid reply opens a 15-second debounce window. Further replies in the
+same thread are stored idempotently and combined in Slack timestamp order. A
+database generation lease serializes work per root draft, so concurrent workers
+cannot generate two variants from the same batch. Feedback received during an
+active generation remains pending for the next batch.
 
-The app-level token needs `connections:write` for Socket Mode. Subscribe to
-`app_mention` and message events, including direct messages. The bot must be
-installed in any channel where it creates or reads a draft thread.
+Slack delivery uses a transactional outbox. Root approvals and revised thread
+approvals are claimed with leases and retried by the agent's hourly loop after
+transient failures. A failed thread post does not regenerate or roll back the
+already-persisted revision; retry sends the same outbox record to the same
+thread. Root bindings are committed only after a successful Slack post.
 
-### Environment and limits
+### Recovery and observability
 
-Copy `.env.example` to the deployment secrets file and fill in the required
-credentials. Video review settings are:
+- Confirm both `marketing-agent.service` and `slack-bridge.service` are active;
+  the former runs revision generation and outbox retries, while the latter
+  ingests Socket Mode DM events.
+- Inspect structured logs for feedback event ID, draft/root identifiers,
+  revision number, processing attempt, lease state, and sanitized failure
+  category. Credentials, raw model output, and founder PII must not be logged.
+- For a missing root approval, inspect the `slack_outbox` row and its
+  `status`, `next_attempt_at`, `last_failure_category`, and lease columns. Do
+  not manually bind a guessed Slack timestamp; allow retry to establish it.
+- For a stuck revision, inspect `draft_revision_feedback` and
+  `draft_revision_generation_leases`. Expired processing/generation leases are
+  reclaimed automatically. Preserve pending feedback and lineage instead of
+  deleting or replaying Slack events.
+- Permanent schema or brand-validation failures remain `failed` for inspection.
+  A controlled operator retry uses `retry_failed_feedback(engine, (<id>,))`;
+  it only transitions retained failed rows back to `pending`. Provider, network,
+  and database operational failures retry automatically three times with backoff.
+- Approval outbox rows are revalidated immediately before Slack posting. If the
+  target was approved, rejected, or superseded after enqueue, the row becomes
+  terminal `obsolete` without an API call. A decision racing after the final
+  check can still coincide with an already-sent message; Slack has no atomic
+  transaction with PostgreSQL, so the stored result records the observed truth.
+- After recovery, verify the lineage is `queued -> superseded -> queued` and
+  that the newest draft has one pending or delivered thread-approval outbox
+  record. Do not approve a recovery test draft or activate paid media.
 
-- `VIDEO_MEDIA_ROOT`: owner-only local storage, defaulting to
-  `data/video-media` in development. The systemd deployment uses
-  `/var/peermarket-agent/video-media`.
-- `VIDEO_MAX_FILE_BYTES`: maximum downloaded file size (default 200 MiB).
-- `VIDEO_MAX_CLIPS`: maximum clips combined for one draft (default 8).
-- `VIDEO_MAX_DURATION_SECONDS`: maximum duration per clip (default 60 seconds).
-- `VIDEO_RETENTION_DAYS`: operational retention target (default 30 days).
+Deployment continues through the existing GitHub Actions workflow. It requires
+the existing `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`, and
+`SLACK_FOUNDER_USER_ID` secrets; this feature adds no interval variable or new
+secret. The Slack app must subscribe to direct-message `message` events and
+Socket Mode must remain enabled.
 
-The service creates the configured media root with mode `0700`, owned by
-`peermarket-agent`, and refuses to start if `ffmpeg` or `ffprobe` is absent.
-Keep a configured media root below `/var/peermarket-agent` so systemd's
-write restriction continues to protect the host.
+### Replacing a terminal Meta hierarchy
 
-Retention cleanup is manual and should be performed after confirming that no
-active review needs the files, for example by removing old `draft-*` folders
-under `VIDEO_MEDIA_ROOT`. Do not add an automatic publisher or automatic
-cleanup job without an explicit operational decision and review.
+Before running any production replacement command, deploy this capability through
+a reviewed pull request and the complete GitHub Actions deployment workflow. Do
+not run the command from an unmerged branch or an ad-hoc production checkout, and
+never hand-edit production PostgreSQL to enable, reset, or repair a replacement.
 
-### Founder upload workflow
+`peermarket-meta replace-terminal-draft` is an explicit recovery command for an
+`approved` or already `published` Meta draft. Use it only when the exact stored
+campaign, ad set, creative, and ad IDs are present and the entire live hierarchy
+is terminal (`ARCHIVED` or `DELETED`). It preserves the publication's frozen
+budget; after successful activation, the replacement creates spend.
 
-1. Wait for the agent's TikTok draft message in Slack.
-2. Reply in that exact thread with one or more portrait videos (`.mp4`, `.mov`,
-   or `.webm`, matching the MIME type).
-3. The bridge acknowledges the upload asynchronously, validates and reviews
-   it in the background, and replies in the thread with the result.
-4. Review the result and use the explicit approval/rejection workflow. Uploads
-   from anyone other than `SLACK_FOUNDER_USER_ID`, or uploads outside an active
-   TikTok draft thread, are rejected.
+Operators must first inspect both Meta and PostgreSQL, then supply all four IDs
+exactly as stored:
+
+```bash
+peermarket-meta replace-terminal-draft \
+  --draft-id 156 \
+  --campaign-id 120249110304880342 \
+  --adset-id 120249110305000342 \
+  --creative-id 28047843224854442 \
+  --ad-id 120249110305530342
+```
+
+Do not blindly retry this command after a failure. Inspect the current IDs,
+draft status, publication state, and finalized replacement-history entry before
+deciding on any further operator action.
+
+### Staged Meta performance rollout
+
+Deploy performance collection disabled first. The workflow defaults both
+`META_INSIGHTS_ENABLED` and `PEERMARKET_ATTRIBUTION_ENABLED` to `false`; keep
+those repository variables false through the initial deployment. The remaining
+repository-variable defaults are a 3-day Insights lookback, the
+`Europe/Brussels` Meta account timezone, a 2-hour no-delivery grace period, a
+dedicated 2-hour snapshot freshness limit, and learning minimums of 1,000
+impressions, 30 landing-page views, and 10 registrations. These are operational
+controls, not secrets. Insights exclude the current partial account day and
+store account-calendar plus UTC-overlap identity for aggregate joins.
+
+After the reviewed workflow has deployed, use the read-only verifier against a
+known published draft:
+
+```bash
+peermarket-performance verify --draft-id 156
+```
+
+The command reads the publication, live Meta statuses and Insights, the
+aggregate-only attribution view, and stored snapshot freshness. Its JSON output
+is limited to IDs, statuses, counts, availability/freshness checks, and feature
+flags; it never prints credentials or raw attribution rows and never changes a
+Meta resource or database row.
+
+Enable `META_INSIGHTS_ENABLED` first, redeploy through GitHub Actions, wait for
+one scheduled collection, and verify that `meta_available` and `snapshot_fresh`
+are true. Review delivery counts before enabling
+`PEERMARKET_ATTRIBUTION_ENABLED`, redeploy again, and verify aggregate-view
+availability. Leave either flag false if its check is unavailable. Do not lower
+learning thresholds or enable paid-media behavior merely to make a rollout
+check pass; adjust thresholds only in a separate reviewed change backed by
+sufficient production evidence.
+
+### TikTok human-video review
+
+Approved TikTok drafts include a spoken script, shot list, overlays, and
+recording notes. Reply to the draft's Slack thread with one or more founder
+recordings. The bridge privately downloads and validates `.mp4`, `.mov`, and
+`.webm` files, normalizes and combines clips when needed, and posts Claude's
+technical/script review in the same thread. It never publishes automatically.
+
+The bot needs `files:read`, `chat:write`, relevant channel/group/IM history
+scopes, and Socket Mode `connections:write`. Configure `VIDEO_MEDIA_ROOT`,
+`VIDEO_MAX_FILE_BYTES`, `VIDEO_MAX_CLIPS`, `VIDEO_MAX_DURATION_SECONDS`, and
+`VIDEO_RETENTION_DAYS`; systemd creates the media directory with mode `0700`
+and verifies `ffmpeg` and `ffprobe`. Retention remains manual.

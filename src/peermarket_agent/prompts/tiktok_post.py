@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_tiktok
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 # Sonnet 4.6 approximate pricing: $3/M input, $15/M output → cents per token.
@@ -82,6 +83,7 @@ async def generate_tiktok_post(
         max_tokens=400,
     )
     payload = parse_claude_json(resp.text)
+    validate_tiktok(payload)
     return TikTokPost(
         hook=payload["hook"],
         body=payload["body"],

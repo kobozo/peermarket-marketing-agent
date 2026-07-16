@@ -22,7 +22,7 @@ async def test_generate_email_parses_subject_and_body():
     fake = AsyncMock()
     fake.complete = AsyncMock(
         return_value=ClaudeResponse(
-            text='{"subject": "Je hebt nog niets verkocht", "body": "Hoi, je hebt een account..."}',
+            text='{"subject": "Je hebt nog niets verkocht", "body": "Hoi ' + "woord " * 80 + '"}',
             input_tokens=250,
             output_tokens=80,
             model="claude-sonnet-4-6",
@@ -36,7 +36,7 @@ async def test_generate_email_parses_subject_and_body():
         audience="dormant_signups",
     )
     assert result.subject == "Je hebt nog niets verkocht"
-    assert result.body.startswith("Hoi")
+    assert result.body.startswith("Hoi woord")
     assert result.cost_cents >= 1
 
 

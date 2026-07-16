@@ -1,9 +1,17 @@
 """Slack outbound notifier — DMs the founder when something needs attention."""
 
+from dataclasses import dataclass
+
 import structlog
 from slack_sdk.web.async_client import AsyncWebClient
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class SlackMessageResult:
+    channel_id: str
+    ts: str
 
 
 class SlackNotifier:
@@ -30,32 +38,38 @@ class SlackNotifier:
             return False
 
     async def post_draft_thread(self, draft_id: int, text: str) -> tuple[str, str]:
-        """Post a draft's root message and return its Slack thread reference."""
-        response = await self._client.chat_postMessage(
-            channel=self._founder_user_id,
-            text=text,
-        )
-        channel_id = response["channel"]
-        message_ts = response["ts"]
-        log.info(
-            "slack_notifier.draft_thread_posted",
-            draft_id=draft_id,
-            channel_id=channel_id,
-            message_ts=message_ts,
-        )
-        return channel_id, message_ts
+        result = await self.send_message(text)
+        log.info("slack_notifier.draft_thread_posted", draft_id=draft_id, message_ts=result.ts)
+        return result.channel_id, result.ts
 
     async def post_thread_reply(self, channel_id: str, thread_ts: str, text: str) -> bool:
-        """Reply to a persisted draft thread without opening a new founder DM."""
         try:
-            await self._client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text=text,
-            )
+            await self.send_message(text, channel_id=channel_id, thread_ts=thread_ts)
             return True
         except Exception:
-            log.exception(
-                "slack_notifier.thread_reply_failed", channel_id=channel_id, thread_ts=thread_ts
-            )
+            log.exception("slack_notifier.thread_reply_failed", channel_id=channel_id, thread_ts=thread_ts)
             return False
+
+    async def send_message(
+        self,
+        text: str,
+        *,
+        channel_id: str | None = None,
+        thread_ts: str | None = None,
+    ) -> SlackMessageResult:
+        """Post a message and expose Slack's authoritative message identity.
+
+        Unlike ``notify_founder``, this delivery interface propagates failures so
+        durable callers can record and retry them.
+        """
+        channel = channel_id or self._founder_user_id
+        if not channel:
+            raise ValueError("Slack founder/channel ID is not configured")
+        kwargs = {"channel": channel, "text": text}
+        if thread_ts is not None:
+            kwargs["thread_ts"] = thread_ts
+        response = await self._client.chat_postMessage(**kwargs)
+        return SlackMessageResult(
+            channel_id=str(response["channel"]),
+            ts=str(response["ts"]),
+        )

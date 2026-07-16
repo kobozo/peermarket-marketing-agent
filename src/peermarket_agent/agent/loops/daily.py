@@ -19,9 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.agent.cli_draft import run_draft_command
 from peermarket_agent.claude import ClaudeClient
-from peermarket_agent.slack_bridge.video_events import update_draft_thread_metadata
 from peermarket_agent.slack_dm import format_draft_dm, format_summary_dm
 from peermarket_agent.slack_notifier import SlackNotifier
+from peermarket_agent.slack_outbox import enqueue_root_approval
 
 log = structlog.get_logger(__name__)
 
@@ -61,7 +61,7 @@ async def _fetch_draft_with_action_name(engine: AsyncEngine, draft_id: int) -> d
             await conn.execute(
                 text(
                     "SELECT d.id, at.name AS action_type_name, d.language, "
-                    "d.channel, d.brand_score, d.copy, d.metadata "
+                    "d.channel, d.brand_score, d.copy "
                     "FROM drafts d JOIN action_types at ON at.id = d.action_type_id "
                     "WHERE d.id = :id"
                 ),
@@ -77,7 +77,6 @@ async def _fetch_draft_with_action_name(engine: AsyncEngine, draft_id: int) -> d
         "channel": row[3],
         "brand_score": row[4],
         "copy": row[5],
-        **(row[6] or {}),
     }
 
 
@@ -102,7 +101,7 @@ async def run_daily_drafts(
     claude: ClaudeClient,
     notifier: SlackNotifier,
 ) -> int:
-    """Run Loop B once. Returns count of drafts that persisted + were DM'd."""
+    """Run Loop B once. Returns the count of approval roots newly enqueued."""
     persisted = 0
     for plan in _TODAYS_PLAN:
         action = plan["action_type_name"]
@@ -126,25 +125,12 @@ async def run_daily_drafts(
             log.warning("loop_b.draft_disappeared", action=action, draft_id=draft_id)
             continue
         message = format_draft_dm(draft)
-        if action == "tiktok_post_organic":
-            # The root post is the single founder notification for TikTok. Its
-            # timestamp is persisted so uploads can be authorized in this thread.
-            try:
-                reference = await notifier.post_draft_thread(draft_id, message)
-                if not (isinstance(reference, tuple) and len(reference) == 2):
-                    raise RuntimeError("Slack did not return a draft thread reference")
-                await update_draft_thread_metadata(engine, draft_id, *reference)
-                sent = True
-            except Exception:
-                log.exception("loop_b.tiktok_thread_failed", draft_id=draft_id)
-                sent = False
+        enqueued = await enqueue_root_approval(engine, draft_id=draft_id, text=message)
+        persisted += 1
+        if enqueued:
+            log.info("loop_b.approval_enqueued", action=action, draft_id=draft_id)
         else:
-            sent = await notifier.notify_founder(message)
-        if sent:
-            persisted += 1
-            log.info("loop_b.dm_sent", action=action, draft_id=draft_id)
-        else:
-            log.warning("loop_b.dm_failed", action=action, draft_id=draft_id)
+            log.info("loop_b.approval_already_enqueued", action=action, draft_id=draft_id)
 
     summary = format_summary_dm(drafts_persisted=persisted, drafts_attempted=len(_TODAYS_PLAN))
     await notifier.notify_founder(summary)

@@ -1,9 +1,12 @@
-"""Read-only client for peermarket prod KPIs.
+"""Read-only client for peermarket prod aggregate metrics.
 
 Constrained to a fixed aggregate query — never SELECTs PII columns.
 Returns a plain dict for the hourly loop. This will be wrapped in a
 proper MCP stdio server in Phase 1.
 """
+
+from dataclasses import dataclass
+from datetime import date
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -19,6 +22,25 @@ SELECT
         WHERE created_at > NOW() - INTERVAL '30 days')       AS active_sellers_30d
 """)
 
+_ATTRIBUTION_QUERY = text("""
+SELECT day, utm_source, utm_medium, utm_campaign, utm_content,
+       event_type, event_count
+FROM marketing_attribution_daily
+WHERE day >= :start AND day <= :stop
+ORDER BY day, utm_content, event_type
+""")
+
+
+@dataclass(frozen=True)
+class AttributionAggregate:
+    day: date
+    utm_source: str
+    utm_medium: str
+    utm_campaign: str
+    utm_content: str
+    event_type: str
+    event_count: int
+
 
 class PeermarketReadonly:
     def __init__(self, dsn: str) -> None:
@@ -32,3 +54,13 @@ class PeermarketReadonly:
             "listings_24h": int(row[1]),
             "active_sellers_30d": int(row[2]),
         }
+
+    async def fetch_attribution(self, start: date, stop: date) -> list[AttributionAggregate]:
+        """Read campaign totals exclusively from the production aggregate view."""
+        async with self._engine.connect() as conn:
+            rows = (
+                (await conn.execute(_ATTRIBUTION_QUERY, {"start": start, "stop": stop}))
+                .mappings()
+                .all()
+            )
+        return [AttributionAggregate(**dict(row)) for row in rows]

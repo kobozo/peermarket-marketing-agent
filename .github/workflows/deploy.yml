@@ -10,7 +10,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: agent_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AGENT_DB_URL: postgresql+asyncpg://postgres:test@localhost:5432/agent_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras
+      - run: uv run pytest -q
+
   deploy:
+    needs: test
     runs-on: [self-hosted, agent-peermarket]
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +80,17 @@ jobs:
           META_APP_SECRET: ${{ secrets.META_APP_SECRET }}
           META_SYSTEM_USER_TOKEN: ${{ secrets.META_SYSTEM_USER_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          META_AUTO_ACTIVATE: ${{ vars.META_AUTO_ACTIVATE || 'false' }}
+          META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+          META_INSIGHTS_ENABLED: ${{ vars.META_INSIGHTS_ENABLED || 'false' }}
+          PEERMARKET_ATTRIBUTION_ENABLED: ${{ vars.PEERMARKET_ATTRIBUTION_ENABLED || 'false' }}
+          META_INSIGHTS_LOOKBACK_DAYS: ${{ vars.META_INSIGHTS_LOOKBACK_DAYS || '3' }}
+          META_ACCOUNT_TIMEZONE: ${{ vars.META_ACCOUNT_TIMEZONE || 'Europe/Brussels' }}
+          META_NO_DELIVERY_GRACE_HOURS: ${{ vars.META_NO_DELIVERY_GRACE_HOURS || '2' }}
+          PERFORMANCE_SNAPSHOT_MAX_AGE_HOURS: ${{ vars.PERFORMANCE_SNAPSHOT_MAX_AGE_HOURS || '2' }}
+          LEARNING_MIN_IMPRESSIONS: ${{ vars.LEARNING_MIN_IMPRESSIONS || '1000' }}
+          LEARNING_MIN_LANDING_PAGE_VIEWS: ${{ vars.LEARNING_MIN_LANDING_PAGE_VIEWS || '30' }}
+          LEARNING_MIN_REGISTRATIONS: ${{ vars.LEARNING_MIN_REGISTRATIONS || '10' }}
         run: |
           # Write PEM to its own file (systemd can't handle multi-line env values)
           printf '%s' "$GITHUB_APP_PRIVATE_KEY_BODY" | sudo tee /etc/peermarket-agent/github-app.pem >/dev/null
@@ -84,12 +120,31 @@ jobs:
           META_APP_SECRET=$META_APP_SECRET
           META_SYSTEM_USER_TOKEN=$META_SYSTEM_USER_TOKEN
           META_AD_ACCOUNT_ID=$META_AD_ACCOUNT_ID
+          META_AUTO_ACTIVATE=$META_AUTO_ACTIVATE
+          META_PAGE_ID=$META_PAGE_ID
+          META_INSIGHTS_ENABLED=$META_INSIGHTS_ENABLED
+          PEERMARKET_ATTRIBUTION_ENABLED=$PEERMARKET_ATTRIBUTION_ENABLED
+          META_INSIGHTS_LOOKBACK_DAYS=$META_INSIGHTS_LOOKBACK_DAYS
+          META_ACCOUNT_TIMEZONE=$META_ACCOUNT_TIMEZONE
+          META_NO_DELIVERY_GRACE_HOURS=$META_NO_DELIVERY_GRACE_HOURS
+          PERFORMANCE_SNAPSHOT_MAX_AGE_HOURS=$PERFORMANCE_SNAPSHOT_MAX_AGE_HOURS
+          LEARNING_MIN_IMPRESSIONS=$LEARNING_MIN_IMPRESSIONS
+          LEARNING_MIN_LANDING_PAGE_VIEWS=$LEARNING_MIN_LANDING_PAGE_VIEWS
+          LEARNING_MIN_REGISTRATIONS=$LEARNING_MIN_REGISTRATIONS
           EOF
           sudo chown root:peermarket-agent /etc/peermarket-agent/secrets.env
           sudo chmod 0640 /etc/peermarket-agent/secrets.env
 
       - name: Restart services
         run: |
+          sudo -u peermarket-agent bash -c '
+            set -euo pipefail
+            set -a
+            source /etc/peermarket-agent/secrets.env
+            set +a
+            cd /opt/peermarket-agent
+            /opt/peermarket-agent/.venv/bin/peermarket-migrate
+          '
           sudo systemctl restart marketing-agent.service slack-bridge.service
           sleep 5
           sudo systemctl is-active marketing-agent.service

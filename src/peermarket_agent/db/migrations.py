@@ -59,24 +59,6 @@ _STEPS: list[str] = [
         decided_at TIMESTAMPTZ,
         decided_by TEXT
     )""",
-    """CREATE TABLE IF NOT EXISTS video_assets (
-        id BIGSERIAL PRIMARY KEY,
-        draft_id BIGINT NOT NULL REFERENCES drafts(id),
-        slack_file_id TEXT NOT NULL,
-        thread_ts TEXT NOT NULL,
-        message_ts TEXT NOT NULL DEFAULT '',
-        path TEXT NOT NULL,
-        role TEXT NOT NULL CHECK (role IN ('source','combined')),
-        mime_type TEXT NOT NULL,
-        size_bytes BIGINT NOT NULL,
-        duration_seconds DOUBLE PRECISION,
-        width INT,
-        height INT,
-        status TEXT NOT NULL,
-        review JSONB NOT NULL DEFAULT '{}',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (draft_id, slack_file_id)
-    )""",
     """CREATE TABLE IF NOT EXISTS publications (
         id BIGSERIAL PRIMARY KEY,
         draft_id BIGINT REFERENCES drafts(id),
@@ -150,11 +132,241 @@ _STEPS: list[str] = [
         seen_n_times INT NOT NULL DEFAULT 1
     )""",
     "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+    """CREATE TABLE IF NOT EXISTS video_assets (
+        id BIGSERIAL PRIMARY KEY,
+        draft_id BIGINT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+        slack_file_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        message_ts TEXT NOT NULL DEFAULT '',
+        path TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('source','combined')),
+        mime_type TEXT NOT NULL,
+        size_bytes BIGINT NOT NULL,
+        duration_seconds DOUBLE PRECISION,
+        width INT,
+        height INT,
+        status TEXT NOT NULL,
+        review JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (draft_id, slack_file_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_video_assets_draft_created ON video_assets (draft_id, created_at)",
     "ALTER TABLE video_assets ADD COLUMN IF NOT EXISTS message_ts TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS parent_draft_id BIGINT REFERENCES drafts(id)",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS root_draft_id BIGINT REFERENCES drafts(id)",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS revision_number INT NOT NULL DEFAULT 0",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS revision_feedback TEXT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS revision_feedback_ts TEXT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS slack_channel_id TEXT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS slack_root_ts TEXT",
+    """DO $$
+       DECLARE constraint_name TEXT;
+       BEGIN
+         FOR constraint_name IN
+           SELECT conname FROM pg_constraint
+           WHERE conrelid = 'drafts'::regclass AND contype = 'c'
+             AND pg_get_constraintdef(oid) LIKE '%status%'
+         LOOP
+           EXECUTE format('ALTER TABLE drafts DROP CONSTRAINT %I', constraint_name);
+         END LOOP;
+         ALTER TABLE drafts ADD CONSTRAINT drafts_status_check
+           CHECK (status IN ('queued','approved','rejected','killed','published','superseded'));
+       END $$""",
+    """CREATE TABLE IF NOT EXISTS draft_revision_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        channel_id TEXT NOT NULL,
+        root_ts TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        feedback_text TEXT NOT NULL,
+        root_draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','processing','applied','failed')),
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        claimed_at TIMESTAMPTZ,
+        applied_at TIMESTAMPTZ,
+        failure_category TEXT,
+        UNIQUE (channel_id, root_ts, message_ts)
+    )""",
+    """CREATE TABLE IF NOT EXISTS slack_outbox (
+        id BIGSERIAL PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        channel_id TEXT,
+        root_ts TEXT,
+        message_kind TEXT NOT NULL CHECK (message_kind IN ('root_approval','thread_approval')),
+        payload JSONB NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','delivered','failed')),
+        attempt_count INT NOT NULL DEFAULT 0,
+        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        delivered_at TIMESTAMPTZ,
+        last_failure_category TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_slack_root_binding_unique "
+    "ON drafts (slack_channel_id, slack_root_ts) WHERE revision_number = 0 "
+    "AND slack_channel_id IS NOT NULL AND slack_root_ts IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_root_revision_unique "
+    "ON drafts (root_draft_id, revision_number) WHERE root_draft_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_revision_feedback_pending "
+    "ON draft_revision_feedback (root_draft_id, status, message_ts)",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_owner TEXT",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS processing_attempts INT NOT NULL DEFAULT 0",
+    "ALTER TABLE draft_revision_feedback ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    """CREATE TABLE IF NOT EXISTS draft_revision_generation_leases (
+        root_draft_id BIGINT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+        lease_owner TEXT NOT NULL,
+        lease_expires_at TIMESTAMPTZ NOT NULL,
+        attempt_count INT NOT NULL DEFAULT 1
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
+    "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_owner TEXT",
+    "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    """DO $$
+       DECLARE constraint_name TEXT;
+       BEGIN
+         FOR constraint_name IN
+           SELECT conname FROM pg_constraint
+           WHERE conrelid = 'slack_outbox'::regclass AND contype = 'c'
+             AND pg_get_constraintdef(oid) LIKE '%status%'
+         LOOP
+           EXECUTE format('ALTER TABLE slack_outbox DROP CONSTRAINT %I', constraint_name);
+         END LOOP;
+         ALTER TABLE slack_outbox ADD CONSTRAINT slack_outbox_status_check
+           CHECK (status IN ('pending','delivered','failed','obsolete'));
+       END $$""",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_statuses JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS failure JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS approved_budget_cents INT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS ads_manager_url TEXT",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS replacement_history JSONB NOT NULL DEFAULT '[]'::JSONB",
+    "ALTER TABLE publications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+    "ALTER TABLE publications ALTER COLUMN performance SET DEFAULT '{}'::JSONB",
+    "UPDATE publications SET performance = '{}'::JSONB WHERE performance IS NULL",
+    "ALTER TABLE publications ALTER COLUMN performance SET NOT NULL",
+    """UPDATE publications
+       SET external_ids = jsonb_build_object('ad_id', external_id)
+           || COALESCE(external_ids, '{}'::JSONB)
+       WHERE external_id IS NOT NULL""",
+    """UPDATE publications AS keeper
+       SET external_id = (
+               SELECT source.external_id FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.external_id IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           state = (
+               SELECT source.state FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.state IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           external_ids = COALESCE((
+               SELECT jsonb_object_agg(item.key, item.value ORDER BY source.id)
+               FROM publications AS source
+               CROSS JOIN LATERAL jsonb_each(COALESCE(source.external_ids, '{}'::JSONB)) AS item
+               WHERE source.draft_id = keeper.draft_id
+           ), '{}'::JSONB),
+           external_statuses = COALESCE((
+               SELECT jsonb_object_agg(item.key, item.value ORDER BY source.id)
+               FROM publications AS source
+               CROSS JOIN LATERAL jsonb_each(
+                   COALESCE(source.external_statuses, '{}'::JSONB)
+               ) AS item
+               WHERE source.draft_id = keeper.draft_id
+           ), '{}'::JSONB),
+           failure = (
+               SELECT source.failure FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.failure IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           approved_budget_cents = (
+               SELECT source.approved_budget_cents FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id
+                   AND source.approved_budget_cents IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           ads_manager_url = (
+               SELECT source.ads_manager_url FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id AND source.ads_manager_url IS NOT NULL
+               ORDER BY source.id DESC LIMIT 1
+           ),
+           performance = COALESCE((
+               SELECT jsonb_object_agg(item.key, item.value ORDER BY source.id)
+               FROM publications AS source
+               CROSS JOIN LATERAL jsonb_each(COALESCE(source.performance, '{}'::JSONB)) AS item
+               WHERE source.draft_id = keeper.draft_id
+           ), '{}'::JSONB),
+           updated_at = (
+               SELECT MAX(source.updated_at) FROM publications AS source
+               WHERE source.draft_id = keeper.draft_id
+           )
+       WHERE keeper.draft_id IS NOT NULL
+         AND keeper.id = (
+             SELECT MIN(candidate.id) FROM publications AS candidate
+             WHERE candidate.draft_id = keeper.draft_id
+         )
+         AND EXISTS (
+             SELECT 1 FROM publications AS duplicate
+             WHERE duplicate.draft_id = keeper.draft_id AND duplicate.id <> keeper.id
+         )""",
+    """UPDATE creatives_archive AS creative
+       SET publication_id = survivor.id
+       FROM publications AS duplicate
+       JOIN publications AS survivor
+         ON survivor.id = (
+             SELECT MIN(candidate.id) FROM publications AS candidate
+             WHERE candidate.draft_id = duplicate.draft_id
+         )
+       WHERE creative.publication_id = duplicate.id
+         AND duplicate.draft_id IS NOT NULL
+         AND duplicate.id <> survivor.id""",
+    """DELETE FROM publications AS duplicate
+       WHERE duplicate.draft_id IS NOT NULL
+         AND duplicate.id <> (
+             SELECT MIN(survivor.id) FROM publications AS survivor
+             WHERE survivor.draft_id = duplicate.draft_id
+         )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_draft_id_unique "
+    "ON publications (draft_id) WHERE draft_id IS NOT NULL",
+    """CREATE TABLE IF NOT EXISTS operational_alert_state (
+        alert_key TEXT PRIMARY KEY,
+        state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        claim JSONB NOT NULL DEFAULT '{}'::JSONB,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_kpis_hourly_metric ON kpis_hourly (metric_name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts (status, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_video_assets_draft_created_at ON video_assets (draft_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_slack_actions_status ON slack_actions (status)",
+    """CREATE TABLE IF NOT EXISTS daily_performance_summary_outbox (
+        id BIGSERIAL PRIMARY KEY,
+        summary_key TEXT NOT NULL UNIQUE,
+        window_start DATE NOT NULL,
+        window_stop DATE NOT NULL,
+        window_definition TEXT NOT NULL,
+        publication_ids JSONB NOT NULL,
+        evidence_ids JSONB NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','sent')),
+        attempt_count INT NOT NULL DEFAULT 0,
+        last_attempt_at TIMESTAMPTZ,
+        sent_at TIMESTAMPTZ,
+        claim_token TEXT,
+        claim_expires_at TIMESTAMPTZ,
+        last_failure TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_daily_performance_summary_pending "
+    "ON daily_performance_summary_outbox (status, window_start, id)",
+    "ALTER TABLE daily_performance_summary_outbox "
+    "ADD COLUMN IF NOT EXISTS summary_kind TEXT NOT NULL DEFAULT 'evidence_summary'",
+    "ALTER TABLE daily_performance_summary_outbox ADD COLUMN IF NOT EXISTS run_day DATE",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_start DROP NOT NULL",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_stop DROP NOT NULL",
+    "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_definition DROP NOT NULL",
 ]
 
 

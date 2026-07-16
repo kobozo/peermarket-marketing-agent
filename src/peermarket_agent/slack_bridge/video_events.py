@@ -77,8 +77,9 @@ async def find_thread_draft(engine: AsyncEngine, channel_id: str, thread_ts: str
                     "WHERE at.name = 'tiktok_post_organic' "
                     "AND d.channel = 'tiktok' "
                     "AND d.status IN ('queued', 'approved') "
-                    "AND d.metadata ->> 'slack_channel_id' = :channel_id "
-                    "AND d.metadata ->> 'slack_ts' = :thread_ts"
+                    "AND ((d.metadata ->> 'slack_channel_id' = :channel_id "
+                    "AND d.metadata ->> 'slack_ts' = :thread_ts) OR "
+                    "(d.slack_channel_id = :channel_id AND d.slack_root_ts = :thread_ts))"
                 ),
                 {"channel_id": channel_id, "thread_ts": thread_ts},
             )

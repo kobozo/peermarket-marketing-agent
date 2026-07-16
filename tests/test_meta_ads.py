@@ -1,21 +1,25 @@
 """Meta Ads connector tests — no real API calls."""
 
+import traceback
 from unittest.mock import MagicMock
 
 import pytest
 
 from peermarket_agent.meta_ads import (
+    MetaActivationResult,
     MetaAdsDisabled,
     MetaAdsError,
     MetaConfig,
-    create_paused_ad,
+    activate_meta_ad,
+    create_meta_ad_paused,
 )
 
 _FULL_CONFIG = MetaConfig(
     app_id="111",
     app_secret="s",
-    system_user_token="t",
+    system_user_token="super-secret-token",
     ad_account_id="act_999",
+    page_id="61592144690879",
 )
 
 
@@ -83,7 +87,7 @@ def _patch_meta_sdk(
 
 async def test_create_paused_ad_returns_result_with_ids(monkeypatch):
     _patch_meta_sdk(monkeypatch)
-    result = await create_paused_ad(
+    result = await create_meta_ad_paused(
         config=_FULL_CONFIG,
         name="test-ad",
         primary_text="x" * 150,
@@ -105,9 +109,11 @@ async def test_create_paused_ad_returns_result_with_ids(monkeypatch):
 
 
 async def test_create_paused_ad_disabled_when_credentials_missing():
-    config = MetaConfig(app_id="", app_secret="", system_user_token="", ad_account_id="")
+    config = MetaConfig(
+        app_id="", app_secret="", system_user_token="", ad_account_id="", page_id=""
+    )
     with pytest.raises(MetaAdsDisabled, match="missing credentials"):
-        await create_paused_ad(
+        await create_meta_ad_paused(
             config=config,
             name="x",
             primary_text="x" * 150,
@@ -124,7 +130,7 @@ async def test_create_paused_ad_disabled_when_credentials_missing():
 async def test_create_paused_ad_rejects_invalid_cta(monkeypatch):
     _patch_meta_sdk(monkeypatch)
     with pytest.raises(MetaAdsError, match="cta_type"):
-        await create_paused_ad(
+        await create_meta_ad_paused(
             config=_FULL_CONFIG,
             name="x",
             primary_text="x" * 150,
@@ -141,7 +147,7 @@ async def test_create_paused_ad_rejects_invalid_cta(monkeypatch):
 async def test_create_paused_ad_rejects_unknown_audience(monkeypatch):
     _patch_meta_sdk(monkeypatch)
     with pytest.raises(MetaAdsError, match="audience profile"):
-        await create_paused_ad(
+        await create_meta_ad_paused(
             config=_FULL_CONFIG,
             name="x",
             primary_text="x" * 150,
@@ -157,7 +163,7 @@ async def test_create_paused_ad_rejects_unknown_audience(monkeypatch):
 
 async def test_create_paused_ad_skips_image_upload_when_none(monkeypatch):
     fake = _patch_meta_sdk(monkeypatch)
-    await create_paused_ad(
+    await create_meta_ad_paused(
         config=_FULL_CONFIG,
         name="x",
         primary_text="x" * 150,
@@ -174,7 +180,7 @@ async def test_create_paused_ad_skips_image_upload_when_none(monkeypatch):
 
 async def test_create_paused_ad_uploads_image_when_provided(monkeypatch):
     fake = _patch_meta_sdk(monkeypatch)
-    await create_paused_ad(
+    await create_meta_ad_paused(
         config=_FULL_CONFIG,
         name="x",
         primary_text="x" * 150,
@@ -189,9 +195,51 @@ async def test_create_paused_ad_uploads_image_when_provided(monkeypatch):
     fake.create_ad_image.assert_called_once()
 
 
+async def test_create_paused_ad_uses_configured_page_identity(monkeypatch):
+    fake = _patch_meta_sdk(monkeypatch)
+    await create_meta_ad_paused(
+        config=_FULL_CONFIG,
+        name="x",
+        primary_text="x" * 150,
+        headline="x",
+        description="x",
+        cta_type="LEARN_MORE",
+        landing_page_url="https://x",
+        image_bytes=None,
+        audience_profile_key="declutterers",
+        daily_budget_eur=5,
+    )
+
+    creative_params = fake.create_ad_creative.call_args.kwargs["params"]
+    assert creative_params["object_story_spec"]["page_id"] == "61592144690879"
+
+
+async def test_create_paused_ad_disabled_when_page_id_missing():
+    config = MetaConfig(
+        app_id="111",
+        app_secret="s",
+        system_user_token="t",
+        ad_account_id="act_999",
+        page_id="",
+    )
+    with pytest.raises(MetaAdsDisabled, match="page_id"):
+        await create_meta_ad_paused(
+            config=config,
+            name="x",
+            primary_text="x" * 150,
+            headline="x",
+            description="x",
+            cta_type="LEARN_MORE",
+            landing_page_url="https://x",
+            image_bytes=None,
+            audience_profile_key="declutterers",
+            daily_budget_eur=5,
+        )
+
+
 async def test_create_paused_ad_passes_daily_budget_in_cents(monkeypatch):
     fake = _patch_meta_sdk(monkeypatch)
-    await create_paused_ad(
+    await create_meta_ad_paused(
         config=_FULL_CONFIG,
         name="x",
         primary_text="x" * 150,
@@ -208,10 +256,50 @@ async def test_create_paused_ad_passes_daily_budget_in_cents(monkeypatch):
     assert call_kwargs.get("daily_budget") == 1000
 
 
+async def test_create_paused_ad_uses_supported_billing_event(monkeypatch):
+    fake = _patch_meta_sdk(monkeypatch)
+    await create_meta_ad_paused(
+        config=_FULL_CONFIG,
+        name="x",
+        primary_text="x" * 150,
+        headline="x",
+        description="x",
+        cta_type="LEARN_MORE",
+        landing_page_url="https://x",
+        image_bytes=None,
+        audience_profile_key="declutterers",
+        daily_budget_eur=5,
+    )
+    params = fake.create_ad_set.call_args.kwargs["params"]
+    assert params["billing_event"] == "IMPRESSIONS"
+    assert params["optimization_goal"] == "LINK_CLICKS"
+
+
+@pytest.mark.parametrize("audience_profile", ["declutterers", "trust_conscious_locals"])
+async def test_create_paused_ad_explicitly_disables_advantage_audience(
+    monkeypatch, audience_profile
+):
+    fake = _patch_meta_sdk(monkeypatch)
+    await create_meta_ad_paused(
+        config=_FULL_CONFIG,
+        name="x",
+        primary_text="x" * 150,
+        headline="x",
+        description="x",
+        cta_type="LEARN_MORE",
+        landing_page_url="https://x",
+        image_bytes=None,
+        audience_profile_key=audience_profile,
+        daily_budget_eur=5,
+    )
+    targeting = fake.create_ad_set.call_args.kwargs["params"]["targeting"]
+    assert targeting["targeting_automation"] == {"advantage_audience": 0}
+
+
 async def test_create_paused_ad_raises_meta_ads_error_on_api_failure(monkeypatch):
     _patch_meta_sdk(monkeypatch, raise_on="campaign")
     with pytest.raises(MetaAdsError, match="Meta API error"):
-        await create_paused_ad(
+        await create_meta_ad_paused(
             config=_FULL_CONFIG,
             name="x",
             primary_text="x" * 150,
@@ -225,9 +313,92 @@ async def test_create_paused_ad_raises_meta_ads_error_on_api_failure(monkeypatch
         )
 
 
+async def test_create_failure_retains_created_ids_and_rolls_back(monkeypatch):
+    _patch_meta_sdk(monkeypatch, raise_on="ad")
+    pause_mock = MagicMock(return_value={})
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_pause", pause_mock)
+
+    with pytest.raises(MetaAdsError) as caught:
+        await create_meta_ad_paused(
+            config=_FULL_CONFIG,
+            name="x",
+            primary_text="x" * 150,
+            headline="x",
+            description="x",
+            cta_type="LEARN_MORE",
+            landing_page_url="https://x",
+            image_bytes=None,
+            audience_profile_key="declutterers",
+            daily_budget_eur=5,
+        )
+
+    assert caught.value.phase == "create_ad"
+    assert caught.value.resource_ids == {
+        "campaign_id": "c1",
+        "ad_set_id": "as1",
+        "creative_id": "cr1",
+    }
+    assert caught.value.rollback_errors == {}
+    pause_mock.assert_called_once_with(
+        _FULL_CONFIG,
+        {"campaign_id": "c1", "ad_set_id": "as1", "creative_id": "cr1"},
+    )
+
+
+async def test_create_paused_ad_preserves_actionable_api_error_details(monkeypatch):
+    from facebook_business.exceptions import FacebookRequestError
+
+    error = FacebookRequestError(
+        "Request failed",
+        request_context={},
+        http_status=400,
+        http_headers={},
+        body={
+            "error": {
+                "message": "Invalid parameter",
+                "code": 100,
+                "error_subcode": 18157520,
+                "error_user_title": "Invalid Page",
+                "error_user_msg": "Select a Page connected to this ad account.",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.FacebookAdsApi.init",
+        lambda *a, **kw: None,
+    )
+    fake_account = MagicMock()
+    fake_account.create_campaign.side_effect = error
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.AdAccount",
+        lambda *a, **kw: fake_account,
+    )
+
+    with pytest.raises(MetaAdsError) as exc_info:
+        await create_meta_ad_paused(
+            config=_FULL_CONFIG,
+            name="x",
+            primary_text="x" * 150,
+            headline="x",
+            description="x",
+            cta_type="LEARN_MORE",
+            landing_page_url="https://x",
+            image_bytes=None,
+            audience_profile_key="declutterers",
+            daily_budget_eur=5,
+        )
+
+    message = str(exc_info.value)
+    assert "Invalid parameter" in message
+    assert "code=100" in message
+    assert "subcode=18157520" in message
+    assert "Invalid Page" in message
+    assert "Select a Page connected to this ad account." in message
+
+
 async def test_create_paused_ad_all_resources_status_paused(monkeypatch):
     fake = _patch_meta_sdk(monkeypatch)
-    await create_paused_ad(
+    await create_meta_ad_paused(
         config=_FULL_CONFIG,
         name="x",
         primary_text="x" * 150,
@@ -246,3 +417,254 @@ async def test_create_paused_ad_all_resources_status_paused(monkeypatch):
     assert "PAUSED" in str(campaign_params).upper()
     assert "PAUSED" in str(adset_params).upper()
     assert "PAUSED" in str(ad_params).upper()
+
+
+def _patch_resources(
+    monkeypatch,
+    statuses,
+    *,
+    fail_on=None,
+    rollback_fail_on=None,
+    rollback_error_message=None,
+    activation_error_message=None,
+):
+    calls = []
+
+    class FakeResource:
+        def __init__(self, resource_type, resource_id):
+            self.resource_type = resource_type
+            self.resource_id = resource_id
+
+        def api_update(self, *, params):
+            status = params["status"]
+            calls.append(("update", self.resource_type, self.resource_id, status))
+            if status == "ACTIVE" and fail_on == self.resource_type:
+                raise RuntimeError(
+                    activation_error_message or f"failed to activate {self.resource_type}"
+                )
+            if status == "PAUSED" and rollback_fail_on == self.resource_type:
+                raise RuntimeError(
+                    rollback_error_message or f"failed to pause {self.resource_type}"
+                )
+
+        def api_get(self, *, fields):
+            calls.append(("get", self.resource_type, self.resource_id, tuple(fields)))
+            return statuses[self.resource_type]
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.Campaign",
+        lambda resource_id: FakeResource("campaign", resource_id),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.AdSet",
+        lambda resource_id: FakeResource("ad_set", resource_id),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.Ad",
+        lambda resource_id: FakeResource("ad", resource_id),
+    )
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: None)
+    return calls
+
+
+@pytest.mark.parametrize("ad_effective_status", ["ACTIVE", "IN_PROCESS", "PENDING_REVIEW"])
+async def test_activate_meta_ad_orders_updates_and_accepts_review_states(
+    monkeypatch, ad_effective_status
+):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad": {"status": "ACTIVE", "effective_status": ad_effective_status},
+    }
+    calls = _patch_resources(monkeypatch, statuses)
+
+    result = await activate_meta_ad(
+        _FULL_CONFIG,
+        {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"},
+    )
+
+    assert isinstance(result, MetaActivationResult)
+    assert result.campaign == statuses["campaign"]
+    assert result.ad_set == statuses["ad_set"]
+    assert result.ad == statuses["ad"]
+    assert [call[1] for call in calls if call[0] == "update"] == [
+        "campaign",
+        "ad_set",
+        "ad",
+    ]
+    assert [call[1] for call in calls if call[0] == "get"] == [
+        "campaign",
+        "ad_set",
+        "ad",
+    ]
+
+
+async def test_activation_failure_rolls_back_child_to_parent_and_reports_context(monkeypatch):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    calls = _patch_resources(
+        monkeypatch,
+        statuses,
+        fail_on="ad_set",
+        rollback_fail_on="ad",
+    )
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(_FULL_CONFIG, ids)
+
+    error = caught.value
+    assert error.phase == "activate_ad_set"
+    assert error.resource_ids == ids
+    assert error.observed_statuses == statuses
+    assert error.rollback_errors == {"ad": "failed to pause ad"}
+    assert [call[1] for call in calls if call[0] == "update" and call[3] == "PAUSED"] == [
+        "ad",
+        "ad_set",
+        "campaign",
+    ]
+    rendered = str(error)
+    assert "activate_ad_set" in rendered
+    assert "system_user_token" not in rendered
+    assert _FULL_CONFIG.system_user_token not in rendered
+
+
+async def test_activation_error_redacts_credentials_from_rollback_errors(monkeypatch):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(
+        monkeypatch,
+        statuses,
+        fail_on="ad_set",
+        rollback_fail_on="ad",
+        rollback_error_message=f"request included {_FULL_CONFIG.system_user_token}",
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(
+            _FULL_CONFIG,
+            {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"},
+        )
+
+    assert caught.value.rollback_errors == {"ad": "request included [REDACTED]"}
+    assert _FULL_CONFIG.system_user_token not in str(caught.value)
+
+
+async def test_activation_error_does_not_chain_credential_bearing_cause(monkeypatch):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(
+        monkeypatch,
+        statuses,
+        fail_on="ad_set",
+        activation_error_message=f"request token={_FULL_CONFIG.system_user_token}",
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(
+            _FULL_CONFIG,
+            {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"},
+        )
+
+    chained_traceback = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert caught.value.__cause__ is None
+    assert _FULL_CONFIG.system_user_token not in chained_traceback
+
+
+async def test_activation_error_redacts_short_credentials_without_corrupting_words(
+    monkeypatch,
+):
+    config = MetaConfig(
+        app_id="111",
+        app_secret="s3",
+        system_user_token="t4",
+        ad_account_id="act_999",
+        page_id="61592144690879",
+    )
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(
+        monkeypatch,
+        statuses,
+        fail_on="ad_set",
+        rollback_fail_on="ad",
+        rollback_error_message="app_secret=s3; token=t4; status stays readable",
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(
+            config,
+            {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"},
+        )
+
+    assert caught.value.rollback_errors == {
+        "ad": "app_secret=[REDACTED]; token=[REDACTED]; status stays readable"
+    }
+
+
+async def test_activation_error_survives_rollback_setup_failure(monkeypatch):
+    statuses = {
+        "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+    }
+    _patch_resources(monkeypatch, statuses, fail_on="ad_set")
+    init_calls = 0
+
+    def fail_rollback_init(config):
+        nonlocal init_calls
+        init_calls += 1
+        if init_calls == 3:
+            raise RuntimeError(
+                f"rollback token={_FULL_CONFIG.system_user_token} could not initialize"
+            )
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", fail_rollback_init)
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(_FULL_CONFIG, ids)
+
+    error = caught.value
+    assert error.phase == "activate_ad_set"
+    assert error.resource_ids == ids
+    assert error.observed_statuses == statuses
+    assert error.rollback_errors == {"setup": "rollback token=[REDACTED] could not initialize"}
+    assert error.__cause__ is None
+    chained_traceback = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert _FULL_CONFIG.system_user_token not in chained_traceback
+
+
+async def test_initial_activation_setup_failure_is_structured_and_sanitized(monkeypatch):
+    def fail_init(config):
+        raise RuntimeError(f"initialization token={_FULL_CONFIG.system_user_token} unavailable")
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", fail_init)
+    ids = {"campaign_id": "c1", "ad_set_id": "as1", "ad_id": "ad1"}
+
+    with pytest.raises(MetaAdsError) as caught:
+        await activate_meta_ad(_FULL_CONFIG, ids)
+
+    error = caught.value
+    assert error.phase == "setup"
+    assert error.resource_ids == ids
+    assert error.observed_statuses == {}
+    assert error.rollback_errors == {"setup": "initialization token=[REDACTED] unavailable"}
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    chained_traceback = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert _FULL_CONFIG.system_user_token not in chained_traceback

@@ -21,6 +21,11 @@ class DraftDict(TypedDict):
     recording_notes: str
 
 
+class RevisedDraftDict(DraftDict):
+    revision_number: int
+    revision_feedback: str
+
+
 _HEADER_LABELS: dict[str, tuple[str, str]] = {
     "tiktok_post_organic": ("🎬", "TikTok organic"),
     "email_re_engagement": ("✉️", "Email re-engagement"),
@@ -66,4 +71,14 @@ def format_summary_dm(*, drafts_persisted: int, drafts_attempted: int) -> str:
         f"Goedemorgen ☕ — vandaag heb ik {drafts_persisted}/{drafts_attempted} drafts klaar. "
         f"Tap een ✅ of ❌ in de vorige berichten, of typ `✅ <id>` / `❌ <id>` "
         f"als je liever zo werkt."
+    )
+
+
+def format_revised_draft_dm(draft: RevisedDraftDict, *, change_summary: str) -> str:
+    """Format a complete replacement variant for its existing approval thread."""
+    base = format_draft_dm(draft)
+    header, copy_and_ack = base.split("\n\n", 1)
+    return (
+        f"{header} · revision {draft['revision_number']}\n\n"
+        f"*Changes applied:* {change_summary}\n\n{copy_and_ack}"
     )

@@ -1,6 +1,10 @@
 """Slack DM formatter tests."""
 
-from peermarket_agent.slack_dm import format_draft_dm, format_summary_dm
+from peermarket_agent.slack_dm import (
+    format_draft_dm,
+    format_revised_draft_dm,
+    format_summary_dm,
+)
 
 _BASE_DRAFT = {
     "id": 42,
@@ -57,3 +61,22 @@ def test_format_summary_dm():
     msg = format_summary_dm(drafts_persisted=2, drafts_attempted=3)
     assert "2/3" in msg
     assert "Goedemorgen" in msg
+
+
+def test_format_revised_draft_has_complete_copy_summary_and_new_decision_id():
+    msg = format_revised_draft_dm(
+        {
+            **_BASE_DRAFT,
+            "id": 43,
+            "action_type_name": "tiktok_post_organic",
+            "revision_number": 1,
+            "revision_feedback": "Make the CTA warmer",
+        },
+        change_summary="Warmer CTA while preserving the offer",
+    )
+    assert "draft #43" in msg
+    assert "revision 1" in msg
+    assert "Marktplaats moe?" in msg
+    assert "Warmer CTA while preserving the offer" in msg
+    assert "✅ 43" in msg
+    assert "❌ 43" in msg
