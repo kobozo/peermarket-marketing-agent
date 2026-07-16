@@ -382,6 +382,9 @@ async def collect_meta_performance(
             statuses = await get_meta_ad_statuses(config, publication["external_ids"])
             snapshot = await fetch_meta_insights(config, ad_id, start, stop)
             current = dict(vars(snapshot))
+            current["window_definition"] = (
+                f"rolling-{(stop - start).days + 1}-inclusive-calendar-days"
+            )
             meta = derive_performance((previous.get("meta") or {}).get("latest"), current)
             meta.update({"statuses": statuses, "last_successful_retrieval": now, "error": None})
             condition = classify_delivery(statuses, current, publication["published_at"], now, 2)

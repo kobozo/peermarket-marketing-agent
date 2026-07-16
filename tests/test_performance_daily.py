@@ -1,5 +1,8 @@
+import asyncio
+import json
 import os
 from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -29,7 +32,7 @@ def test_missing_registration_data_is_unavailable_not_zero():
     observation = evaluate_publication(
         {"meta": {"latest": {"landing_page_views": 5}}, "attribution": {"available": False}}
     )
-    assert observation.metrics["landing_to_registration"] is None
+    assert observation.metrics["first_party_landing_to_registration"] is None
     assert observation.metrics["registrations"] is None
 
 
@@ -47,17 +50,131 @@ def test_evaluator_uses_only_available_attributed_registration_events():
             "attribution": {
                 "available": True,
                 "events": [
-                    {"event_type": "registration", "event_count": 8},
-                    {"event_type": "listing", "event_count": 3},
+                    {"event_type": "registration_completed", "event_count": 8},
+                    {"event_type": "first_listing_created", "event_count": 3},
                 ],
             },
         }
     )
     assert observation.metrics["registrations"] == 8
-    assert str(observation.metrics["landing_to_registration"]) == "0.2"
+    assert observation.metrics["first_party_landing_to_registration"] is None
 
 
-async def _insert_publication(engine, *, draft_id, audience, performance, ads_url):
+def _complete_performance():
+    return {
+        "approved_budget_cents": 5_000,
+        "delivery": {"condition": "healthy"},
+        "meta": {
+            "latest": {
+                "spend_cents": 2_000,
+                "impressions": 1_000,
+                "clicks": 100,
+                "inline_link_clicks": 80,
+                "landing_page_views": 40,
+            }
+        },
+        "attribution": {
+            "available": True,
+            "events": [
+                {"event_type": "landing_view", "event_count": 50},
+                {"event_type": "registration_completed", "event_count": 10},
+                {"event_type": "first_listing_created", "event_count": 5},
+                {"event_type": "first_listing_published", "event_count": 4},
+                {"event_type": "identity_verification_completed", "event_count": 2},
+            ],
+        },
+    }
+
+
+def test_evaluator_produces_exact_design_metric_set():
+    metrics = evaluate_publication(_complete_performance()).metrics
+
+    assert metrics == {
+        "approved_budget_cents": 5_000,
+        "spend_cents": 2_000,
+        "delivery_state": "healthy",
+        "impressions": 1_000,
+        "clicks": 100,
+        "link_clicks": 80,
+        "meta_landing_page_views": 40,
+        "first_party_landing_views": 50,
+        "registrations": 10,
+        "first_listing_created": 5,
+        "first_listing_published": 4,
+        "identity_verifications": 2,
+        "cost_per_link_click_cents": Decimal("25"),
+        "click_to_meta_landing": Decimal("0.5"),
+        "first_party_landing_to_registration": Decimal("0.2"),
+        "cost_per_registration_cents": Decimal("200"),
+        "registration_to_first_listing": Decimal("0.5"),
+        "cost_per_first_published_listing_cents": Decimal("500"),
+        "identity_verification_conversion": Decimal("0.2"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("numerator_field", "denominator_field", "ratio_field"),
+    [
+        ("spend_cents", "inline_link_clicks", "cost_per_link_click_cents"),
+        ("landing_page_views", "inline_link_clicks", "click_to_meta_landing"),
+        ("registration_completed", "landing_view", "first_party_landing_to_registration"),
+        ("spend_cents", "registration_completed", "cost_per_registration_cents"),
+        ("first_listing_created", "registration_completed", "registration_to_first_listing"),
+        (
+            "spend_cents",
+            "first_listing_published",
+            "cost_per_first_published_listing_cents",
+        ),
+        (
+            "identity_verification_completed",
+            "registration_completed",
+            "identity_verification_conversion",
+        ),
+    ],
+)
+@pytest.mark.parametrize("denominator", [None, 0])
+def test_every_derived_metric_guards_missing_and_zero_denominator(
+    numerator_field, denominator_field, ratio_field, denominator
+):
+    performance = _complete_performance()
+    latest = performance["meta"]["latest"]
+    events = performance["attribution"]["events"]
+    if denominator_field in latest:
+        if denominator is None:
+            latest.pop(denominator_field)
+        else:
+            latest[denominator_field] = denominator
+    else:
+        events[:] = [event for event in events if event["event_type"] != denominator_field]
+        if denominator is not None:
+            events.append({"event_type": denominator_field, "event_count": denominator})
+
+    assert evaluate_publication(performance).metrics[ratio_field] is None
+
+
+def test_missing_attribution_events_are_unavailable_not_zero():
+    metrics = evaluate_publication(
+        {"meta": {"latest": {}}, "attribution": {"available": True, "events": []}}
+    ).metrics
+    for name in (
+        "first_party_landing_views",
+        "registrations",
+        "first_listing_created",
+        "first_listing_published",
+        "identity_verifications",
+    ):
+        assert metrics[name] is None
+
+
+async def _insert_publication(
+    engine,
+    *,
+    draft_id,
+    audience,
+    performance,
+    ads_url,
+    objective="OUTCOME_TRAFFIC",
+):
     async with engine.begin() as conn:
         action_type_id = (
             await conn.execute(text("SELECT id FROM action_types WHERE name='meta_ad_creative'"))
@@ -71,7 +188,12 @@ async def _insert_publication(engine, *, draft_id, audience, performance, ads_ur
             {
                 "id": draft_id,
                 "action": action_type_id,
-                "metadata": '{"audience_profile_key":"' + audience + '"}',
+                "metadata": json.dumps(
+                    {
+                        **({"audience_profile_key": audience} if audience is not None else {}),
+                        **({"objective": objective} if objective is not None else {}),
+                    }
+                ),
             },
         )
         await conn.execute(
@@ -82,7 +204,7 @@ async def _insert_publication(engine, *, draft_id, audience, performance, ads_ur
             ),
             {
                 "id": draft_id,
-                "performance": __import__("json").dumps(performance),
+                "performance": json.dumps(performance),
                 "url": ads_url,
                 "published": datetime(2026, 7, 14, tzinfo=UTC),
             },
@@ -104,6 +226,7 @@ async def test_daily_run_is_idempotent_and_sanitizes_unavailable_summary(databas
                     "landing_page_views": 30,
                     "window_start": "2026-07-15",
                     "window_stop": "2026-07-16",
+                    "window_definition": "rolling-2-calendar-days",
                 }
             },
             "attribution": {"available": False, "error": "password=super-secret"},
@@ -123,7 +246,7 @@ async def test_daily_run_is_idempotent_and_sanitizes_unavailable_summary(databas
     assert len(performance["daily_observations"]) == 1
     message = notifier.notify_founder.await_args_list[0].args[0]
     assert "unavailable" in message
-    assert "2026-07-15 → 2026-07-16 UTC" in message
+    assert "2026-07-15 → 2026-07-16 UTC (rolling-2-calendar-days)" in message
     assert "https://business.facebook.com/adsmanager/manage/ads" in message
     assert "super-secret" not in message
     assert "caused" not in message.lower()
@@ -139,11 +262,12 @@ async def test_daily_run_inserts_then_idempotently_reinforces_learning(database_
                 "landing_page_views": 30,
                 "window_start": "2026-07-15",
                 "window_stop": "2026-07-16",
+                "window_definition": "rolling-2-calendar-days",
             }
         },
         "attribution": {
             "available": True,
-            "events": [{"event_type": "registration", "event_count": 10}],
+            "events": [{"event_type": "registration_completed", "event_count": 10}],
         },
     }
     await _insert_publication(
@@ -166,9 +290,283 @@ async def test_daily_run_inserts_then_idempotently_reinforces_learning(database_
         )
     assert len(rows) == 1
     assert rows[0]["seen_n_times"] == 1
-    assert rows[0]["evidence_links"]["window"] == {
+    evidence = rows[0]["evidence_links"]
+    assert evidence["window"] == {
         "start": "2026-07-15",
         "stop": "2026-07-16",
-        "definition": "utc-day",
+        "definition": "rolling-2-calendar-days",
+        "inclusive_days": 2,
     }
-    assert rows[0]["evidence_links"]["sample"]["variants"] == 2
+    assert evidence["decision"] == {"eligible": True, "reason": "thresholds_met"}
+    assert evidence["dimensions"] == {
+        "channel": "meta",
+        "objective": "OUTCOME_TRAFFIC",
+        "language": "NL",
+        "audience": "declutterers",
+        "window_definition": "rolling-2-calendar-days",
+    }
+    assert evidence["thresholds"] == {
+        "impressions": 1_000,
+        "landing_page_views": 30,
+        "registrations": 10,
+    }
+    assert evidence["sample"]["variants"] == 2
+    async with database_engine.connect() as conn:
+        observations = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT id, performance->'daily_observations'->0 AS observation FROM publications ORDER BY id"
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert [variant["publication_id"] for variant in evidence["variants"]] == [1, 2]
+    for persisted_variant, source in zip(evidence["variants"], observations, strict=True):
+        assert persisted_variant["evidence_id"] == source["observation"]["evidence_id"]
+        assert persisted_variant["compared_values"] == source["observation"]["metrics"]
+        assert persisted_variant["sample_sizes"] == {
+            "impressions": 1000,
+            "meta_landing_page_views": 30,
+            "registrations": 10,
+        }
+
+
+async def test_daily_slack_contains_complete_design_metrics_and_samples(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    performance = _complete_performance()
+    performance["meta"]["latest"].update(
+        window_start="2026-07-14",
+        window_stop="2026-07-16",
+        window_definition="rolling-3-inclusive-calendar-days",
+    )
+    await _insert_publication(
+        database_engine,
+        draft_id=650,
+        audience="declutterers",
+        performance=performance,
+        ads_url="https://business.facebook.com/adsmanager/manage/ads?act=123",
+    )
+    notifier = AsyncMock()
+
+    await run_daily_performance(
+        database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+
+    message = notifier.notify_founder.await_args.args[0]
+    for fragment in (
+        "approved budget",
+        "spend 2000 cents",
+        "delivery healthy",
+        "impressions 1000",
+        "clicks 100",
+        "link clicks 80",
+        "Meta LPV 40",
+        "first-party landings 50",
+        "attributed registrations 10",
+        "first listings created 5",
+        "first listings published 4",
+        "identity verifications 2",
+        "cost/link click 25",
+        "click→Meta LPV 0.5",
+        "first-party landing→registration 0.2",
+        "cost/registration 200",
+        "registration→first listing 0.5",
+        "cost/first published listing 500",
+        "identity verification conversion 0.2",
+        "sample sizes: impressions 1000, Meta LPV 40, registrations 10",
+        "Ads Manager:",
+    ):
+        assert fragment in message
+    assert "caused" not in message.lower()
+
+
+@pytest.mark.parametrize(
+    "latest",
+    [
+        {"window_start": "2026-07-15", "window_stop": "2026-07-16"},
+        {
+            "window_start": "not-a-date",
+            "window_stop": "2026-07-16",
+            "window_definition": "rolling-3-calendar-days",
+        },
+        {
+            "window_start": "2026-07-16",
+            "window_stop": "2026-07-15",
+            "window_definition": "rolling-3-calendar-days",
+        },
+    ],
+)
+async def test_missing_or_invalid_source_window_creates_no_completed_observation(
+    database_engine, latest
+):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    await _insert_publication(
+        database_engine,
+        draft_id=701,
+        audience="declutterers",
+        ads_url=None,
+        performance={"meta": {"latest": latest}, "attribution": {"available": False}},
+    )
+    notifier = AsyncMock()
+
+    assert (
+        await run_daily_performance(
+            database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+        )
+        == 0
+    )
+    async with database_engine.connect() as conn:
+        performance = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=701"))
+        ).scalar_one()
+    assert "daily_observations" not in performance
+    assert "window unavailable" in notifier.notify_founder.await_args.args[0]
+
+
+async def test_explicit_one_day_inclusive_source_window_is_valid(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    await _insert_publication(
+        database_engine,
+        draft_id=702,
+        audience="declutterers",
+        ads_url=None,
+        performance={
+            "meta": {
+                "latest": {
+                    "window_start": "2026-07-16",
+                    "window_stop": "2026-07-16",
+                    "window_definition": "rolling-1-inclusive-calendar-day",
+                }
+            },
+            "attribution": {"available": False},
+        },
+    )
+
+    assert (
+        await run_daily_performance(
+            database_engine,
+            AsyncMock(),
+            object(),
+            now=datetime(2026, 7, 16, 9, tzinfo=UTC),
+        )
+        == 1
+    )
+
+
+async def test_missing_objective_or_audience_never_creates_learning(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    base = _complete_performance()
+    base["meta"]["latest"].update(
+        window_start="2026-07-14",
+        window_stop="2026-07-16",
+        window_definition="rolling-3-calendar-days",
+    )
+    for draft_id in (801, 802):
+        await _insert_publication(
+            database_engine,
+            draft_id=draft_id,
+            audience=None,
+            objective=None,
+            performance=base,
+            ads_url=None,
+        )
+    await run_daily_performance(
+        database_engine, AsyncMock(), object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+    async with database_engine.connect() as conn:
+        assert (await conn.execute(text("SELECT count(*) FROM learnings"))).scalar_one() == 0
+
+
+async def test_concurrent_daily_replay_inserts_one_observation_and_learning(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    base = _complete_performance()
+    base["meta"]["latest"].update(
+        window_start="2026-07-14",
+        window_stop="2026-07-16",
+        window_definition="rolling-3-calendar-days",
+    )
+    for draft_id in (901, 902):
+        await _insert_publication(
+            database_engine,
+            draft_id=draft_id,
+            audience="declutterers",
+            performance=base,
+            ads_url=None,
+        )
+    now = datetime(2026, 7, 16, 9, tzinfo=UTC)
+
+    results = await asyncio.gather(
+        run_daily_performance(database_engine, AsyncMock(), object(), now=now),
+        run_daily_performance(database_engine, AsyncMock(), object(), now=now),
+    )
+
+    assert sorted(results) == [0, 2]
+    async with database_engine.connect() as conn:
+        observations = (
+            await conn.execute(
+                text(
+                    "SELECT sum(jsonb_array_length(performance->'daily_observations')) FROM publications"
+                )
+            )
+        ).scalar_one()
+        learning_count = (await conn.execute(text("SELECT count(*) FROM learnings"))).scalar_one()
+    assert observations == 2
+    assert learning_count == 1
+
+
+async def test_new_window_reinforces_once_and_retains_replayable_prior_evidence(database_engine):
+    await run_migrations(database_engine)
+    await seed(database_engine)
+    base = _complete_performance()
+    base["meta"]["latest"].update(
+        window_start="2026-07-14",
+        window_stop="2026-07-16",
+        window_definition="rolling-3-calendar-days",
+    )
+    for draft_id in (1001, 1002):
+        await _insert_publication(
+            database_engine,
+            draft_id=draft_id,
+            audience="declutterers",
+            performance=base,
+            ads_url=None,
+        )
+    await run_daily_performance(
+        database_engine, AsyncMock(), object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+    async with database_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE publications SET performance=jsonb_set(jsonb_set(performance, "
+                "'{meta,latest,window_start}', '\"2026-07-15\"'), "
+                "'{meta,latest,window_stop}', '\"2026-07-17\"')"
+            )
+        )
+
+    await run_daily_performance(
+        database_engine, AsyncMock(), object(), now=datetime(2026, 7, 17, 9, tzinfo=UTC)
+    )
+    await run_daily_performance(
+        database_engine, AsyncMock(), object(), now=datetime(2026, 7, 17, 9, tzinfo=UTC)
+    )
+
+    async with database_engine.connect() as conn:
+        row = (
+            (await conn.execute(text("SELECT evidence_links, seen_n_times FROM learnings")))
+            .mappings()
+            .one()
+        )
+    assert row["seen_n_times"] == 2
+    assert len(row["evidence_links"]["runs"]) == 2
+    assert [run["window"]["stop"] for run in row["evidence_links"]["runs"]] == [
+        "2026-07-16",
+        "2026-07-17",
+    ]

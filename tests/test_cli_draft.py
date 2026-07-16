@@ -224,6 +224,7 @@ async def test_run_draft_meta_persists_metadata(prepared_db):
     assert row[0] == "meta"
     meta = row[1]
     assert meta["audience_profile_key"] == "declutterers"
+    assert meta["objective"] == "OUTCOME_TRAFFIC"
     assert meta["headline"] == "Verkoop veilig"
     assert meta["cta_label"] == "Learn More"
     assert meta["cta_type"] == "LEARN_MORE"

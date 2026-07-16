@@ -98,6 +98,7 @@ async def _produce_copy_for_action(
         )
         metadata = {
             "audience_profile_key": audience_key,
+            "objective": "OUTCOME_TRAFFIC",
             "headline": ad.headline,
             "description": ad.description,
             "cta_label": ad.cta_label,

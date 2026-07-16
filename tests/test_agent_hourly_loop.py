@@ -169,6 +169,28 @@ async def test_one_meta_failure_does_not_block_other_publications(engine, monkey
     assert "token-secret" not in str(failure)
 
 
+async def test_hourly_snapshot_persists_explicit_requested_window_definition(engine, monkeypatch):
+    await _publication(engine, 155, "ad-0")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-0")),
+    )
+
+    await collect_meta_performance(engine, _settings(), AsyncMock(), AsyncMock(), now=NOW)
+
+    async with engine.connect() as conn:
+        performance = (
+            await conn.execute(text("SELECT performance FROM publications WHERE draft_id=155"))
+        ).scalar_one()
+    assert performance["meta"]["latest"]["window_definition"] == (
+        "rolling-3-inclusive-calendar-days"
+    )
+
+
 async def test_no_delivery_alert_is_deduplicated_and_recovers_once(engine, monkeypatch):
     await _publication(engine, 156, "ad-1")
     notifier = AsyncMock()

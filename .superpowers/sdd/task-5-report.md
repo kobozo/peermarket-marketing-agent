@@ -54,3 +54,70 @@ Fresh post-format verification:
 - Both workflow YAML files parsed successfully and deployment contract
   assertions passed.
 - `git diff --check`: passed.
+
+## Meta attribution-learning Task 5 review follow-up (2026-07-16)
+
+The daily attribution implementation was hardened in a strict review-driven
+TDD pass. No Meta resource, budget ledger, deployment, production database, or
+external configuration was mutated.
+
+### Root causes and RED evidence
+
+- The initial evaluator covered only impressions, Meta landing-page views, and
+  a legacy registration event name. It therefore omitted the designed funnel,
+  costs, and denominator guards. The expanded regressions failed across the
+  exact metric map and every missing/zero denominator.
+- Comparison identity used fabricated objective, audience, and `utc-day`
+  defaults, and invalid source windows fell back to the current date. Missing
+  dimension and missing/invalid source-window regressions failed.
+- Learning evidence retained aggregate IDs and totals but not complete
+  per-variant values, dimensions, thresholds, or replayable decisions.
+  Evidence-shape, reinforcement, and concurrent replay regressions failed.
+- The hourly snapshot did not persist an explicit requested rolling-window
+  definition, and new Meta drafts did not persist their fixed traffic
+  objective. Both source-identity regressions failed.
+- The first review RED run reported `32 failed, 19 passed`; the secondary
+  evidence/source RED run reported `2 failed, 1 passed`.
+
+### Implemented review contract
+
+- `evaluate_publication` now returns the exact designed raw and derived metric
+  set: approved budget, spend, delivery, impressions, clicks/link clicks, Meta
+  and first-party landings, registrations, first listing created/published,
+  identity verification, and all seven guarded cost/conversion calculations.
+- Absent Meta values and suppressed/absent aggregate event groups remain
+  `None`; Slack renders them as `unavailable`. A missing or zero denominator
+  always yields `None`, never a fabricated zero conversion.
+- Daily summaries include every designed metric, explicit source window and
+  definition, sample sizes, and the Ads Manager link, under a descriptive-only
+  heading with no causal claim.
+- Completed immutable observations require valid explicit source
+  `window_start`, `window_stop`, and `window_definition`. Missing, malformed,
+  reversed, or incomplete source windows create no observation or learning and
+  are reported as unavailable. The hourly collector records the actual
+  requested rolling inclusive-calendar-day identity. Same-day start/stop
+  bounds remain a valid one-day inclusive window; only reversed bounds fail.
+- Reusable comparisons reject any missing or blank channel, objective, language,
+  audience, window definition, or bounds. They compare exact definitions and
+  bounds; persisted evidence also records inclusive window length.
+- New Meta drafts persist the connector's actual `OUTCOME_TRAFFIC` objective at
+  source. The daily layer does not infer missing objectives or audiences.
+- Each eligible learning evidence run records a deterministic decision ID,
+  eligible/reason result, dimensions, exact window, thresholds, aggregate
+  sample, and per-variant publication ID, immutable evidence ID, complete
+  compared metric values, and threshold sample sizes.
+- Replays of the same decision are idempotent. A genuinely new comparable
+  window reinforces once while retaining all prior replayable evidence runs.
+  Publication row locks serialize concurrent daily replays.
+
+### Review verification
+
+- Focused RED-to-GREEN suite:
+  `tests/test_performance_daily.py tests/test_learnings.py tests/test_agent_hourly_loop.py tests/test_cli_draft.py`
+  -> `60 passed`.
+- Focused plus adjacent database suite:
+  `tests/test_performance_daily.py tests/test_learnings.py tests/test_agent_hourly_loop.py tests/test_cli_draft.py tests/test_agent_main.py tests/test_migrations.py tests/test_publications.py tests/test_performance.py tests/test_meta_insights.py`
+  -> `121 passed in 13.98s` against local PostgreSQL on port 55432.
+- `uv run ruff check src tests` -> all checks passed.
+- `uv run ruff format --check src tests` -> 98 files already formatted.
+- `git diff --check` -> clean.
