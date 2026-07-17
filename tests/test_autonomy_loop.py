@@ -349,6 +349,22 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
                 "performance": json.dumps(unrelated),
             },
         )
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status) "
+                "SELECT 159,action_type_id,'meta','MULTI','published' FROM drafts WHERE id=156"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO publications(id,draft_id,channel,state,external_ids,approved_budget_cents,performance) "
+                "VALUES (0,159,'meta','terminal',CAST(:ids AS JSONB),700,CAST(:performance AS JSONB))"
+            ),
+            {
+                "ids": json.dumps({"campaign_id": "10", "ad_set_id": "19", "ad_id": "29"}),
+                "performance": json.dumps(first),
+            },
+        )
     await persist_autonomy_inputs(engine)
     budgets = {"20": 1000, "21": 1000, "22": 500}
     writes = []

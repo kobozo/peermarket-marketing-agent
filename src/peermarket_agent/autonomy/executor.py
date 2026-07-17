@@ -428,6 +428,7 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
                 .all()
             )
         ]
+    active_rows = [row for row in rows if row["state"] in {"active", "published"}]
     actual = [
         {
             "publication_id": int(row["publication_id"]),
@@ -435,8 +436,7 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
             "approved_budget_cents": int(row["approved_budget_cents"]),
             "external_ids": dict(row["external_ids"] or {}),
         }
-        for row in rows
-        if row["state"] in {"active", "published"}
+        for row in active_rows
     ]
 
     def identity_key(item: Mapping[str, Any]) -> tuple[int, int]:
@@ -457,7 +457,10 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
         or claim.decision.new_budget_cents != touched
     ):
         return None
-    canonical = rows[0]
+    canonical = min(
+        active_rows,
+        key=lambda row: (int(row["publication_id"]), int(row["draft_id"])),
+    )
     performance = dict(canonical["performance"] or {})
     performance["autonomy_basis"] = dict(frozen)
     return {
