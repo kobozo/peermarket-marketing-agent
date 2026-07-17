@@ -64,6 +64,14 @@ class MetaReplacementBundleResult:
 
 
 @dataclass(frozen=True)
+class MetaHookExperimentResult:
+    campaign_id: str
+    ad_set_id: str
+    variants: Mapping[str, MetaReplacementBundleResult]
+    status: str = "PAUSED"
+
+
+@dataclass(frozen=True)
 class MetaActivationResult:
     campaign: dict[str, str]
     ad_set: dict[str, str]
@@ -741,6 +749,72 @@ async def create_meta_replacement_bundle_paused(
             if f"local_image_sha256:{locale}" in current
         },
     )
+
+
+async def create_meta_hook_experiment_bundles_paused(
+    *,
+    config: MetaConfig,
+    experiment_id: str,
+    variants: Mapping[str, Mapping[str, MetaBundleLocale]],
+    landing_page_url: str,
+    audience_profile_key: str,
+    daily_budget_eur: int,
+    progress: Mapping[str, str] | None = None,
+    persist_progress: Callable[[str, str], Awaitable[None]],
+) -> MetaHookExperimentResult:
+    """Create three paused hook variants under one fenced campaign/ad set."""
+    expected = tuple(f"{experiment_id}:{number:02}" for number in (1, 2, 3))
+    if tuple(variants) != expected or any(
+        set(bundle) != {"NL", "FR", "EN"} for bundle in variants.values()
+    ):
+        raise ValueError(
+            "hook experiment requires ordered :01/:02/:03 variants with exact NL/FR/EN"
+        )
+    durable = dict(progress or {})
+    results: dict[str, MetaReplacementBundleResult] = {}
+    shared = {key: durable[key] for key in ("campaign_id", "ad_set_id") if key in durable}
+    for variant_id in expected:
+        prefix = f"variant:{variant_id}:"
+        local = dict(shared)
+        local.update(
+            {
+                key.removeprefix(prefix): value
+                for key, value in durable.items()
+                if key.startswith(prefix)
+            }
+        )
+
+        async def persist(key: str, value: str, *, _prefix: str = prefix) -> None:
+            durable_key = key if key in {"campaign_id", "ad_set_id"} else _prefix + key
+            existing = durable.get(durable_key)
+            if existing is not None and existing != value:
+                raise MetaAdsError(
+                    "durable hook experiment identity drift", phase="persist_hook_bundle"
+                )
+            durable[durable_key] = value
+            await persist_progress(durable_key, value)
+
+        result = await create_meta_replacement_bundle_paused(
+            config=config,
+            name=f"{experiment_id} {variant_id}",
+            locales=variants[variant_id],
+            landing_page_url=landing_page_url,
+            audience_profile_key=audience_profile_key,
+            daily_budget_eur=daily_budget_eur,
+            progress=local,
+            persist_progress=persist,
+        )
+        if shared and (
+            result.campaign_id != shared["campaign_id"] or result.ad_set_id != shared["ad_set_id"]
+        ):
+            raise MetaAdsError("hook variant parent identity drift", phase="verify_hook_bundle")
+        shared = {"campaign_id": result.campaign_id, "ad_set_id": result.ad_set_id}
+        results[variant_id] = result
+    ad_ids = [item for result in results.values() for item in result.ad_ids.values()]
+    creative_ids = [item for result in results.values() for item in result.creative_ids.values()]
+    if len(set(ad_ids)) != 9 or len(set(creative_ids)) != 9:
+        raise MetaAdsError("hook variants reused child identity", phase="verify_hook_bundle")
+    return MetaHookExperimentResult(shared["campaign_id"], shared["ad_set_id"], results)
 
 
 def _sync_get_replacement_bundle_statuses(

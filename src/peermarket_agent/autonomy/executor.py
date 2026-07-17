@@ -19,6 +19,7 @@ from peermarket_agent.autonomy.replacements import (
     LocaleCreative,
     ReplacementSource,
     build_replacement,
+    hook_experiment_meta_matrix,
 )
 from peermarket_agent.autonomy.snapshot import build_autonomy_snapshot
 from peermarket_agent.autonomy.store import (
@@ -33,6 +34,7 @@ from peermarket_agent.meta_ads import (
     MetaBundleLocale,
     MetaConfig,
     activate_meta_ad,
+    create_meta_hook_experiment_bundles_paused,
     get_meta_ad_statuses,
     get_meta_allocation_state,
     get_meta_budget_state,
@@ -178,6 +180,30 @@ class MetaExecutionAdapter:
             },
         }
         return publication
+
+    async def create_hook_experiment_paused(
+        self,
+        *,
+        experiment: Any,
+        daily_budget_eur: int,
+        audience_profile_key: str,
+        progress: Mapping[str, str] | None,
+        persist_progress: Any,
+        image_bytes: bytes | None = None,
+    ) -> Any:
+        """Bridge a frozen hook experiment to the guarded Meta matrix adapter."""
+        if _setting(self.settings, "meta_autonomy_shadow", True):
+            raise RuntimeError("shadow_mode")
+        return await create_meta_hook_experiment_bundles_paused(
+            config=self.config,
+            experiment_id=experiment.experiment_id,
+            variants=hook_experiment_meta_matrix(experiment, image_bytes=image_bytes),
+            landing_page_url=experiment.landing_page_url,
+            audience_profile_key=audience_profile_key,
+            daily_budget_eur=daily_budget_eur,
+            progress=progress,
+            persist_progress=persist_progress,
+        )
 
     async def read_replacement(
         self,

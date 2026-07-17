@@ -20,6 +20,7 @@ from peermarket_agent.autonomy.executor import (
     _SagaFailure,
     execute_claim,
 )
+from peermarket_agent.autonomy.hook_experiments import build_hook_experiment
 from peermarket_agent.autonomy.snapshot import (
     build_autonomy_basis,
     build_autonomy_snapshot,
@@ -34,6 +35,57 @@ from peermarket_agent.autonomy.store import (
 from peermarket_agent.db.migrations import run_migrations
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
+
+
+async def test_hook_experiment_adapter_shadow_mode_never_reaches_meta_matrix(monkeypatch):
+    meta = AsyncMock()
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.create_meta_hook_experiment_bundles_paused", meta
+    )
+    draft = {
+        "id": 156,
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "120249125021520343",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": {
+            "audience": "declutterers",
+            "optimization": "LANDING_PAGE_VIEWS",
+            "format": "single_image",
+            "visual": "asset",
+            "delivery": "lowest_cost",
+        },
+        "language_bundles": {
+            locale: {
+                "hook": "baseline",
+                "body": f"{locale} body",
+                "headline": f"{locale} headline",
+                "description": f"{locale} description",
+                "cta_label": "Learn More",
+            }
+            for locale in ("NL", "FR", "EN")
+        },
+    }
+    experiment = build_hook_experiment(draft, "warm", "seed")
+    adapter = MetaExecutionAdapter(
+        _settings(
+            meta_autonomy_shadow=True,
+            meta_app_id="app",
+            meta_app_secret="secret",
+            meta_system_user_token="token",
+            meta_ad_account_id="act_1",
+            meta_page_id="page",
+        ),
+        object(),
+    )
+    with pytest.raises(RuntimeError, match="shadow_mode"):
+        await adapter.create_hook_experiment_paused(
+            experiment=experiment,
+            daily_budget_eur=10,
+            audience_profile_key="declutterers",
+            progress=None,
+            persist_progress=AsyncMock(),
+        )
+    meta.assert_not_awaited()
 
 
 @pytest.fixture
