@@ -206,6 +206,11 @@ def _normalize_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "allow_replacement": allow_replacement,
         "variants": variants,
     }
+    frozen_basis = snapshot.get("frozen_basis")
+    if frozen_basis is not None:
+        if not isinstance(frozen_basis, Mapping):
+            raise _InvalidEvidence
+        normalized["frozen_basis"] = dict(frozen_basis)
     if delivery_state == "no_delivery":
         configured_active_since = _aware(
             snapshot.get("configured_active_since"), "configured_active_since"
@@ -507,6 +512,8 @@ def _decision(
         evidence["allocations"] = allocations
     if kind is DecisionKind.REPLACE:
         evidence["source"] = snapshot["replacement_source"]
+    if "frozen_basis" in snapshot:
+        evidence["frozen_basis"] = snapshot["frozen_basis"]
     canonical = {
         "campaign_id": snapshot["campaign_id"],
         "window_start": snapshot["window_start"].isoformat(),

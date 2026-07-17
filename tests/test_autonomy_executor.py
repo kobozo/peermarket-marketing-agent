@@ -20,7 +20,7 @@ from peermarket_agent.autonomy.executor import (
     _SagaFailure,
     execute_claim,
 )
-from peermarket_agent.autonomy.snapshot import build_autonomy_snapshot
+from peermarket_agent.autonomy.snapshot import build_autonomy_basis, build_autonomy_snapshot
 from peermarket_agent.autonomy.store import claim_next_action, enqueue_action
 from peermarket_agent.db.migrations import run_migrations
 
@@ -182,6 +182,7 @@ async def _scale_claim(engine):
         "approved_budget_cents": 1000,
         "performance": performance,
     }
+    performance["autonomy_basis"] = build_autonomy_basis(publication, performance)
     snapshot = build_autonomy_snapshot(
         publication, variants, replacement_source=None, allow_replacement=False
     )
@@ -193,6 +194,7 @@ async def _scale_claim(engine):
             "delivery_state": "healthy",
             "attribution_complete": True,
             "variants": variants,
+            "frozen_basis": snapshot["frozen_basis"],
         },
         reason="proven winner",
         window_start=snapshot["window_start"],
@@ -279,15 +281,24 @@ def _settings(**overrides):
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [
-        (lambda p: p.pop("meta"), "missing_snapshot"),
-        (lambda p: p["meta"].pop("latest"), "missing_snapshot"),
+        (lambda p: p.pop("autonomy_basis"), "missing_snapshot"),
         (
-            lambda p: p["meta"].update({"last_successful_retrieval": "2026-07-17T09:59:59+00:00"}),
-            "stale_snapshot",
+            lambda p: p["autonomy_basis"].update({"captured_at": "2026-07-17T09:59:59+00:00"}),
+            "frozen_basis_changed",
         ),
-        (lambda p: p["attribution"].update({"available": False}), "stale_snapshot"),
-        (lambda p: p["delivery"].update({"condition": "unknown"}), "stale_snapshot"),
-        (lambda p: p["meta"].update({"restated": True}), "stale_snapshot"),
+        (
+            lambda p: p["autonomy_basis"].update({"attribution_complete": False}),
+            "frozen_basis_changed",
+        ),
+        (
+            lambda p: p["autonomy_basis"].update({"delivery_state": "unknown"}),
+            "frozen_basis_changed",
+        ),
+        (lambda p: p["autonomy_basis"].update({"complete": False}), "frozen_basis_changed"),
+        (
+            lambda p: p["autonomy_basis"].update({"window_end": "2026-07-17T11:00:00+00:00"}),
+            "frozen_basis_changed",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -341,6 +352,24 @@ async def test_execution_cancels_each_changed_live_meta_state(engine, meta):
     result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
     assert result.status is ExecutionStatus.CANCELLED
     assert result.reason == "live_state_changed"
+    assert "set_budget" not in meta.calls
+
+
+@pytest.mark.asyncio
+async def test_database_and_live_meta_drifting_together_still_rejects_frozen_basis(engine):
+    claim = await _scale_claim(engine)
+    changed_ids = {"campaign_id": "10", "ad_set_id": "999", "ad_id": "998"}
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE publications SET external_ids=CAST(:ids AS JSONB), approved_budget_cents=1500"
+            ),
+            {"ids": json.dumps(changed_ids)},
+        )
+    meta = BudgetMeta(budget_cents=1500, ad_set_id="999", ad_id="998")
+    result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
+    assert result.status is ExecutionStatus.CANCELLED
+    assert result.reason == "frozen_basis_changed"
     assert "set_budget" not in meta.calls
 
 
@@ -410,7 +439,14 @@ def _replace_claim():
     decision = FrozenDecision(
         kind=DecisionKind.REPLACE,
         campaign_id="10",
-        evidence={"snapshot_id": "s", "source": source},
+        evidence={
+            "snapshot_id": "s",
+            "source": source,
+            "frozen_basis": {
+                "external_ids": {"campaign_id": "10", "ad_set_id": "20", "ad_id": "31"},
+                "approved_budget_cents": 1000,
+            },
+        },
         reason="replace",
         window_start=datetime(2026, 7, 16, tzinfo=UTC),
         window_end=NOW,
@@ -465,7 +501,17 @@ class ReplacementMeta:
 
     async def read_source(self, campaign_id, ids):
         self.calls.append("read_source")
-        return {"status": "PAUSED", "effective_status": "PAUSED"}
+        return {
+            **ids,
+            "budget_cents": 1000,
+            "status": "PAUSED",
+            "effective_status": "PAUSED",
+            "hierarchy": {
+                "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+                "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+                "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+            },
+        }
 
     async def pause_replacement(self, **kwargs):
         self.calls.append("pause_replacement")

@@ -409,6 +409,23 @@ def _source_ok(
     )
 
 
+def _paused_source_ok(source: Mapping[str, Any], ids: Mapping[str, str], budget: int) -> bool:
+    hierarchy = source.get("hierarchy") or {}
+    return (
+        _source_ids(source) == dict(ids)
+        and source.get("budget_cents") == budget
+        and set(hierarchy) == {"campaign", "ad_set", "ad"}
+        and hierarchy["campaign"].get("status") == "ACTIVE"
+        and hierarchy["campaign"].get("effective_status") in _ACTIVE_EFFECTIVE
+        and hierarchy["ad_set"].get("status") == "ACTIVE"
+        and hierarchy["ad_set"].get("effective_status") in _ACTIVE_EFFECTIVE
+        and hierarchy["ad"].get("status") == "PAUSED"
+        and hierarchy["ad"].get("effective_status") in _PAUSED_EFFECTIVE
+        and source.get("status") == "PAUSED"
+        and source.get("effective_status") in _PAUSED_EFFECTIVE
+    )
+
+
 def _history_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     events = []
     for row in rows:
@@ -476,6 +493,14 @@ def _policy_reason(
         )
     except (TypeError, ValueError):
         return "missing_snapshot"
+    frozen_basis = decision.evidence.get("frozen_basis")
+    if (
+        not isinstance(frozen_basis, Mapping)
+        or snapshot.get("frozen_basis") != frozen_basis
+        or publication.get("external_ids") != frozen_basis.get("external_ids")
+        or publication.get("approved_budget_cents") != frozen_basis.get("approved_budget_cents")
+    ):
+        return "frozen_basis_changed"
     captured_at = snapshot["captured_at"]
     if (
         snapshot.get("snapshot_id") != decision.evidence.get("snapshot_id")
@@ -607,9 +632,11 @@ async def _replace(
             source_after = await _external(
                 engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
             )
-            if (
-                source_after.get("status") != "PAUSED"
-                or source_after.get("effective_status") not in _PAUSED_EFFECTIVE
+            frozen_basis = claim.decision.evidence.get("frozen_basis") or {}
+            if not _paused_source_ok(
+                source_after,
+                frozen_basis.get("external_ids") or _source_ids(source),
+                frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
             ):
                 raise RuntimeError("source_not_paused")
         except BaseException:
@@ -620,9 +647,14 @@ async def _replace(
             except Exception as rollback_error:
                 rollback = {"error": type(rollback_error).__name__}
                 raise
-            if not _bundle_verified(verified, False, budget_cents):
-                raise RuntimeError("replacement_rollback_unproven") from None
-            rollback = {"mutation": rollback, "verified": verified}
+                verified_safe = _bundle_verified(verified, False, budget_cents)
+                rollback = {
+                    "mutation": rollback,
+                    "verified": verified_safe,
+                    "observed": verified,
+                }
+                if not verified_safe:
+                    raise RuntimeError("replacement_rollback_unproven") from None
             raise
         return {"replacement": active, "source": source_after}, rollback
     except BaseException as cause:
@@ -633,7 +665,16 @@ async def _replace(
                         engine, claim, meta, "pause_replacement", **ids
                     )
                     verified = await _external(engine, claim, meta, "read_replacement", **ids)
-                    rollback = {"mutation": rollback, "verified": verified}
+                    verified_safe = _bundle_verified(
+                        verified, False, frozen_source.daily_budget_eur * 100
+                    )
+                    rollback = {
+                        "mutation": rollback,
+                        "verified": verified_safe,
+                        "observed": verified,
+                    }
+                    if not verified_safe:
+                        raise RuntimeError("replacement_rollback_unproven")
                 elif hasattr(meta, "pause_persisted"):
                     rollback = await _write_external(
                         engine, claim, meta, "pause_persisted", engine=engine, claim=claim

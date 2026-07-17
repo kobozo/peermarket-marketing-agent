@@ -29,29 +29,25 @@ def build_autonomy_snapshot(
     performance = publication.get("performance")
     if not isinstance(performance, Mapping):
         raise ValueError("publication performance is missing")
-    meta = performance.get("meta")
-    delivery = performance.get("delivery")
-    attribution = performance.get("attribution")
-    if not all(isinstance(item, Mapping) for item in (meta, delivery, attribution)):
-        raise ValueError("performance namespaces are incomplete")
-    latest = meta.get("latest")
-    if not isinstance(latest, Mapping) or meta.get("error") is not None:
-        raise ValueError("latest Meta evidence is unavailable")
-    alignment = latest.get("utc_alignment")
-    if not isinstance(alignment, Mapping):
-        raise ValueError("Meta evidence window is unavailable")
-    window_start = _aware(alignment.get("start"), "window_start")
-    window_end = _aware(alignment.get("stop_exclusive"), "window_end")
-    captured_at = _aware(meta.get("last_successful_retrieval"), "captured_at")
-    ids = publication.get("external_ids")
-    campaign_id = ids.get("campaign_id") if isinstance(ids, Mapping) else None
-    budget = publication.get("approved_budget_cents")
+    basis = performance.get("autonomy_basis")
+    if not isinstance(basis, Mapping):
+        raise ValueError("persisted autonomy basis is missing")
+    ids = basis.get("external_ids")
+    campaign_id = basis.get("campaign_id")
+    budget = basis.get("approved_budget_cents")
+    window_start = _aware(basis.get("window_start"), "window_start")
+    window_end = _aware(basis.get("window_end"), "window_end")
+    captured_at = _aware(basis.get("captured_at"), "captured_at")
     if (
         not isinstance(campaign_id, str)
         or not campaign_id.isascii()
         or not campaign_id.isdecimal()
         or type(budget) is not int
         or budget <= 0
+        or not isinstance(ids, Mapping)
+        or ids.get("campaign_id") != campaign_id
+        or not isinstance(ids.get("ad_set_id"), str)
+        or not isinstance(ids.get("ad_id"), str)
         or not variants
     ):
         raise ValueError("publication identity or budget is incomplete")
@@ -62,28 +58,65 @@ def build_autonomy_snapshot(
         "window_end": window_end.isoformat(),
         "variants": list(variants),
         "source": replacement_source,
+        "frozen_basis": basis,
     }
     snapshot = {
         "snapshot_id": "autonomy:"
         + hashlib.sha256(
-            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                stable,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=lambda value: (
+                    value.isoformat() if isinstance(value, datetime) else str(value)
+                ),
+            ).encode()
         ).hexdigest(),
         "campaign_id": campaign_id,
         "captured_at": captured_at,
         "window_start": window_start,
         "window_end": window_end,
-        "complete": not bool(meta.get("restated")),
-        "delivery_state": delivery.get("condition", "unknown"),
-        "attribution_complete": attribution.get("available") is True,
+        "complete": basis.get("complete") is True,
+        "delivery_state": basis.get("delivery_state", "unknown"),
+        "attribution_complete": basis.get("attribution_complete") is True,
         "current_budget_cents": budget,
         "opening_budget_cents": budget,
         "allow_replacement": allow_replacement,
         "variants": list(variants),
         "replacement_source": replacement_source,
+        "frozen_basis": dict(basis),
     }
     if reallocation is not None:
         snapshot["reallocation"] = dict(reallocation)
     return snapshot
+
+
+def build_policy_decision(
+    publication: Mapping[str, Any],
+    variants: Sequence[Mapping[str, Any]],
+    *,
+    replacement_source: Mapping[str, Any] | None,
+    history: Sequence[Mapping[str, Any]],
+    limits: Mapping[str, Any] | object,
+    now: datetime,
+    allow_replacement: bool = True,
+    reallocation: Mapping[str, Any] | None = None,
+):
+    """Public Task 7 seam from persisted collector evidence to a frozen decision."""
+    from peermarket_agent.autonomy.policy import evaluate_campaign
+
+    return evaluate_campaign(
+        build_autonomy_snapshot(
+            publication,
+            variants,
+            replacement_source=replacement_source,
+            allow_replacement=allow_replacement,
+            reallocation=reallocation,
+        ),
+        history,
+        limits,
+        now,
+    )
 
 
 def build_autonomy_basis(
@@ -103,4 +136,6 @@ def build_autonomy_basis(
         "window_end": alignment.get("stop_exclusive"),
         "delivery_state": (performance.get("delivery") or {}).get("condition"),
         "attribution_complete": (performance.get("attribution") or {}).get("available") is True,
+        "complete": not bool((performance.get("meta") or {}).get("restated"))
+        and (performance.get("meta") or {}).get("error") is None,
     }
