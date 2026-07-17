@@ -2,7 +2,6 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -82,7 +81,7 @@ class Settings(BaseSettings):
     meta_autonomy_shadow: bool = True
     meta_autonomy_campaign_ids_csv: str = ""
     meta_autonomy_experiment_id: str = ""
-    meta_autonomy_variant_count: Literal[3] = 3
+    meta_autonomy_variant_count: int = Field(default=3, ge=3, le=3)
     meta_autonomy_max_replacements_24h: int = Field(default=1, ge=0, le=10)
     meta_autonomy_cooldown_hours: int = Field(default=24, ge=1, le=168)
     meta_autonomy_max_test_days: int = Field(default=7, ge=1, le=30)
