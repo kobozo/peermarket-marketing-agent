@@ -33,6 +33,28 @@ LOCALES = ("NL", "FR", "EN")
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 DIMENSIONS = {"hook", "copy", "visual", "audience"}
 _LOCALE_MARKER = re.compile(r"(^|\s)(?:\[(?:NL|FR|EN)\]|(?:NL|FR|EN):)(?:\s|$)", re.I)
+_HOOK_LANGUAGE_SIGNALS = {
+    "NL": {"je", "jouw", "spullen", "verkoop", "kopers", "veilig"},
+    "FR": {"vous", "vos", "vendez", "objets", "acheteurs", "sécurité"},
+    "EN": {"you", "your", "sell", "items", "buyers", "safely"},
+}
+
+
+def validate_native_hook_bundle(hooks: Mapping[str, str]) -> None:
+    """Reject missing, copied, labelled, or non-native hook text without performing I/O."""
+    if set(hooks) != set(LOCALES):
+        raise ValueError("hook bundle requires exact NL/FR/EN language coverage")
+    normalized = {}
+    for locale in LOCALES:
+        hook = hooks[locale]
+        if not isinstance(hook, str) or not hook.strip() or _LOCALE_MARKER.search(hook):
+            raise ValueError("hook bundle contains missing or labelled language text")
+        words = set(re.findall(r"[^\W\d_]+", hook.casefold(), flags=re.UNICODE))
+        if not words & _HOOK_LANGUAGE_SIGNALS[locale]:
+            raise ValueError(f"{locale} hook lacks native language evidence")
+        normalized[locale] = " ".join(hook.casefold().split())
+    if len(set(normalized.values())) != len(LOCALES):
+        raise ValueError("literal cross-language hook copy is not allowed")
 
 
 @dataclass(frozen=True, slots=True)
