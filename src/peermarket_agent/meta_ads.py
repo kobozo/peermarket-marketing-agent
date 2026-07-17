@@ -658,6 +658,22 @@ async def create_meta_replacement_bundle_paused(
     if set(locales) != {"NL", "FR", "EN"}:
         raise ValueError("Meta replacement bundle requires exact NL/FR/EN locales")
     current = dict(progress or {})
+    # Fence the entire retry before any lookup or create. A newly captured/edited
+    # image must never be attached to durable IDs created for different bytes.
+    for locale, child in locales.items():
+        if not child.image_bytes:
+            continue
+        expected_sha256 = hashlib.sha256(child.image_bytes).hexdigest()
+        expected_meta_hash = hashlib.md5(child.image_bytes).hexdigest()  # noqa: S324
+        stored_sha256 = current.get(f"local_image_sha256:{locale}")
+        stored_meta_hash = current.get(f"image_hash:{locale}")
+        if (stored_sha256 is not None and stored_sha256 != expected_sha256) or (
+            stored_meta_hash is not None and stored_meta_hash != expected_meta_hash
+        ):
+            raise MetaAdsError(
+                "durable progress does not match current frozen image bytes",
+                phase="validate_bundle_image_identity",
+            )
     for locale in (None, None, "NL", "FR", "EN"):
         child = locales.get(locale) if locale else None
         while (locale is None and ("campaign_id" not in current or "ad_set_id" not in current)) or (

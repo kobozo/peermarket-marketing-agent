@@ -75,13 +75,15 @@ _NONDELIVERING_EFFECTIVE_STATUSES = {
 
 
 def _is_verified_paused_bundle(observed: dict, budget_cents: int) -> bool:
-    expected = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
+    status_keys = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
+    creative_keys = {"creative:NL", "creative:FR", "creative:EN"}
+    observed_keys = frozenset(observed)
     return (
-        set(observed) == expected
+        observed_keys in {frozenset(status_keys), frozenset(status_keys | creative_keys)}
         and all(
-            item.get("status") == "PAUSED"
-            and item.get("effective_status") in _NONDELIVERING_EFFECTIVE_STATUSES
-            for item in observed.values()
+            observed[key].get("status") == "PAUSED"
+            and observed[key].get("effective_status") in _NONDELIVERING_EFFECTIVE_STATUSES
+            for key in status_keys
         )
         and observed["ad_set"].get("daily_budget") == budget_cents
     )

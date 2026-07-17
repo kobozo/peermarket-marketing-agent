@@ -1,6 +1,7 @@
 """Meta pipeline tests — approval → screenshot → brand-frame → paused Meta ad."""
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import asdict
@@ -361,6 +362,90 @@ async def test_autonomous_publication_persists_intention_then_creates_one_comple
     assert set(publication.ad_ids) == {"NL", "FR", "EN"}
     create.assert_awaited_once()
     assert "locale" not in create.await_args.kwargs
+
+
+async def test_autonomous_publication_accepts_real_connector_identity_result(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.screenshot_url", AsyncMock(return_value=b"raw")
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.edit_image", AsyncMock(return_value=b"prepared")
+    )
+    image_hash = hashlib.md5(b"prepared").hexdigest()  # noqa: S324
+    states = {
+        ("campaign", "new-c"): {"status": "PAUSED", "effective_status": "PAUSED"},
+        ("ad_set", "new-as"): {
+            "status": "PAUSED",
+            "effective_status": "CAMPAIGN_PAUSED",
+            "daily_budget": "1000",
+            "campaign_id": "new-c",
+        },
+    }
+    for locale, frozen in draft.locales.items():
+        states[("ad", f"ad-{locale}")] = {
+            "status": "PAUSED",
+            "effective_status": "ADSET_PAUSED",
+            "adset_id": "new-as",
+            "creative": {"id": f"cr-{locale}"},
+        }
+        states[("creative", f"cr-{locale}")] = {
+            "object_story_spec": {
+                "page_id": _make_settings().meta_page_id,
+                "link_data": {
+                    "message": frozen.primary_text,
+                    "link": draft.landing_page_url,
+                    "name": frozen.headline,
+                    "description": frozen.description,
+                    "call_to_action": {"type": "LEARN_MORE"},
+                    "image_hash": image_hash,
+                },
+            }
+        }
+
+    class Resource:
+        def __init__(self, kind, rid):
+            self.kind, self.rid = kind, rid
+
+        def api_get(self, fields):
+            return states[(self.kind, self.rid)]
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: None)
+    monkeypatch.setattr("peermarket_agent.meta_ads.Campaign", lambda rid: Resource("campaign", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdSet", lambda rid: Resource("ad_set", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.Ad", lambda rid: Resource("ad", rid))
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.AdCreative", lambda rid: Resource("creative", rid)
+    )
+
+    async def create_bundle(**kwargs):
+        values = {
+            "campaign_id": "new-c",
+            "ad_set_id": "new-as",
+            **{f"creative_id:{x}": f"cr-{x}" for x in ("NL", "FR", "EN")},
+            **{f"ad_id:{x}": f"ad-{x}" for x in ("NL", "FR", "EN")},
+        }
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        return MetaReplacementBundleResult(
+            "new-c",
+            "new-as",
+            {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager",
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused",
+        AsyncMock(side_effect=create_bundle),
+    )
+    publication = await publish_replacement_paused(
+        engine=engine, settings=_make_settings(), claim=claim, draft=draft
+    )
+    assert publication.ad_ids == {x: f"ad-{x}" for x in ("NL", "FR", "EN")}
 
 
 async def test_autonomous_publication_mismatch_makes_no_meta_call(
@@ -745,6 +830,44 @@ def test_paused_bundle_accepts_real_nondelivering_hierarchy_states(
         },
     }
     assert _is_verified_paused_bundle(observed, 1000)
+
+
+def test_paused_bundle_accepts_independently_verified_creative_identity_entries():
+    from peermarket_agent.meta_pipeline import _is_verified_paused_bundle
+
+    observed = {
+        "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED", "daily_budget": 1000},
+        **{
+            f"ad:{locale}": {"status": "PAUSED", "effective_status": "PAUSED"}
+            for locale in ("NL", "FR", "EN")
+        },
+        **{
+            f"creative:{locale}": {"object_story_spec": {"verified": locale}}
+            for locale in ("NL", "FR", "EN")
+        },
+    }
+    assert _is_verified_paused_bundle(observed, 1000)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_paused_bundle_rejects_missing_or_extra_creative_identity_entries(mutation):
+    from peermarket_agent.meta_pipeline import _is_verified_paused_bundle
+
+    observed = {
+        "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+        "ad_set": {"status": "PAUSED", "effective_status": "PAUSED", "daily_budget": 1000},
+        **{
+            f"ad:{locale}": {"status": "PAUSED", "effective_status": "PAUSED"}
+            for locale in ("NL", "FR", "EN")
+        },
+        **{f"creative:{locale}": {} for locale in ("NL", "FR", "EN")},
+    }
+    if mutation == "missing":
+        del observed["creative:FR"]
+    else:
+        observed["creative:DE"] = {}
+    assert not _is_verified_paused_bundle(observed, 1000)
 
 
 @pytest.mark.parametrize("bad", ["ACTIVE", "UNKNOWN", None])

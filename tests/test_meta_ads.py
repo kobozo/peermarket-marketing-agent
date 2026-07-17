@@ -346,6 +346,33 @@ async def test_live_bundle_validation_reads_parent_links_and_frozen_creative_ide
     assert observed["creative:NL"]["object_story_spec"]["link_data"]["message"] == "body"
 
 
+@pytest.mark.parametrize(
+    "creative_ids",
+    [
+        {"NL": "cr-NL", "FR": "cr-FR"},
+        {"NL": "cr-NL", "FR": "cr-FR", "EN": "cr-EN", "DE": "cr-DE"},
+    ],
+)
+async def test_live_bundle_validation_rejects_missing_or_extra_creative_identity(
+    monkeypatch, creative_ids
+):
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: None)
+    locales = {
+        locale: MetaBundleLocale("body", "head", "desc", "LEARN_MORE", None)
+        for locale in ("NL", "FR", "EN")
+    }
+    with pytest.raises(MetaAdsError, match="complete frozen creative identity"):
+        await get_meta_replacement_bundle_statuses(
+            _FULL_CONFIG,
+            "c1",
+            "as1",
+            {locale: f"ad-{locale}" for locale in ("NL", "FR", "EN")},
+            creative_ids=creative_ids,
+            landing_page_url="https://peermarket.eu/",
+            locales=locales,
+        )
+
+
 @pytest.mark.parametrize("collision", ["adset_parent", "ad_parent", "ad_creative", "creative_copy"])
 async def test_live_bundle_validation_rejects_identity_collision(monkeypatch, collision):
     story = {
@@ -447,6 +474,38 @@ async def test_replacement_bundle_creates_one_budget_hierarchy_and_three_locale_
     persisted_keys = [call.args[0] for call in persisted.await_args_list]
     assert "request_name:campaign" in persisted_keys
     assert {f"request_name:ad:{locale}" for locale in ("NL", "FR", "EN")} <= set(persisted_keys)
+
+
+@pytest.mark.parametrize("stored_key", ["local_image_sha256:NL", "image_hash:NL"])
+async def test_replacement_retry_changed_frozen_bytes_refuses_all_meta_calls(
+    monkeypatch, stored_key
+):
+    meta_call = MagicMock()
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", meta_call)
+    locales = {
+        locale: MetaBundleLocale("body", "head", "desc", "LEARN_MORE", b"current-image")
+        for locale in ("NL", "FR", "EN")
+    }
+    progress = {
+        "campaign_id": "campaign-1",
+        "ad_set_id": "adset-1",
+        stored_key: "0" * (64 if stored_key.startswith("local_") else 32),
+    }
+
+    with pytest.raises(MetaAdsError, match="frozen image") as caught:
+        await create_meta_replacement_bundle_paused(
+            config=_FULL_CONFIG,
+            name="replacement",
+            locales=locales,
+            landing_page_url="https://peermarket.eu/",
+            audience_profile_key="declutterers",
+            daily_budget_eur=10,
+            progress=progress,
+            persist_progress=AsyncMock(),
+        )
+
+    assert caught.value.phase == "validate_bundle_image_identity"
+    meta_call.assert_not_called()
 
 
 @pytest.mark.parametrize(
