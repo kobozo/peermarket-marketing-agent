@@ -469,6 +469,8 @@ class ReplacementMeta:
         self.active = False
         self.source_pause_fails = source_pause_fails
         self.rollback_verified = rollback_verified
+        self.source_paused = False
+        self.rollback_phase = False
 
     async def create_paused(self, **kwargs):
         self.calls.append("create_paused")
@@ -482,7 +484,7 @@ class ReplacementMeta:
     async def read_replacement(self, **kwargs):
         self.calls.append("read_replacement")
         status = "ACTIVE" if self.active else "PAUSED"
-        effective = status if self.rollback_verified else "ACTIVE"
+        effective = "ACTIVE" if self.rollback_phase and not self.rollback_verified else status
         result = {
             key: {"status": status, "effective_status": effective}
             for key in ("campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN")
@@ -498,30 +500,97 @@ class ReplacementMeta:
         self.calls.append("pause_source")
         if self.source_pause_fails:
             raise RuntimeError("source pause failed")
+        self.source_paused = True
 
     async def read_source(self, campaign_id, ids):
         self.calls.append("read_source")
+        status = "PAUSED" if self.source_paused else "ACTIVE"
         return {
             **ids,
             "budget_cents": 1000,
-            "status": "PAUSED",
-            "effective_status": "PAUSED",
+            "status": status,
+            "effective_status": status,
             "hierarchy": {
                 "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
                 "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE"},
-                "ad": {"status": "PAUSED", "effective_status": "PAUSED"},
+                "ad": {"status": status, "effective_status": status},
             },
         }
 
     async def pause_replacement(self, **kwargs):
         self.calls.append("pause_replacement")
         self.active = False
+        self.rollback_phase = True
         return {"paused": True}
 
 
 class ReplacementBuilder:
     async def build(self, **kwargs):
         return object()
+
+
+async def _public_replace_claim(engine):
+    decision = _replace_claim().decision
+    await enqueue_action(engine, decision)
+    claim = await claim_next_action(engine, "worker", lease_seconds=300)
+    async with engine.begin() as conn:
+        action_type = await conn.scalar(
+            text(
+                "INSERT INTO action_types(name,risk_tier,default_autonomy) "
+                "VALUES ('replacement_public','high','propose') RETURNING id"
+            )
+        )
+        draft = await conn.scalar(
+            text(
+                "INSERT INTO drafts(action_type_id,channel,language,status) "
+                "VALUES (:id,'meta','MULTI','published') RETURNING id"
+            ),
+            {"id": action_type},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO publications"
+                "(id,draft_id,channel,state,external_ids,approved_budget_cents,performance) "
+                "VALUES (2,:draft,'meta','active',"
+                '\'{"campaign_id":"10","ad_set_id":"20","ad_id":"31"}\','
+                "1000,'{}')"
+            ),
+            {"draft": draft},
+        )
+    return claim
+
+
+@pytest.mark.asyncio
+async def test_public_replace_source_pause_unverified_rollback_persists_exact_audit(
+    engine, monkeypatch
+):
+    claim = await _public_replace_claim(engine)
+    meta = ReplacementMeta(source_pause_fails=True, rollback_verified=False)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+
+    result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
+
+    assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,failure_category,failure_message,audit "
+                        "FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "reconciliation_required"
+    assert row["failure_category"] == "replacement_rollback_unproven"
+    assert row["failure_message"] == "replacement_rollback_unproven"
+    rollback = row["audit"]["rollback_result"]
+    assert rollback["verified"] is False
+    assert rollback["observed"]["ad:NL"]["effective_status"] == "ACTIVE"
 
 
 @pytest.mark.asyncio

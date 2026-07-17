@@ -639,23 +639,23 @@ async def _replace(
                 frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
             ):
                 raise RuntimeError("source_not_paused")
-        except BaseException:
+        except BaseException as source_pause_error:
             compensated = True
             try:
-                rollback = await _write_external(engine, claim, meta, "pause_replacement", **ids)
-                verified = await _external(engine, claim, meta, "read_replacement", **ids)
+                mutation = await _write_external(engine, claim, meta, "pause_replacement", **ids)
+                observed = await _external(engine, claim, meta, "read_replacement", **ids)
             except Exception as rollback_error:
                 rollback = {"error": type(rollback_error).__name__}
-                raise
-                verified_safe = _bundle_verified(verified, False, budget_cents)
-                rollback = {
-                    "mutation": rollback,
-                    "verified": verified_safe,
-                    "observed": verified,
-                }
-                if not verified_safe:
-                    raise RuntimeError("replacement_rollback_unproven") from None
-            raise
+                raise RuntimeError("replacement_rollback_unproven") from rollback_error
+            verified = _bundle_verified(observed, False, budget_cents)
+            rollback = {
+                "mutation": mutation,
+                "verified": verified,
+                "observed": observed,
+            }
+            if not verified:
+                raise RuntimeError("replacement_rollback_unproven") from None
+            raise source_pause_error
         return {"replacement": active, "source": source_after}, rollback
     except BaseException as cause:
         if not compensated:
@@ -922,6 +922,18 @@ async def execute_claim(
             return ExecutionResult(
                 ExecutionStatus.RETRYABLE, "meta_rate_limit", before, retry_at=retry_at
             )
+        cause = exc.cause if isinstance(exc, _SagaFailure) else exc
+        exact_failure = str(cause)
+        failure_category = (
+            exact_failure
+            if exact_failure
+            in {
+                "replacement_rollback_unproven",
+                "persisted_replacement_rollback_unproven",
+                "reallocation_rollback_unproven",
+            }
+            else "external_state_unproven"
+        )
         reconciled = await block_campaign_for_reconciliation(
             engine,
             claim,
@@ -929,12 +941,12 @@ async def execute_claim(
             rollback_result=(
                 exc.rollback_result if isinstance(exc, _SagaFailure) else locals().get("rollback")
             ),
-            failure_category="external_state_unproven",
-            failure_message=type(exc).__name__,
+            failure_category=failure_category,
+            failure_message=exact_failure or type(cause).__name__,
         )
         if reconciled:
             return ExecutionResult(
-                ExecutionStatus.RECONCILIATION_REQUIRED, "external_state_unproven", before
+                ExecutionStatus.RECONCILIATION_REQUIRED, failure_category, before
             )
         return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before)
     finally:
