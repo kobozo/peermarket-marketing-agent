@@ -205,7 +205,7 @@ class MetaExecutionAdapter:
         if _setting(self.settings, "meta_autonomy_shadow", True):
             raise RuntimeError("shadow_mode")
         async with engine.begin() as conn:
-            await conn.execute(
+            acquired = await conn.execute(
                 text(
                     "INSERT INTO autonomous_replacement_publications "
                     "(action_id,replacement_draft_id,source_draft_id,state,frozen_budget_cents,"
@@ -227,16 +227,19 @@ class MetaExecutionAdapter:
                     "token": claim.lease_token,
                 },
             )
-            stored = dict(
-                await conn.scalar(
-                    text(
-                        "SELECT progress FROM autonomous_replacement_publications WHERE action_id=:id"
-                    ),
-                    {"id": claim.id},
-                )
-                or {}
+            if acquired.rowcount != 1:
+                raise RuntimeError("replacement publication is owned by another worker")
+            stored = await conn.scalar(
+                text(
+                    "SELECT progress FROM autonomous_replacement_publications "
+                    "WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token "
+                    "AND lease_expires_at>NOW() FOR UPDATE"
+                ),
+                {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
             )
-        progress = stored
+            if stored is None:
+                raise RuntimeError("replacement publication lease ownership was lost")
+        progress = dict(stored)
 
         async def persist(key: str, value: str) -> None:
             await _renew_action(engine, claim)
@@ -336,15 +339,17 @@ class MetaExecutionAdapter:
     async def pause_persisted_hook_experiment(self, *, engine: Any, claim: Any) -> dict[str, Any]:
         await _renew_action(engine, claim)
         async with engine.connect() as conn:
-            progress = dict(
-                await conn.scalar(
-                    text(
-                        "SELECT progress FROM autonomous_replacement_publications WHERE action_id=:id"
-                    ),
-                    {"id": claim.id},
-                )
-                or {}
+            stored = await conn.scalar(
+                text(
+                    "SELECT progress FROM autonomous_replacement_publications "
+                    "WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token "
+                    "AND lease_expires_at>NOW()"
+                ),
+                {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
             )
+        if stored is None:
+            raise RuntimeError("replacement publication lease ownership was lost")
+        progress = dict(stored)
         campaign, ad_set = progress.get("campaign_id"), progress.get("ad_set_id")
         if not campaign or not ad_set:
             return {"verified": True, "mutations": {}}

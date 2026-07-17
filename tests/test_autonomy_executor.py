@@ -999,6 +999,58 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
 
 
 @pytest.mark.asyncio
+async def test_hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk(
+    engine, monkeypatch
+):
+    claim = await _public_replace_claim(engine)
+    experiment = _persisted_test_experiment()
+    draft = await _PersistedHookBuilder().build(
+        engine=engine, source=None, settings=None, claim=claim
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO autonomous_replacement_publications "
+                "(action_id,replacement_draft_id,source_draft_id,state,frozen_budget_cents,"
+                "source_campaign_id,changed_dimension,landing_page_url,lease_owner,lease_token,lease_expires_at) "
+                "VALUES (:action,100,1,'creating',1000,'10','hook','https://peermarket.eu/',"
+                "'other-worker','other-token',NOW()+INTERVAL '5 minutes')"
+            ),
+            {"action": claim.id},
+        )
+    sdk_create = AsyncMock()
+    sdk_pause = AsyncMock()
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.create_meta_hook_experiment_bundles_paused",
+        sdk_create,
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.pause_meta_replacement_bundle", sdk_pause
+    )
+    settings = _settings(
+        meta_app_id="app",
+        meta_app_secret="secret",
+        meta_system_user_token="token",
+        meta_ad_account_id="act_1",
+        meta_page_id="page",
+    )
+    adapter = MetaExecutionAdapter(settings, object())
+    with pytest.raises(RuntimeError, match="owned by another worker"):
+        await adapter.create_hook_experiment_paused(
+            experiment=experiment,
+            engine=engine,
+            claim=claim,
+            draft=draft,
+            daily_budget_eur=10,
+            audience_profile_key="declutterers",
+        )
+    with pytest.raises(RuntimeError, match="lease ownership was lost"):
+        await adapter.pause_persisted_hook_experiment(engine=engine, claim=claim)
+    sdk_create.assert_not_awaited()
+    sdk_pause.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_public_replace_source_pause_unverified_rollback_persists_exact_audit(
     engine, monkeypatch
 ):

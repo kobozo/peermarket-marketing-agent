@@ -65,3 +65,15 @@ Exact focused command:
 `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
 
 Result: `3 passed, 85 deselected`. Ruff and `git diff --check` also passed. Existing adapter-level PostgreSQL-independent tests continue to cover durable complete retry without duplicate SDK calls, rate-limit interruption, and child-resource drift; the saga uses the same fenced progress representation exercised by the new PostgreSQL success path.
+
+## Replacement-publication lease fencing
+
+Creation now checks the intention UPSERT rowcount and then locks/selects the replacement publication only when action ID, lease owner, lease token, and unexpired lease all match. Cleanup independently renews the action and selects progress with the same replacement-lease predicate. A transferred publication lease therefore causes zero matrix-create and zero reverse-pause SDK calls.
+
+PostgreSQL coverage creates a future-dated replacement lease owned by another worker and proves both creation and cleanup refuse before their SDK boundaries.
+
+Exact clean-database focused command:
+
+`AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
+
+Result: `4 passed, 85 deselected in 3.08s`. Ruff passed and the diff was whitespace-clean.
