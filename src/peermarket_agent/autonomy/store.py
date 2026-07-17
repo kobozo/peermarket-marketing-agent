@@ -40,6 +40,7 @@ class ClaimedAction:
     lease_owner: str
     lease_token: str
     lease_expires_at: datetime
+    decision: FrozenDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +163,15 @@ async def claim_next_action(
         raise ValueError("lease_seconds must be a positive integer")
     token = uuid.uuid4().hex
     async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE autonomous_actions SET status='reconciliation_required', "
+                "failure_category='worker_crash_during_execution', "
+                "failure_message='execution lease expired; external state requires reconciliation', "
+                "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
+                "WHERE status='executing' AND lease_expires_at <= NOW()"
+            )
+        )
         row = (
             (
                 await conn.execute(
@@ -175,7 +185,10 @@ async def claim_next_action(
                         " updated_at=NOW() FROM candidate, autonomous_decisions AS decision"
                         " WHERE action.id=candidate.id AND decision.id=action.decision_id"
                         " RETURNING action.id, action.decision_id, action.campaign_id, decision.kind,"
-                        " action.lease_owner, action.lease_token, action.lease_expires_at"
+                        " action.lease_owner, action.lease_token, action.lease_expires_at,"
+                        " decision.decision_key, decision.window_start, decision.window_end,"
+                        " decision.evidence, decision.reason, decision.old_budget_cents,"
+                        " decision.new_budget_cents"
                     ),
                     {"worker": worker, "token": token, "seconds": lease_seconds},
                 )
@@ -185,6 +198,17 @@ async def claim_next_action(
         )
     if row is None:
         return None
+    frozen_decision = FrozenDecision(
+        kind=DecisionKind(row["kind"]),
+        campaign_id=row["campaign_id"],
+        evidence=row["evidence"],
+        reason=row["reason"],
+        window_start=row["window_start"],
+        window_end=row["window_end"],
+        idempotency_key=row["decision_key"],
+        old_budget_cents=row["old_budget_cents"],
+        new_budget_cents=row["new_budget_cents"],
+    )
     return ClaimedAction(
         id=row["id"],
         decision_id=row["decision_id"],
@@ -193,6 +217,7 @@ async def claim_next_action(
         lease_owner=row["lease_owner"],
         lease_token=row["lease_token"],
         lease_expires_at=row["lease_expires_at"],
+        decision=frozen_decision,
     )
 
 
@@ -241,34 +266,46 @@ async def finish_action(
     if budget is not None and status is not ActionStatus.SUCCEEDED:
         raise ValueError("budget events require successful finalization")
     async with engine.begin() as conn:
-        result = await conn.execute(
-            text(
-                "UPDATE autonomous_actions SET status=:status, before_state=CAST(:before AS JSONB), "
-                "after_state=CAST(:after AS JSONB), audit=CAST(:audit AS JSONB), "
-                "failure_category=:category, failure_message=:message, "
-                "next_evaluation_at=:next_evaluation, lease_owner=NULL, lease_token=NULL, "
-                "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND status='executing' "
-                "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at > NOW()"
-            ),
-            {
-                "status": status.value,
-                "before": _json(before_state or {}),
-                "after": _json(after_state or {}),
-                "audit": _json(
-                    {"rollback_result": rollback_result} if rollback_result is not None else {}
-                ),
-                "category": _sanitize_category(failure_category),
-                "message": _sanitize_message(failure_message),
-                "next_evaluation": next_evaluation_at,
-                "id": claim.id,
-                "owner": claim.lease_owner,
-                "token": claim.lease_token,
-            },
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "UPDATE autonomous_actions SET status=:status, "
+                        "before_state=CAST(:before AS JSONB), after_state=CAST(:after AS JSONB), "
+                        "audit=CAST(:audit AS JSONB), failure_category=:category, "
+                        "failure_message=:message, next_evaluation_at=:next_evaluation, "
+                        "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
+                        "WHERE id=:id AND status='executing' AND lease_owner=:owner "
+                        "AND lease_token=:token AND lease_expires_at > NOW() "
+                        "RETURNING campaign_id, decision_id"
+                    ),
+                    {
+                        "status": status.value,
+                        "before": _json(_sanitize_audit_value(before_state or {})),
+                        "after": _json(_sanitize_audit_value(after_state or {})),
+                        "audit": _json(
+                            _sanitize_audit_value(
+                                {"rollback_result": rollback_result}
+                                if rollback_result is not None
+                                else {}
+                            )
+                        ),
+                        "category": _sanitize_category(failure_category),
+                        "message": _sanitize_message(failure_message),
+                        "next_evaluation": next_evaluation_at,
+                        "id": claim.id,
+                        "owner": claim.lease_owner,
+                        "token": claim.lease_token,
+                    },
+                )
+            )
+            .mappings()
+            .first()
         )
-        if result.rowcount != 1:
+        if row is None:
             return False
         if budget is not None:
-            await _insert_budget_event(conn, claim.id, claim.campaign_id, *budget)
+            await _insert_budget_event(conn, claim.id, row["campaign_id"], *budget)
         return True
 
 
@@ -329,10 +366,12 @@ async def block_campaign_for_reconciliation(
                 "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at > NOW()"
             ),
             {
-                "before": _json(before_state or {}),
-                "after": _json(after_state or {}),
+                "before": _json(_sanitize_audit_value(before_state or {})),
+                "after": _json(_sanitize_audit_value(after_state or {})),
                 "audit": _json(
-                    {"rollback_result": rollback_result} if rollback_result is not None else {}
+                    _sanitize_audit_value(
+                        {"rollback_result": rollback_result} if rollback_result is not None else {}
+                    )
                 ),
                 "category": _sanitize_category(failure_category),
                 "message": _sanitize_message(failure_message),
@@ -369,6 +408,14 @@ async def _insert_budget_event(
     for value in (old_budget_cents, new_budget_cents):
         if type(value) is not int or value <= 0:
             raise ValueError("budget cents must be positive integers")
+    authoritative_campaign_id = await conn.scalar(
+        text("SELECT campaign_id FROM autonomous_actions WHERE id=:id FOR SHARE"),
+        {"id": action_id},
+    )
+    if authoritative_campaign_id is None:
+        raise ValueError("budget event action does not exist")
+    if authoritative_campaign_id != campaign_id:
+        raise ValueError("budget event campaign does not match its action")
     row = (
         (
             await conn.execute(
@@ -434,7 +481,9 @@ async def campaign_history(engine: AsyncEngine, campaign_id: str) -> list[dict[s
 def _sanitize_category(value: str | None) -> str | None:
     if value is None:
         return None
-    sanitized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    sanitized = re.sub(r"[^a-z0-9]+", "_", (_sanitize_message(value) or "unknown").lower()).strip(
+        "_"
+    )
     return sanitized[:80] or "unknown"
 
 
@@ -442,6 +491,34 @@ def _sanitize_message(value: str | None) -> str | None:
     if value is None:
         return None
     value = re.sub(
-        r"(?i)(token|secret|password|access[_-]?token)\s*[=:]\s*\S+", r"\1=[redacted]", value
+        r"(?i)\b(?:authorization\s*[:=]\s*)?bearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s,;}&\]]+)",
+        "Bearer [redacted]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)(?:\"|')?(access[_-]?token|token|appsecret_proof|secret|password)(?:\"|')?"
+        r"\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s&,;}]+)",
+        r"\1=[redacted]",
+        value,
     )
     return " ".join(value.split())[:500]
+
+
+def _sanitize_audit_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[redacted]"
+                if re.fullmatch(
+                    r"(?i)authorization|access[_-]?token|token|appsecret_proof|secret|password",
+                    str(key),
+                )
+                else _sanitize_audit_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_audit_value(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_message(value)
+    return value

@@ -425,6 +425,16 @@ _STEPS: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_autonomous_budget_events_campaign_created "
     "ON autonomous_budget_events (campaign_id, created_at DESC)",
+    """CREATE OR REPLACE FUNCTION reject_autonomous_budget_event_mutation()
+       RETURNS TRIGGER AS $$
+       BEGIN
+         RAISE EXCEPTION 'autonomous_budget_events is append-only';
+       END;
+       $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS autonomous_budget_events_append_only ON autonomous_budget_events",
+    """CREATE TRIGGER autonomous_budget_events_append_only
+       BEFORE UPDATE OR DELETE ON autonomous_budget_events
+       FOR EACH ROW EXECUTE FUNCTION reject_autonomous_budget_event_mutation()""",
 ]
 
 
