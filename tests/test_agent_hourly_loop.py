@@ -236,7 +236,15 @@ async def test_hook_experiment_collector_persists_real_nine_ad_metrics(engine, m
         NOW.date(),
         NOW - timedelta(days=1),
         NOW,
-        (),
+        tuple(
+            SimpleNamespace(
+                utm_content=f"{experiment}:{number:02}:{locale}",
+                event_type="registration",
+                event_count=number,
+            )
+            for number in (1, 2, 3)
+            for locale in ("NL", "FR", "EN")
+        ),
         NOW,
     )
     async with engine.connect() as conn:
@@ -250,6 +258,10 @@ async def test_hook_experiment_collector_persists_real_nine_ad_metrics(engine, m
         == 900
     )
     assert all(item["window_start"] for variant in persisted.values() for item in variant.values())
+    assert [
+        sum(item["registrations"] for item in persisted[f"{experiment}:{number:02}"].values())
+        for number in (1, 2, 3)
+    ] == [3, 6, 9]
 
 
 async def test_one_meta_failure_does_not_block_other_publications(engine, monkeypatch):

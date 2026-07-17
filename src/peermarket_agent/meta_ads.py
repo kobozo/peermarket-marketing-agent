@@ -6,7 +6,7 @@ import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 from facebook_business.adobjects.ad import Ad
@@ -656,7 +656,7 @@ async def create_meta_replacement_bundle_paused(
     config: MetaConfig,
     name: str,
     locales: Mapping[str, MetaBundleLocale],
-    landing_page_url: str,
+    landing_page_url: str | Mapping[str, str],
     audience_profile_key: str,
     daily_budget_eur: int,
     progress: Mapping[str, str] | None = None,
@@ -714,7 +714,13 @@ async def create_meta_replacement_bundle_paused(
                     name=name,
                     audience_profile_key=audience_profile_key,
                     daily_budget_eur=daily_budget_eur,
-                    landing_page_url=landing_page_url,
+                    landing_page_url=(
+                        landing_page_url[locale]
+                        if locale is not None and isinstance(landing_page_url, Mapping)
+                        else next(iter(landing_page_url.values()))
+                        if isinstance(landing_page_url, Mapping)
+                        else landing_page_url
+                    ),
                     locale=locale,
                     creative=child,
                     progress=current,
@@ -798,7 +804,10 @@ async def create_meta_hook_experiment_bundles_paused(
             config=config,
             name=f"{experiment_id} {variant_id}",
             locales=variants[variant_id],
-            landing_page_url=landing_page_url,
+            landing_page_url={
+                locale: _with_utm_content(landing_page_url, f"{variant_id}:{locale}")
+                for locale in ("NL", "FR", "EN")
+            },
             audience_profile_key=audience_profile_key,
             daily_budget_eur=daily_budget_eur,
             progress=local,
@@ -815,6 +824,13 @@ async def create_meta_hook_experiment_bundles_paused(
     if len(set(ad_ids)) != 9 or len(set(creative_ids)) != 9:
         raise MetaAdsError("hook variants reused child identity", phase="verify_hook_bundle")
     return MetaHookExperimentResult(shared["campaign_id"], shared["ad_set_id"], results)
+
+
+def _with_utm_content(url: str, identity: str) -> str:
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "utm_content"]
+    query.append(("utm_content", identity))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def _sync_get_replacement_bundle_statuses(

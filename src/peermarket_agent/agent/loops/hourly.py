@@ -510,7 +510,7 @@ async def _collect_hook_experiment_metrics(
             (
                 await conn.execute(
                     text(
-                        "SELECT r.progress,p.draft_id FROM autonomous_replacement_publications r "
+                        "SELECT r.progress,p.draft_id,p.performance FROM autonomous_replacement_publications r "
                         "JOIN publications p ON p.draft_id=r.source_draft_id "
                         "JOIN autonomous_hook_experiment_variants v ON v.experiment_id=:experiment "
                         "AND v.campaign_id=r.source_campaign_id WHERE r.changed_dimension='hook' "
@@ -525,6 +525,7 @@ async def _collect_hook_experiment_metrics(
     if row is None:
         return
     progress = dict(row["progress"] or {})
+    basis = dict((row["performance"] or {}).get("autonomy_basis") or {})
     metrics: dict[str, dict] = {}
     for number in (1, 2, 3):
         variant_id = f"{experiment_id}:{number:02}"
@@ -546,11 +547,11 @@ async def _collect_hook_experiment_metrics(
                 "impressions": int(snapshot.impressions),
                 "landing_page_views": int(snapshot.landing_page_views),
                 "registrations": registrations,
-                "window_start": start.isoformat(),
-                "window_stop": stop.isoformat(),
+                "window_start": basis.get("window_start", start.isoformat()),
+                "window_stop": basis.get("window_end", stop.isoformat()),
                 "utc_start": utc_start.isoformat(),
                 "utc_stop_exclusive": utc_stop_exclusive.isoformat(),
-                "captured_at": now.isoformat(),
+                "captured_at": basis.get("captured_at", now.isoformat()),
             }
     await save_performance_snapshot(
         engine, int(row["draft_id"]), {"hook_experiment_variants": metrics}

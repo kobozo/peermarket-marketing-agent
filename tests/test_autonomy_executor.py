@@ -922,7 +922,9 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
             ):
                 rate_injected = True
                 raise MetaAdsError("rate limited", phase="create_bundle", api_error_code=613)
-            created_payloads.append((variant, locale, kwargs["creative"].primary_text))
+            created_payloads.append(
+                (variant, locale, kwargs["creative"].primary_text, kwargs["landing_page_url"])
+            )
             return f"creative_id:{locale}", f"cr-{variant}-{locale}"
         return f"ad_id:{locale}", f"ad-{variant}-{locale}"
 
@@ -1122,8 +1124,18 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         (f"exp:{number:02}", locale) for number in (1, 2, 3) for locale in ("NL", "FR", "EN")
     }
     assert all(
-        text.startswith("hook-") and "ordinary-hook" not in text for _, _, text in created_payloads
+        text.startswith("hook-") and "ordinary-hook" not in text
+        for _, _, text, _ in created_payloads
     )
+    assert {(variant, locale, url) for variant, locale, _, url in created_payloads} == {
+        (
+            f"exp:{number:02}",
+            locale,
+            f"https://peermarket.eu/?utm_content=exp%3A{number:02}%3A{locale}",
+        )
+        for number in (1, 2, 3)
+        for locale in ("NL", "FR", "EN")
+    }
     assert len(active_ads) == 9 and source_paused
     async with engine.connect() as conn:
         action = (

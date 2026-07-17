@@ -384,6 +384,15 @@ async def _persisted_hook_variants(
                 )
             ).mappings()
         ]
+        progress = await conn.scalar(
+            text(
+                "SELECT r.progress FROM autonomous_replacement_publications r "
+                "JOIN autonomous_hook_experiment_variants v ON v.experiment_id=:id "
+                "AND v.campaign_id=r.source_campaign_id WHERE r.changed_dimension='hook' "
+                "ORDER BY r.id DESC LIMIT 1"
+            ),
+            {"id": experiment_id},
+        )
     expected_ids = [f"{experiment_id}:{number:02}" for number in (1, 2, 3)]
     if len(records) != 9 or sorted({item["variant_id"] for item in records}) != expected_ids:
         return None
@@ -406,6 +415,27 @@ async def _persisted_hook_variants(
         return None
     samples = performance.get("hook_experiment_variants")
     samples = samples if isinstance(samples, dict) else {}
+    basis = performance.get("autonomy_basis")
+    if isinstance(basis, dict):
+        expected_window = {
+            "window_start": basis.get("window_start"),
+            "window_stop": basis.get("window_end"),
+            "captured_at": basis.get("captured_at"),
+        }
+        for variant_id in expected_ids:
+            variant_samples = samples.get(variant_id)
+            if not isinstance(variant_samples, dict):
+                return None
+            for locale in ("NL", "FR", "EN"):
+                sample = variant_samples.get(locale)
+                if not isinstance(sample, dict) or any(
+                    sample.get(field) != value for field, value in expected_window.items()
+                ):
+                    return None
+                if isinstance(progress, dict) and str(sample.get("ad_id") or "") != str(
+                    progress.get(f"variant:{variant_id}:ad_id:{locale}") or ""
+                ):
+                    return None
     result = []
     for index, variant_id in enumerate(expected_ids, 1):
         locales = [item for item in records if item["variant_id"] == variant_id]
