@@ -56,6 +56,7 @@ def test_autonomy_migration_has_durable_constraints_and_audit_fields():
     assert "create table if not exists autonomous_budget_events" in migration_sql
     assert "amount_cents int not null" in migration_sql
     assert "created_at timestamptz not null default now()" in migration_sql
+    assert "autonomous_decisions_append_only" in migration_sql
 
 
 def test_publications_migration_adds_reconciliation_columns_and_unique_draft_index():
@@ -105,6 +106,36 @@ async def test_migrations_are_idempotent(engine):
         result = await conn.execute(text("SELECT count(*) FROM action_types"))
         # Schema-only — seed lives in T4. Count is 0 here.
         assert result.scalar() == 0
+
+
+async def test_autonomous_decisions_are_append_only_at_database_level(engine):
+    await run_migrations(engine)
+    async with engine.begin() as conn:
+        decision_id = (
+            await conn.execute(
+                text(
+                    "INSERT INTO autonomous_decisions "
+                    "(decision_key, kind, campaign_id, window_start, window_end, evidence, reason) "
+                    "VALUES ('decision-1', 'observe', '123', NOW() - INTERVAL '1 hour', NOW(), "
+                    "'{\"snapshot_id\": 42}'::jsonb, 'observe') RETURNING id"
+                )
+            )
+        ).scalar_one()
+
+    for statement in (
+        "UPDATE autonomous_decisions SET reason = 'changed' WHERE id = :decision_id",
+        "DELETE FROM autonomous_decisions WHERE id = :decision_id",
+    ):
+        with pytest.raises(Exception, match="append-only"):
+            async with engine.begin() as conn:
+                await conn.execute(text(statement), {"decision_id": decision_id})
+
+    async with engine.connect() as conn:
+        reason = await conn.scalar(
+            text("SELECT reason FROM autonomous_decisions WHERE id = :decision_id"),
+            {"decision_id": decision_id},
+        )
+    assert reason == "observe"
 
 
 async def test_revision_schema_has_lineage_bindings_and_superseded_status(engine):

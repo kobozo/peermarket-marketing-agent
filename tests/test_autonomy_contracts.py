@@ -1,6 +1,8 @@
 """Tests for immutable autonomous lifecycle contracts."""
 
+import json
 from datetime import UTC, datetime
+from datetime import tzinfo as TzInfo
 
 import pytest
 
@@ -47,6 +49,36 @@ def test_frozen_decision_is_immutable():
         decision.reason = "changed"
 
 
+def test_frozen_decision_deeply_isolates_and_freezes_evidence():
+    source = {
+        "metrics": [{"name": "spend", "values": [12, 24]}],
+        "labels": {"winner", "stable"},
+    }
+    decision = _decision(evidence=source)
+
+    source["metrics"][0]["values"].append(48)
+    source["labels"].add("mutated")
+
+    assert decision.evidence["metrics"][0]["values"] == [12, 24]
+    assert set(decision.evidence["labels"]) == {"winner", "stable"}
+
+    with pytest.raises(TypeError):
+        decision.evidence["new"] = True
+    with pytest.raises(TypeError):
+        decision.evidence["metrics"][0]["values"].append(48)
+    with pytest.raises(TypeError):
+        decision.evidence["metrics"][0]["name"] = "clicks"
+
+
+def test_frozen_decision_evidence_remains_json_serializable():
+    decision = _decision(evidence={"metrics": [1, {"valid": True}], "labels": {"a", "b"}})
+
+    assert json.loads(json.dumps(decision.evidence)) == {
+        "metrics": [1, {"valid": True}],
+        "labels": ["a", "b"],
+    }
+
+
 def test_frozen_decision_rejects_scale_without_budget_values():
     with pytest.raises(ValueError):
         FrozenDecision(
@@ -78,6 +110,18 @@ def test_frozen_decision_requires_timezone_aware_ordered_window():
 
     with pytest.raises(ValueError, match="window"):
         _decision(window_start=datetime(2026, 7, 17, tzinfo=UTC))
+
+
+def test_frozen_decision_rejects_tzinfo_with_no_utc_offset():
+    class MissingOffset(TzInfo):
+        def utcoffset(self, dt):
+            return None
+
+        def dst(self, dt):
+            return None
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _decision(window_start=datetime(2026, 7, 15, tzinfo=MissingOffset()))
 
 
 @pytest.mark.parametrize(

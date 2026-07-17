@@ -7,6 +7,56 @@ from enum import StrEnum
 from typing import Any
 
 
+def _immutable(*args: object, **kwargs: object) -> None:
+    raise TypeError("frozen evidence cannot be mutated")
+
+
+class _FrozenDict(dict[str, Any]):
+    """A JSON-serializable dict whose mutation API is disabled."""
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+
+class _FrozenList(list[Any]):
+    """A JSON-serializable list whose mutation API is disabled."""
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+
+
+def _freeze_json(value: Any) -> Any:
+    """Copy JSON-like containers into recursively immutable, serializable values."""
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("evidence mapping keys must be strings")
+        return _FrozenDict((key, _freeze_json(item)) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return _FrozenList(_freeze_json(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        frozen = (_freeze_json(item) for item in value)
+        return _FrozenList(sorted(frozen, key=repr))
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"evidence values must be JSON-like, got {type(value).__name__}")
+
+
 class DecisionKind(StrEnum):
     OBSERVE = "observe"
     PAUSE = "pause"
@@ -45,12 +95,15 @@ class FrozenDecision:
             or self.window_end is None
             or self.window_start.tzinfo is None
             or self.window_end.tzinfo is None
+            or self.window_start.utcoffset() is None
+            or self.window_end.utcoffset() is None
         ):
             raise ValueError("decision window timestamps must be timezone-aware")
         if self.window_start >= self.window_end:
             raise ValueError("window_start must precede window_end")
         if not self.evidence:
             raise ValueError("evidence must be non-empty")
+        object.__setattr__(self, "evidence", _freeze_json(self.evidence))
         if not self.reason.strip():
             raise ValueError("reason must be non-empty")
         if not self.idempotency_key.strip():

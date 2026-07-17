@@ -380,6 +380,16 @@ _STEPS: list[str] = [
         new_budget_cents INT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )""",
+    """CREATE OR REPLACE FUNCTION reject_autonomous_decision_mutation()
+       RETURNS TRIGGER AS $$
+       BEGIN
+         RAISE EXCEPTION 'autonomous_decisions is append-only';
+       END;
+       $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS autonomous_decisions_append_only ON autonomous_decisions",
+    """CREATE TRIGGER autonomous_decisions_append_only
+       BEFORE UPDATE OR DELETE ON autonomous_decisions
+       FOR EACH ROW EXECUTE FUNCTION reject_autonomous_decision_mutation()""",
     """CREATE TABLE IF NOT EXISTS autonomous_actions (
         id BIGSERIAL PRIMARY KEY,
         decision_id BIGINT NOT NULL REFERENCES autonomous_decisions(id),
