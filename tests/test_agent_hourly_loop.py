@@ -396,6 +396,25 @@ async def test_feature_flags_default_false_and_disabled_pulse_does_not_collect(e
     collector.assert_not_awaited()
 
 
+async def test_hourly_collects_before_autonomy_and_passes_explicit_dependencies(
+    engine, monkeypatch
+):
+    calls = []
+    collector = AsyncMock(side_effect=lambda *args, **kwargs: calls.append("collect"))
+    autonomy = AsyncMock(side_effect=lambda *args, **kwargs: calls.append("autonomy"))
+    monkeypatch.setattr("peermarket_agent.agent.loops.hourly.collect_meta_performance", collector)
+    monkeypatch.setattr("peermarket_agent.agent.loops.hourly.run_autonomy_cycle", autonomy)
+    settings = _settings(meta_insights_enabled=True, meta_autonomy_enabled=True)
+    claude, notifier = object(), object()
+    peermarket = AsyncMock()
+    peermarket.fetch_kpis.return_value = {}
+
+    await run_hourly_pulse(engine, peermarket, settings=settings, notifier=notifier, claude=claude)
+
+    assert calls == ["collect", "autonomy"]
+    autonomy.assert_awaited_once_with(engine, claude, notifier, settings)
+
+
 async def test_missing_attribution_view_alerts_once_without_blocking_meta(engine, monkeypatch):
     await _publication(engine, 156, "ad-1")
     peermarket = AsyncMock()

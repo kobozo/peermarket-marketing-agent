@@ -2,7 +2,7 @@
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1191,6 +1191,11 @@ async def test_policy_replace_is_cancelled_when_replacement_count_changes_before
     prior_claim = await claim_next_action(engine, "history-worker")
     assert await begin_execution(engine, prior_claim)
     assert await finish_action(engine, prior_claim, status=ActionStatus.SUCCEEDED)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE autonomous_actions SET updated_at=:at WHERE id=:id"),
+            {"at": NOW - timedelta(minutes=1), "id": prior_claim.id},
+        )
     await enqueue_action(engine, decision)
     claim = await claim_next_action(engine, "executor-worker")
     meta = ReplacementMeta()

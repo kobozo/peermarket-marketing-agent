@@ -10,6 +10,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from peermarket_agent.agent.loops.autonomy import run_autonomy_cycle
 from peermarket_agent.autonomy.snapshot import build_autonomy_basis
 from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
@@ -480,8 +481,9 @@ async def collect_meta_performance(
 
 
 async def run_hourly_pulse(
-    engine: AsyncEngine, peermarket, *, settings=None, notifier=None
+    engine: AsyncEngine, peermarket, *, settings=None, notifier=None, claude=None
 ) -> None:
     await _record_heartbeat_and_site_kpis(engine, peermarket)
     if settings and settings.meta_insights_enabled:
         await collect_meta_performance(engine, settings, peermarket, notifier)
+        await run_autonomy_cycle(engine, claude, notifier, settings)

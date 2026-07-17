@@ -194,7 +194,7 @@ _STEPS: list[str] = [
         draft_id BIGINT NOT NULL REFERENCES drafts(id),
         channel_id TEXT,
         root_ts TEXT,
-        message_kind TEXT NOT NULL CHECK (message_kind IN ('root_approval','thread_approval')),
+        message_kind TEXT NOT NULL CHECK (message_kind IN ('root_approval','thread_approval','autonomy_audit')),
         payload JSONB NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending'
             CHECK (status IN ('pending','delivered','failed')),
@@ -236,6 +236,19 @@ _STEPS: list[str] = [
          END LOOP;
          ALTER TABLE slack_outbox ADD CONSTRAINT slack_outbox_status_check
            CHECK (status IN ('pending','delivered','failed','obsolete'));
+       END $$""",
+    """DO $$
+       DECLARE constraint_name TEXT;
+       BEGIN
+         FOR constraint_name IN
+           SELECT conname FROM pg_constraint
+           WHERE conrelid = 'slack_outbox'::regclass AND contype = 'c'
+             AND pg_get_constraintdef(oid) LIKE '%message_kind%'
+         LOOP
+           EXECUTE format('ALTER TABLE slack_outbox DROP CONSTRAINT %I', constraint_name);
+         END LOOP;
+         ALTER TABLE slack_outbox ADD CONSTRAINT slack_outbox_message_kind_check
+           CHECK (message_kind IN ('root_approval','thread_approval','autonomy_audit'));
        END $$""",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
