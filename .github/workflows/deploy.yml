@@ -182,3 +182,28 @@ jobs:
             sleep 2
           done
           echo "healthz failed after 5 retries"; exit 1
+
+      - name: Verify hook experiment shadow canary
+        if: ${{ vars.META_AUTONOMY_EXPERIMENT_ID != '' && vars.META_AUTONOMY_ENABLED == 'true' && vars.META_AUTONOMY_SHADOW == 'true' }}
+        run: |
+          set -euo pipefail
+          report="$(sudo -u peermarket-agent bash -c '
+            set -a
+            source /etc/peermarket-agent/secrets.env
+            set +a
+            cd /opt/peermarket-agent
+            /opt/peermarket-agent/.venv/bin/peermarket-performance autonomy --draft-id 156
+          ')"
+          REPORT="$report" python3 - <<'PY'
+          import json, os
+          report = json.loads(os.environ["REPORT"])
+          experiment = report["hook_experiment"]
+          experiment_id = experiment["experiment_id"]
+          expected = [f"{experiment_id}:{number:02}" for number in (1, 2, 3)]
+          actual = [item["variant_id"] for item in experiment["variants"]]
+          assert report["draft_id"] == 156
+          assert report["feature_flags"] == {"enabled": True, "shadow": True, "allowlisted": True}
+          assert experiment["variant_count"] == 3 and actual == expected
+          assert experiment["fixed_identity_match"] and experiment["ready"]
+          assert report["action"] is None
+          PY

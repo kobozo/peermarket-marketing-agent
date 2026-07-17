@@ -7,16 +7,41 @@ This canary is restricted to Draft 156 and Meta campaign `120249125021520342`. I
 First generate and review the deterministic experiment ID in a non-production environment. Set only GitHub repository variables; never put credentials or hook copy in variables.
 
 ```bash
+gh variable set META_INSIGHTS_ENABLED --body true
+gh variable set PEERMARKET_ATTRIBUTION_ENABLED --body true
 gh variable set META_AUTONOMY_CAMPAIGN_IDS_CSV --body 120249125021520342
 gh variable set META_AUTONOMY_EXPERIMENT_ID --body '<frozen-experiment-id>'
 gh variable set META_AUTONOMY_VARIANT_COUNT --body 3
 gh variable set META_AUTONOMY_ENABLED --body true
 gh variable set META_AUTONOMY_SHADOW --body true
+gh variable set META_AUTONOMY_MAX_INCREASE_PERCENT --body 20
+gh variable set META_AUTONOMY_MAX_DAILY_BUDGET_EUR --body 20
+gh variable set META_AUTONOMY_MAX_REPLACEMENTS_24H --body 1
+gh variable set META_AUTONOMY_MAX_TEST_DAYS --body 7
+gh variable set META_AUTONOMY_COOLDOWN_HOURS --body 24
 
+dispatch_hook_canary() {
+  local deploy_ref head_sha boundary attempt run_id run_output
+  local -a run_ids
 deploy_ref="$(git branch --show-current)"
+  head_sha="$(git rev-parse HEAD)"
+  boundary="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 gh workflow run deploy.yml --ref "$deploy_ref"
-run_id="$(gh run list --workflow deploy.yml --event workflow_dispatch --branch "$deploy_ref" --limit 1 --json databaseId --jq '.[0].databaseId')"
-gh run watch "$run_id" --exit-status
+  for attempt in {1..12}; do
+    run_output="$(gh run list --workflow deploy.yml --event workflow_dispatch --branch "$deploy_ref" --commit "$head_sha" --created ">=$boundary" --limit 20 --json databaseId --jq ".[].databaseId")" || return 1
+    mapfile -t run_ids <<<"$run_output"
+    if (( ${#run_ids[@]} > 1 )); then return 1; fi
+    if (( ${#run_ids[@]} == 1 )); then
+      run_id="${run_ids[0]}"
+      [[ "$run_id" =~ ^[0-9]+$ ]] || return 1
+      gh run watch "$run_id" --exit-status
+      return
+    fi
+    sleep 5
+  done
+  return 1
+}
+dispatch_hook_canary
 ```
 
 Do not continue unless the watched workflow succeeded and its commit matches the intended revision.
@@ -30,7 +55,9 @@ Run the read-only inspection on the deployed host:
 peermarket-performance autonomy --draft-id 156
 ```
 
-The sanitized `hook_experiment` result must show the configured experiment ID, `variant_count: 3`, three variant IDs each with EN/FR/NL, `fixed_identity_match: true`, `ready: true`, and no blocked reason. It intentionally omits hook text, the fixed identity values, tokens, and credentials. Confirm separately in Meta that no resources changed during shadow preparation.
+The sanitized `hook_experiment` result must show the configured experiment ID, `variant_count: 3`, exactly `:01`, `:02`, and `:03` with EN/FR/NL, `fixed_identity_match: true`, `ready: true`, and no blocked reason. Confirm the fixed landing page and audience identity, a sufficient or insufficient evidence state, no queued action, and a durable Slack audit. It intentionally omits hook text, fixed identity values, tokens, and credentials.
+
+Keep shadow true and execution writes disabled until an explicit later canary approval. Record the correlated successful CI run ID and commit SHA in the handoff; this implementation task does not dispatch it.
 
 ## Kill switch
 

@@ -118,6 +118,34 @@ def test_hook_experiment_runbook_is_ci_only_shadow_first_and_has_kill_switch():
     )
 
 
+def test_hook_canary_uses_correlated_ci_dispatch_and_deployed_read_only_gate():
+    runbook = HOOK_RUNBOOK.read_text()
+    workflow = DEPLOY_WORKFLOW.read_text()
+    for line in (
+        "gh variable set META_INSIGHTS_ENABLED --body true",
+        "gh variable set PEERMARKET_ATTRIBUTION_ENABLED --body true",
+        "gh variable set META_AUTONOMY_ENABLED --body true",
+        "gh variable set META_AUTONOMY_SHADOW --body true",
+        "gh variable set META_AUTONOMY_CAMPAIGN_IDS_CSV --body 120249125021520342",
+        "gh variable set META_AUTONOMY_MAX_INCREASE_PERCENT --body 20",
+        "gh variable set META_AUTONOMY_MAX_DAILY_BUDGET_EUR --body 20",
+        "gh variable set META_AUTONOMY_MAX_REPLACEMENTS_24H --body 1",
+        "gh variable set META_AUTONOMY_MAX_TEST_DAYS --body 7",
+        "gh variable set META_AUTONOMY_COOLDOWN_HOURS --body 24",
+    ):
+        assert line in runbook
+    assert '--commit "$head_sha" --created ">=$boundary"' in runbook
+    assert 'gh run watch "$run_id" --exit-status' in runbook
+    assert "exactly `:01`, `:02`, and `:03`" in runbook
+    assert "fixed landing page and audience identity" in runbook
+    assert "sufficient or insufficient evidence" in runbook
+    assert "no queued action" in runbook
+    assert "durable Slack audit" in runbook
+    assert "explicit later canary approval" in runbook
+    assert "Verify hook experiment shadow canary" in workflow
+    assert "peermarket-performance autonomy --draft-id 156" in workflow
+
+
 def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials():
     text = RUNBOOK.read_text()
     required = {
