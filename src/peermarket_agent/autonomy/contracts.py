@@ -128,7 +128,15 @@ class FrozenDecision:
             for item in frozen.values():
                 if (
                     not isinstance(item, Mapping)
-                    or set(item) != {"ad_set_id", "ad_id", "old_budget_cents", "new_budget_cents"}
+                    or set(item)
+                    != {
+                        "campaign_id",
+                        "variant_id",
+                        "ad_set_id",
+                        "ad_id",
+                        "old_budget_cents",
+                        "new_budget_cents",
+                    }
                     or not all(
                         isinstance(item[key], str) and item[key].isascii() and item[key].isdecimal()
                         for key in ("ad_set_id", "ad_id")
@@ -139,6 +147,14 @@ class FrozenDecision:
                     )
                 ):
                     raise ValueError("reallocation allocations are invalid")
+                if (
+                    item["campaign_id"] != self.campaign_id
+                    or not isinstance(item["variant_id"], str)
+                    or not item["variant_id"].strip()
+                ):
+                    raise ValueError("reallocation allocation ownership is invalid")
+            if frozen["winner"]["variant_id"] == frozen["loser"]["variant_id"]:
+                raise ValueError("reallocation variants must differ")
             if (
                 sum(item["old_budget_cents"] for item in frozen.values()) != self.old_budget_cents
                 or sum(item["new_budget_cents"] for item in frozen.values())

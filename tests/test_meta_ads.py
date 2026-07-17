@@ -16,6 +16,7 @@ from peermarket_agent.meta_ads import (
     activate_meta_ad,
     create_meta_ad_paused,
     create_meta_replacement_bundle_paused,
+    get_meta_allocation_state,
     get_meta_budget_state,
     get_meta_replacement_bundle_statuses,
     pause_meta_replacement_bundle,
@@ -783,6 +784,43 @@ async def test_get_meta_budget_state_reads_bound_exact_resources(monkeypatch):
     adset.api_get.assert_called_once_with(fields=["status", "effective_status", "daily_budget"])
     assert observed["ad"] == {"status": "PAUSED", "effective_status": "PAUSED"}
     assert observed["ad_set"]["daily_budget"] == 1200
+
+
+async def test_get_meta_allocation_state_verifies_exact_parent_ownership(monkeypatch):
+    _, _, ad, adset, *_ = _patch_mutation_sdk(
+        monkeypatch,
+        ad_state={"status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "123"},
+        adset_state={
+            "status": "ACTIVE",
+            "effective_status": "ACTIVE",
+            "daily_budget": "1200",
+            "campaign_id": "789",
+        },
+    )
+    observed = await get_meta_allocation_state(_FULL_CONFIG, "789", "123", "456")
+    assert observed["campaign_id"] == "789"
+    assert observed["ad"]["ad_set_id"] == "123"
+    assert observed["ad_set"]["campaign_id"] == "789"
+    assert observed["ad_set"]["daily_budget"] == 1200
+    ad.api_get.assert_called_once_with(fields=["status", "effective_status", "adset_id"])
+    adset.api_get.assert_called_once_with(
+        fields=["status", "effective_status", "daily_budget", "campaign_id"]
+    )
+
+
+async def test_get_meta_allocation_state_rejects_wrong_parent(monkeypatch):
+    _patch_mutation_sdk(
+        monkeypatch,
+        ad_state={"status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "wrong"},
+        adset_state={
+            "status": "ACTIVE",
+            "effective_status": "ACTIVE",
+            "daily_budget": "1200",
+            "campaign_id": "789",
+        },
+    )
+    with pytest.raises(MetaAdsError, match="hierarchy mismatch"):
+        await get_meta_allocation_state(_FULL_CONFIG, "789", "123", "456")
 
 
 @pytest.mark.parametrize(

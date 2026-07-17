@@ -1157,6 +1157,68 @@ async def get_meta_budget_state(
     return await asyncio.to_thread(_sync_get_budget_state, config, validated)
 
 
+def _sync_get_allocation_state(
+    config: MetaConfig, campaign_id: str, ad_set_id: str, ad_id: str
+) -> dict[str, object]:
+    resource_ids = {
+        "campaign_id": campaign_id,
+        "ad_set_id": ad_set_id,
+        "ad_id": ad_id,
+    }
+    try:
+        _ensure_enabled(config)
+        api = _init_api(config)
+        ad = dict(Ad(ad_id, api=api).api_get(fields=["status", "effective_status", "adset_id"]))
+        ad_set = dict(
+            AdSet(ad_set_id, api=api).api_get(
+                fields=["status", "effective_status", "daily_budget", "campaign_id"]
+            )
+        )
+        if str(ad.get("adset_id")) != ad_set_id or str(ad_set.get("campaign_id")) != campaign_id:
+            raise _mutation_error(
+                "Meta allocation hierarchy mismatch",
+                config,
+                phase="get_allocation_state",
+                resource_ids=resource_ids,
+            )
+        return {
+            **resource_ids,
+            "ad": {
+                "status": str(ad.get("status", "")),
+                "effective_status": str(ad.get("effective_status", "")),
+                "ad_set_id": str(ad.get("adset_id", "")),
+            },
+            "ad_set": {
+                "status": str(ad_set.get("status", "")),
+                "effective_status": str(ad_set.get("effective_status", "")),
+                "campaign_id": str(ad_set.get("campaign_id", "")),
+                **_normalized_daily_budget(ad_set),
+            },
+        }
+    except MetaAdsError:
+        raise
+    except Exception as exc:
+        raise _mutation_error(
+            f"Meta allocation state read failed: {exc}",
+            config,
+            phase="get_allocation_state",
+            resource_ids=resource_ids,
+            sdk_error=exc,
+        ) from None
+
+
+async def get_meta_allocation_state(
+    config: MetaConfig, campaign_id: str, ad_set_id: str, ad_id: str
+) -> dict[str, object]:
+    """Read and verify exact ad -> ad set -> campaign ownership and budget."""
+    values = [
+        _validate_resource_id(campaign_id, "campaign_id"),
+        _validate_resource_id(ad_set_id, "ad_set_id"),
+        _validate_resource_id(ad_id, "ad_id"),
+    ]
+    return await asyncio.to_thread(_sync_get_allocation_state, config, *values)
+
+
 def _sync_observe_best_effort(config: MetaConfig, ids: dict[str, str]) -> dict[str, dict[str, str]]:
     try:
         return _sync_get_statuses(config, ids)

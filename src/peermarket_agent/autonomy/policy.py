@@ -130,6 +130,14 @@ def evaluate_campaign(
         )
 
     if normalized["allow_replacement"]:
+        if normalized.get("replacement_source") is None:
+            return _decision(
+                DecisionKind.OBSERVE,
+                normalized,
+                ordered_history,
+                "missing_replacement_source",
+                outcome,
+            )
         replacements = sum(
             event["kind"] == "replace" and event["at"] > now - timedelta(hours=24)
             for event in ordered_history
@@ -214,6 +222,9 @@ def _normalize_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "new_budget_cents": _positive_int(item.get("new_budget_cents"), "new_budget_cents"),
             "allocations": _normalize_allocations(item.get("allocations")),
         }
+    source = snapshot.get("replacement_source")
+    if source is not None:
+        normalized["replacement_source"] = _normalize_replacement_source(source, campaign_id)
     return normalized
 
 
@@ -375,6 +386,8 @@ def _normalize_allocations(value):
     result = {}
     for label, item in value.items():
         if not isinstance(item, Mapping) or set(item) != {
+            "campaign_id",
+            "variant_id",
             "ad_set_id",
             "ad_id",
             "old_budget_cents",
@@ -386,12 +399,88 @@ def _normalize_allocations(value):
         if not all(value.isascii() and value.isdecimal() for value in (ad_set_id, ad_id)):
             raise _InvalidEvidence
         result[label] = {
+            "campaign_id": _stable_id(item.get("campaign_id"), "campaign_id"),
+            "variant_id": _stable_id(item.get("variant_id"), "variant_id"),
             "ad_set_id": ad_set_id,
             "ad_id": ad_id,
             "old_budget_cents": _positive_int(item.get("old_budget_cents"), "old_budget_cents"),
             "new_budget_cents": _positive_int(item.get("new_budget_cents"), "new_budget_cents"),
         }
     return result
+
+
+def _normalize_replacement_source(value, campaign_id):
+    if not isinstance(value, Mapping):
+        raise _InvalidEvidence
+    required = {
+        "draft_id",
+        "campaign_id",
+        "experiment_id",
+        "changed_dimension",
+        "locales",
+        "audience_profile_key",
+        "image_prompt",
+        "asset_path",
+        "daily_budget_eur",
+        "landing_page_url",
+        "publication_id",
+        "objective",
+        "current_meta_ids",
+    }
+    if set(value) != required or value.get("campaign_id") != campaign_id:
+        raise _InvalidEvidence
+    if type(value.get("draft_id")) is not int or value["draft_id"] <= 0:
+        raise _InvalidEvidence
+    if type(value.get("publication_id")) is not int or value["publication_id"] <= 0:
+        raise _InvalidEvidence
+    if value.get("objective") != "OUTCOME_TRAFFIC":
+        raise _InvalidEvidence
+    if value.get("changed_dimension") not in {"hook", "copy", "visual", "audience"}:
+        raise _InvalidEvidence
+    if type(value.get("daily_budget_eur")) is not int or not 5 <= value["daily_budget_eur"] <= 20:
+        raise _InvalidEvidence
+    for key in (
+        "experiment_id",
+        "audience_profile_key",
+        "image_prompt",
+        "asset_path",
+        "landing_page_url",
+    ):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise _InvalidEvidence
+    locales = value.get("locales")
+    locale_fields = {"locale", "hook", "body", "headline", "description", "cta_label"}
+    if not isinstance(locales, Mapping) or set(locales) != {"NL", "FR", "EN"}:
+        raise _InvalidEvidence
+    if any(
+        not isinstance(item, Mapping)
+        or set(item) != locale_fields
+        or item.get("locale") != locale
+        or any(
+            not isinstance(item.get(field), str) or not item[field].strip()
+            for field in locale_fields
+        )
+        for locale, item in locales.items()
+    ):
+        raise _InvalidEvidence
+    ids = value.get("current_meta_ids")
+    if (
+        not isinstance(ids, Mapping)
+        or set(ids) != {"campaign_id", "ad_set_id", "ad_ids", "creative_ids"}
+        or ids.get("campaign_id") != campaign_id
+    ):
+        raise _InvalidEvidence
+    if not isinstance(ids.get("ad_set_id"), str) or not ids["ad_set_id"].isdecimal():
+        raise _InvalidEvidence
+    for key in ("ad_ids", "creative_ids"):
+        mapping = ids.get(key)
+        if (
+            not isinstance(mapping, Mapping)
+            or set(mapping) != {"NL", "FR", "EN"}
+            or any(not isinstance(item, str) or not item.isdecimal() for item in mapping.values())
+        ):
+            raise _InvalidEvidence
+    return {key: value[key] for key in required}
 
 
 def _decision(
@@ -416,6 +505,8 @@ def _decision(
         evidence.update(outcome)
     if allocations is not None:
         evidence["allocations"] = allocations
+    if kind is DecisionKind.REPLACE:
+        evidence["source"] = snapshot["replacement_source"]
     canonical = {
         "campaign_id": snapshot["campaign_id"],
         "window_start": snapshot["window_start"].isoformat(),

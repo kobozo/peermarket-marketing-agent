@@ -20,6 +20,7 @@ from peermarket_agent.autonomy.replacements import (
     ReplacementSource,
     build_replacement,
 )
+from peermarket_agent.autonomy.snapshot import build_autonomy_snapshot
 from peermarket_agent.autonomy.store import (
     begin_execution,
     block_campaign_for_reconciliation,
@@ -33,6 +34,7 @@ from peermarket_agent.meta_ads import (
     MetaConfig,
     activate_meta_ad,
     get_meta_ad_statuses,
+    get_meta_allocation_state,
     get_meta_budget_state,
     get_meta_replacement_bundle_statuses,
     pause_meta_replacement_bundle,
@@ -122,10 +124,13 @@ class MetaExecutionAdapter:
         return await set_meta_adset_daily_budget(self.config, ad_set_id, cents)
 
     async def read_allocation(self, *, allocation: Mapping[str, Any]) -> Any:
-        return await get_meta_budget_state(
+        result = await get_meta_allocation_state(
             self.config,
-            {"ad_set_id": allocation["ad_set_id"], "ad_id": allocation["ad_id"]},
+            allocation["campaign_id"],
+            allocation["ad_set_id"],
+            allocation["ad_id"],
         )
+        return dict(result) | {"variant_id": allocation["variant_id"]}
 
     async def build(self, *, engine: Any, claim: Any, source: ReplacementSource) -> Any:
         return await build_replacement(engine, self.claude, source, claim.decision, claim=claim)
@@ -218,9 +223,21 @@ class MetaExecutionAdapter:
             for locale in ("NL", "FR", "EN")
             if progress.get(f"ad_id:{locale}")
         }
-        if not campaign_id or not ad_set_id or not ad_ids:
-            return {"observed": {}, "pause_errors": {"ids": "persisted IDs incomplete"}}
-        return await pause_meta_replacement_bundle(self.config, campaign_id, ad_set_id, ad_ids)
+        if not campaign_id or not ad_set_id or set(ad_ids) != {"NL", "FR", "EN"}:
+            return {
+                "verified": False,
+                "observed": {},
+                "pause_errors": {"ids": "persisted IDs incomplete"},
+            }
+        mutation = await pause_meta_replacement_bundle(self.config, campaign_id, ad_set_id, ad_ids)
+        observed = await self.read_replacement(campaign_id, ad_set_id, ad_ids)
+        draft = self._drafts.get(campaign_id)
+        budget = draft.daily_budget_eur * 100 if draft is not None else -1
+        return {
+            "verified": _bundle_verified(observed, False, budget),
+            "mutation": mutation,
+            "observed": observed,
+        }
 
 
 async def execute_production_claim(
@@ -250,6 +267,9 @@ def _replacement_source(decision: Any) -> ReplacementSource:
         asset_path=raw["asset_path"],
         daily_budget_eur=raw["daily_budget_eur"],
         landing_page_url=raw["landing_page_url"],
+        publication_id=raw["publication_id"],
+        objective=raw["objective"],
+        current_meta_ids=raw["current_meta_ids"],
     )
 
 
@@ -311,18 +331,18 @@ async def _renew_action(engine: Any, claim: Any, seconds: int = 300) -> None:
 
 
 async def _external(
-    engine: Any, claim: Any, target: object, name: str, *args: Any, **kwargs: Any
+    db_engine: Any, execution_claim: Any, target: object, name: str, *args: Any, **kwargs: Any
 ) -> Any:
-    await _renew_action(engine, claim)
+    await _renew_action(db_engine, execution_claim)
     return await _call(target, name, *args, **kwargs)
 
 
 async def _write_external(
-    engine: Any, claim: Any, target: object, name: str, *args: Any, **kwargs: Any
+    db_engine: Any, execution_claim: Any, target: object, name: str, *args: Any, **kwargs: Any
 ) -> Any:
     _WRITE_STARTED.set(True)
     try:
-        return await _external(engine, claim, target, name, *args, **kwargs)
+        return await _external(db_engine, execution_claim, target, name, *args, **kwargs)
     except asyncio.CancelledError:
         raise
     except BaseException as exc:
@@ -346,7 +366,7 @@ async def _publication(engine: Any, campaign_id: str) -> dict[str, Any] | None:
             (
                 await conn.execute(
                     text(
-                        "SELECT p.draft_id, p.state, p.external_ids, p.approved_budget_cents, p.performance FROM publications p WHERE p.channel='meta' AND p.external_ids->>'campaign_id'=:campaign ORDER BY p.updated_at DESC LIMIT 1"
+                        "SELECT p.id AS publication_id, p.draft_id, p.state, p.external_ids, p.approved_budget_cents, p.performance FROM publications p WHERE p.channel='meta' AND p.external_ids->>'campaign_id'=:campaign ORDER BY p.updated_at DESC LIMIT 1"
                     ),
                     {"campaign": campaign_id},
                 )
@@ -420,14 +440,43 @@ def _policy_reason(
     now: datetime,
 ) -> str | None:
     decision = claim.decision
-    performance = publication.get("performance") or {}
-    snapshot = performance.get("autonomy_snapshot")
-    if not isinstance(snapshot, Mapping):
+    if decision.kind is DecisionKind.REPLACE:
+        frozen = decision.evidence.get("source")
+        current = frozen.get("current_meta_ids") if isinstance(frozen, Mapping) else None
+        external = publication.get("external_ids") or {}
+        if (
+            not isinstance(current, Mapping)
+            or frozen.get("draft_id") != publication.get("draft_id")
+            or frozen.get("publication_id") != publication.get("publication_id")
+            or frozen.get("daily_budget_eur") * 100 != publication.get("approved_budget_cents")
+            or current.get("campaign_id") != external.get("campaign_id")
+            or current.get("ad_set_id") != external.get("ad_set_id")
+            or external.get("ad_id") not in (current.get("ad_ids") or {}).values()
+            or (
+                external.get("creative_id") is not None
+                and external.get("creative_id") not in (current.get("creative_ids") or {}).values()
+            )
+        ):
+            return "replacement_source_changed"
+    try:
+        snapshot = build_autonomy_snapshot(
+            publication,
+            decision.evidence.get("variants", ()),
+            replacement_source=decision.evidence.get("source"),
+            allow_replacement=decision.kind is DecisionKind.REPLACE,
+            reallocation=(
+                {
+                    "old_budget_cents": decision.old_budget_cents,
+                    "new_budget_cents": decision.new_budget_cents,
+                    "allocations": decision.allocations,
+                }
+                if decision.kind is DecisionKind.REALLOCATE
+                else None
+            ),
+        )
+    except (TypeError, ValueError):
         return "missing_snapshot"
-    captured_at = snapshot.get("captured_at")
-    if isinstance(captured_at, str):
-        with suppress(ValueError):
-            captured_at = datetime.fromisoformat(captured_at)
+    captured_at = snapshot["captured_at"]
     if (
         snapshot.get("snapshot_id") != decision.evidence.get("snapshot_id")
         or captured_at is None
@@ -509,7 +558,7 @@ def _bundle_ids(bundle: Any) -> dict[str, Any]:
     if set(result["ad_ids"]) != {"NL", "FR", "EN"}:
         raise RuntimeError("replacement_bundle_must_contain_exact_locales")
     creative_ids = value.get("creative_ids")
-    if creative_ids is not None and set(creative_ids) != {"NL", "FR", "EN"}:
+    if not isinstance(creative_ids, Mapping) or set(creative_ids) != {"NL", "FR", "EN"}:
         raise RuntimeError("replacement_bundle_must_contain_exact_creatives")
     return result
 
@@ -589,8 +638,13 @@ async def _replace(
                     rollback = await _write_external(
                         engine, claim, meta, "pause_persisted", engine=engine, claim=claim
                     )
+                    if rollback.get("verified") is not True:
+                        raise RuntimeError("persisted_replacement_rollback_unproven")
             except Exception as rollback_error:
-                rollback = {"error": type(rollback_error).__name__}
+                rollback = {
+                    "result": rollback,
+                    "error": type(rollback_error).__name__,
+                }
         raise _SagaFailure(cause, rollback) from cause
 
 
@@ -716,7 +770,13 @@ async def execute_claim(
                         engine, claim, meta, "read_allocation", allocation=item
                     )
                     if (
-                        observed.get("ad_set", {}).get("daily_budget") != item["old_budget_cents"]
+                        any(
+                            observed.get(key) != item[key]
+                            for key in ("campaign_id", "variant_id", "ad_set_id", "ad_id")
+                        )
+                        or item["campaign_id"] != claim.campaign_id
+                        or observed.get("ad_set", {}).get("daily_budget")
+                        != item["old_budget_cents"]
                         or observed.get("ad_set", {}).get("status") != "ACTIVE"
                         or observed.get("ad_set", {}).get("effective_status")
                         not in _ACTIVE_EFFECTIVE
@@ -739,7 +799,17 @@ async def execute_claim(
                     observed = await _external(
                         engine, claim, meta, "read_allocation", allocation=item
                     )
-                    if observed["ad_set"]["daily_budget"] != item["new_budget_cents"]:
+                    if (
+                        any(
+                            observed.get(key) != item[key]
+                            for key in ("campaign_id", "variant_id", "ad_set_id", "ad_id")
+                        )
+                        or observed["ad_set"]["daily_budget"] != item["new_budget_cents"]
+                        or observed["ad_set"].get("status") != "ACTIVE"
+                        or observed["ad_set"].get("effective_status") not in _ACTIVE_EFFECTIVE
+                        or observed["ad"].get("status") != "ACTIVE"
+                        or observed["ad"].get("effective_status") not in _ACTIVE_EFFECTIVE
+                    ):
                         raise RuntimeError("reallocation_verification_failed")
                     allocation_after[label] = observed
             except BaseException:
@@ -757,6 +827,21 @@ async def execute_claim(
                         verified = await _external(
                             engine, claim, meta, "read_allocation", allocation=item
                         )
+                        if (
+                            any(
+                                verified.get(key) != item[key]
+                                for key in ("campaign_id", "variant_id", "ad_set_id", "ad_id")
+                            )
+                            or verified.get("ad_set", {}).get("daily_budget")
+                            != item["old_budget_cents"]
+                            or verified.get("ad_set", {}).get("status") != "ACTIVE"
+                            or verified.get("ad_set", {}).get("effective_status")
+                            not in _ACTIVE_EFFECTIVE
+                            or verified.get("ad", {}).get("status") != "ACTIVE"
+                            or verified.get("ad", {}).get("effective_status")
+                            not in _ACTIVE_EFFECTIVE
+                        ):
+                            raise RuntimeError("reallocation_rollback_unproven")
                         rollback[label] = {"mutation": mutation, "verified": verified}
                     except Exception as rollback_error:
                         rollback[label] = {"error": type(rollback_error).__name__}
@@ -781,7 +866,7 @@ async def execute_claim(
             rollback_result=locals().get("rollback"),
             budget=budget_event,
         ):
-            raise RuntimeError("execution finalization fence was lost")
+            return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before, after)
         return ExecutionResult(ExecutionStatus.SUCCEEDED, "executed", before, after)
     except BaseException as exc:
         if isinstance(exc, asyncio.CancelledError):

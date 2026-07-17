@@ -61,9 +61,43 @@ def _snapshot(**overrides):
         "attribution_complete": True,
         "current_budget_cents": 1_000,
         "variants": [_variant("2", 10), _variant("1", 20)],
+        "replacement_source": _replacement_source(),
     }
     value.update(overrides)
     return value
+
+
+def _replacement_source():
+    return {
+        "draft_id": 7,
+        "publication_id": 8,
+        "campaign_id": "120249125021520342",
+        "experiment_id": "experiment-1",
+        "changed_dimension": "hook",
+        "locales": {
+            locale: {
+                "locale": locale,
+                "hook": f"{locale} hook",
+                "body": f"{locale} body",
+                "headline": f"{locale} headline",
+                "description": f"{locale} description",
+                "cta_label": "Learn More",
+            }
+            for locale in ("NL", "FR", "EN")
+        },
+        "audience_profile_key": "declutterers",
+        "image_prompt": "real marketplace screenshot",
+        "asset_path": "/tmp/source.png",
+        "daily_budget_eur": 10,
+        "landing_page_url": "https://peermarket.eu/",
+        "objective": "OUTCOME_TRAFFIC",
+        "current_meta_ids": {
+            "campaign_id": "120249125021520342",
+            "ad_set_id": "20",
+            "ad_ids": {"NL": "31", "FR": "32", "EN": "33"},
+            "creative_ids": {"NL": "41", "FR": "42", "EN": "43"},
+        },
+    }
 
 
 def _history(*events):
@@ -97,6 +131,14 @@ def test_bad_evidence_always_observes(mutation, qualified_snapshot, limits):
 def test_exact_evidence_floors_are_eligible(limits):
     decision = evaluate_campaign(_snapshot(), (), limits, NOW)
     assert decision.kind is DecisionKind.REPLACE
+    assert decision.evidence["source"] == _replacement_source()
+
+
+def test_qualified_replacement_without_frozen_source_observes(limits):
+    assert (
+        evaluate_campaign(_snapshot(replacement_source=None), (), limits, NOW).reason
+        == "missing_replacement_source"
+    )
 
 
 @pytest.mark.parametrize(
@@ -153,12 +195,16 @@ def test_prior_replacement_limit_blocks_another_replacement(limits):
 def test_winner_with_loser_reallocates_exact_adsets_without_changing_total(limits):
     allocations = {
         "winner": {
+            "campaign_id": "120249125021520342",
+            "variant_id": "1",
             "ad_set_id": "22",
             "ad_id": "2",
             "old_budget_cents": 400,
             "new_budget_cents": 600,
         },
         "loser": {
+            "campaign_id": "120249125021520342",
+            "variant_id": "2",
             "ad_set_id": "11",
             "ad_id": "1",
             "old_budget_cents": 600,
@@ -186,12 +232,16 @@ def test_reallocation_without_exact_two_sided_identity_fails_closed(limits):
 def test_reallocation_with_non_meta_ids_fails_closed(limits):
     allocations = {
         "winner": {
+            "campaign_id": "120249125021520342",
+            "variant_id": "1",
             "ad_set_id": "not-meta",
             "ad_id": "2",
             "old_budget_cents": 400,
             "new_budget_cents": 600,
         },
         "loser": {
+            "campaign_id": "120249125021520342",
+            "variant_id": "2",
             "ad_set_id": "11",
             "ad_id": "1",
             "old_budget_cents": 600,

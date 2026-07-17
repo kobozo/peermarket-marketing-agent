@@ -10,6 +10,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from peermarket_agent.autonomy.snapshot import build_autonomy_basis
 from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
 from peermarket_agent.performance import classify_delivery, derive_performance
@@ -69,7 +70,7 @@ async def _publications(engine: AsyncEngine) -> list[dict]:
             (
                 await conn.execute(
                     text(
-                        "SELECT draft_id, published_at, external_ids, performance "
+                        "SELECT draft_id, published_at, external_ids, approved_budget_cents, performance "
                         "FROM publications WHERE channel = 'meta' AND draft_id IS NOT NULL "
                         "AND external_ids->>'ad_id' IS NOT NULL "
                         "AND COALESCE(state, '') NOT IN ('terminal', 'archived', 'deleted') "
@@ -434,6 +435,11 @@ async def collect_meta_performance(
                             if row.utm_content == f"draft-{draft_id}"
                         ],
                     }
+            merged_for_basis = dict(previous)
+            merged_for_basis.update(payload)
+            if not settings.peermarket_attribution_enabled:
+                merged_for_basis["attribution"] = {"available": False}
+            payload["autonomy_basis"] = build_autonomy_basis(publication, merged_for_basis)
             await save_performance_snapshot(engine, draft_id, payload)
             updated.append(draft_id)
             await _send_claimed_alert(

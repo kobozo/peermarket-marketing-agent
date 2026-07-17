@@ -64,6 +64,9 @@ class ReplacementSource:
     asset_path: str
     daily_budget_eur: int
     landing_page_url: str
+    publication_id: int = 0
+    objective: str = "OUTCOME_TRAFFIC"
+    current_meta_ids: Mapping[str, object] | None = None
 
     def frozen_evidence(self) -> dict:
         return {"source": asdict(self)}
