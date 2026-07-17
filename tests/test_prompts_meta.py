@@ -155,3 +155,15 @@ async def test_generate_meta_ad_creative_rejects_budget_out_of_range():
             language="NL",
             audience_profile_key="declutterers",
         )
+
+
+def test_autonomous_replacement_prompt_requires_native_strict_locale_json():
+    from peermarket_agent.prompts.meta_ad_creative import build_replacement_user_prompt
+
+    prompt = build_replacement_user_prompt(
+        locale="FR", changed_dimension="copy", source={"headline": "Exact"}, learnings=("one",) * 7
+    )
+    assert "Locale: FR" in prompt
+    assert "written natively" in prompt
+    assert "strict JSON" in prompt
+    assert prompt.count("- one") == 5
