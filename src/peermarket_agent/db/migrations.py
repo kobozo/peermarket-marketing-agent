@@ -367,6 +367,54 @@ _STEPS: list[str] = [
     "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_start DROP NOT NULL",
     "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_stop DROP NOT NULL",
     "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_definition DROP NOT NULL",
+    """CREATE TABLE IF NOT EXISTS autonomous_decisions (
+        id BIGSERIAL PRIMARY KEY,
+        decision_key TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('observe','pause','replace','reallocate','scale')),
+        campaign_id TEXT NOT NULL,
+        window_start TIMESTAMPTZ NOT NULL,
+        window_end TIMESTAMPTZ NOT NULL,
+        evidence JSONB NOT NULL,
+        reason TEXT NOT NULL,
+        old_budget_cents INT,
+        new_budget_cents INT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    """CREATE TABLE IF NOT EXISTS autonomous_actions (
+        id BIGSERIAL PRIMARY KEY,
+        decision_id BIGINT NOT NULL REFERENCES autonomous_decisions(id),
+        campaign_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','leased','executing','succeeded','failed','cancelled',
+                              'reconciliation_required')),
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        before_state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        after_state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        audit JSONB NOT NULL DEFAULT '{}'::JSONB,
+        failure_category TEXT,
+        failure_message TEXT,
+        next_evaluation_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_actions_campaign_nonterminal "
+    "ON autonomous_actions (campaign_id) "
+    "WHERE status IN ('pending','leased','executing')",
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_actions_claimable "
+    "ON autonomous_actions (status, lease_expires_at, id)",
+    """CREATE TABLE IF NOT EXISTS autonomous_budget_events (
+        id BIGSERIAL PRIMARY KEY,
+        action_id BIGINT NOT NULL REFERENCES autonomous_actions(id),
+        campaign_id TEXT NOT NULL,
+        old_budget_cents INT NOT NULL CHECK (old_budget_cents > 0),
+        new_budget_cents INT NOT NULL CHECK (new_budget_cents > 0),
+        amount_cents INT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_budget_events_campaign_created "
+    "ON autonomous_budget_events (campaign_id, created_at DESC)",
 ]
 
 

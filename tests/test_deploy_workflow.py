@@ -56,3 +56,22 @@ def test_deploy_wires_disabled_first_performance_variables():
         assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in workflow_text
         assert f"{name}=${name}" in workflow_text
         assert f"secrets.{name}" not in workflow_text
+
+
+def test_deploy_wires_safe_autonomy_variables():
+    workflow_text = DEPLOY_WORKFLOW.read_text()
+    defaults = {
+        "META_AUTONOMY_ENABLED": "false",
+        "META_AUTONOMY_SHADOW": "true",
+        "META_AUTONOMY_CAMPAIGN_IDS_CSV": "",
+        "META_AUTONOMY_MAX_REPLACEMENTS_24H": "1",
+        "META_AUTONOMY_COOLDOWN_HOURS": "24",
+        "META_AUTONOMY_MAX_TEST_DAYS": "7",
+        "META_AUTONOMY_MAX_INCREASE_PERCENT": "20",
+        "META_AUTONOMY_MAX_DAILY_BUDGET_EUR": "20",
+    }
+
+    for name, default in defaults.items():
+        assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in workflow_text
+        assert f"{name}=${name}" in workflow_text
+        assert f"secrets.{name}" not in workflow_text
