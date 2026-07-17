@@ -137,6 +137,8 @@ def test_bundle_boundary_requires_exact_three_ad_and_creative_ids():
 class BudgetMeta:
     def __init__(self, **overrides):
         self.budget = overrides.pop("budget_cents", 1000)
+        self.pause_readback_fails = overrides.pop("pause_readback_fails", False)
+        self.paused = False
         self.overrides = overrides
         self.calls = []
 
@@ -146,11 +148,13 @@ class BudgetMeta:
             key: {"status": "ACTIVE", "effective_status": "ACTIVE"}
             for key in ("campaign", "ad_set", "ad")
         }
+        status = "PAUSED" if self.paused and not self.pause_readback_fails else "ACTIVE"
+        hierarchy["ad"] = {"status": status, "effective_status": status}
         return {
             **ids,
             "budget_cents": self.budget,
-            "status": "ACTIVE",
-            "effective_status": "ACTIVE",
+            "status": status,
+            "effective_status": status,
             "hierarchy": hierarchy,
         } | self.overrides
 
@@ -159,8 +163,13 @@ class BudgetMeta:
         self.budget = cents
         return {"daily_budget": cents}
 
+    async def pause_source(self, source):
+        self.calls.append("pause_source")
+        self.paused = True
+        return {"status": "PAUSED"}
 
-async def _scale_claim(engine):
+
+async def _scale_claim(engine, kind=DecisionKind.SCALE):
     variants = [{"variant_id": "1"}]
     performance = {
         "meta": {
@@ -187,7 +196,7 @@ async def _scale_claim(engine):
         publication, variants, replacement_source=None, allow_replacement=False
     )
     decision = FrozenDecision(
-        kind=DecisionKind.SCALE,
+        kind=kind,
         campaign_id="10",
         evidence={
             "snapshot_id": snapshot["snapshot_id"],
@@ -199,9 +208,9 @@ async def _scale_claim(engine):
         reason="proven winner",
         window_start=snapshot["window_start"],
         window_end=snapshot["window_end"],
-        idempotency_key="scale-1",
-        old_budget_cents=1000,
-        new_budget_cents=1200,
+        idempotency_key=f"{kind.value}-1",
+        old_budget_cents=1000 if kind is DecisionKind.SCALE else None,
+        new_budget_cents=1200 if kind is DecisionKind.SCALE else None,
     )
     await enqueue_action(engine, decision)
     claim = await claim_next_action(engine, "worker")
@@ -262,6 +271,50 @@ async def test_scale_executes_exact_budget_and_persists_before_intent_after(engi
     assert row["status"] == "succeeded"
     assert row["before_state"]["intent"]["new_budget_cents"] == 1200
     assert row["after_state"]["budget_cents"] == 1200
+
+
+@pytest.mark.asyncio
+async def test_public_pause_success_persists_verified_readback(engine):
+    claim = await _scale_claim(engine, DecisionKind.PAUSE)
+    meta = BudgetMeta()
+    result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
+    assert result.status is ExecutionStatus.SUCCEEDED
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT status,after_state FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "succeeded"
+    assert row["after_state"]["status"] == "PAUSED"
+
+
+@pytest.mark.asyncio
+async def test_public_pause_readback_failure_requires_reconciliation(engine):
+    claim = await _scale_claim(engine, DecisionKind.PAUSE)
+    meta = BudgetMeta(pause_readback_fails=True)
+    result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
+    assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT status,failure_message FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row == {
+        "status": "reconciliation_required",
+        "failure_message": "pause_verification_failed",
+    }
 
 
 def _settings(**overrides):
