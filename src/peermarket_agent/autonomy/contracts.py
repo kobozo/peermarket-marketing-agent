@@ -1,6 +1,6 @@
 """Immutable values shared by autonomous lifecycle policy and execution."""
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -8,52 +8,59 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
-def _immutable(*args: object, **kwargs: object) -> None:
-    raise TypeError("frozen evidence cannot be mutated")
+class _ImmutableMapping(Mapping[str, Any]):
+    """Composition-based immutable mapping; it is intentionally not a dict subclass."""
 
+    __slots__ = ("__values",)
 
-class _FrozenDict(dict[str, Any]):
-    """A JSON-serializable dict whose mutation API is disabled."""
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        if getattr(self, "_frozen_initialized", False):
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        if hasattr(self, "_ImmutableMapping__values"):
             raise TypeError("frozen evidence cannot be reinitialized")
-        dict.__init__(self, *args, **kwargs)
-        object.__setattr__(self, "_frozen_initialized", True)
+        object.__setattr__(self, "_ImmutableMapping__values", dict(values))
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
-    __setattr__ = _immutable
+    def __getitem__(self, key: str) -> Any:
+        return self.__values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.__values)
+
+    def __len__(self) -> int:
+        return len(self.__values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Mapping) and dict(self.items()) == dict(other.items())
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
+
+    def __setitem__(self, key: str, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
 
 
-class _FrozenList(list[Any]):
-    """A JSON-serializable list whose mutation API is disabled."""
+class _ImmutableSequence(Sequence[Any]):
+    """Composition-based immutable sequence; it is intentionally not a list subclass."""
 
-    def __init__(self, *args: object) -> None:
-        if getattr(self, "_frozen_initialized", False):
+    __slots__ = ("__values",)
+
+    def __init__(self, values: Sequence[Any]) -> None:
+        if hasattr(self, "_ImmutableSequence__values"):
             raise TypeError("frozen evidence cannot be reinitialized")
-        list.__init__(self, *args)
-        object.__setattr__(self, "_frozen_initialized", True)
+        object.__setattr__(self, "_ImmutableSequence__values", tuple(values))
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
-    __setattr__ = _immutable
+    def __getitem__(self, index: int | slice) -> Any:
+        return self.__values[index]
+
+    def __len__(self) -> int:
+        return len(self.__values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Sequence) and tuple(self) == tuple(other)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
+
+    def append(self, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
 
 
 def _freeze_json(value: Any) -> Any:
@@ -61,15 +68,24 @@ def _freeze_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("evidence mapping keys must be strings")
-        return _FrozenDict((key, _freeze_json(item)) for key, item in value.items())
-    if isinstance(value, (list, tuple)):
-        return _FrozenList(_freeze_json(item) for item in value)
+        return _ImmutableMapping({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return _ImmutableSequence(tuple(_freeze_json(item) for item in value))
     if isinstance(value, (set, frozenset)):
         frozen = (_freeze_json(item) for item in value)
-        return _FrozenList(sorted(frozen, key=repr))
+        return _ImmutableSequence(tuple(sorted(frozen, key=repr)))
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise TypeError(f"evidence values must be JSON-like, got {type(value).__name__}")
+
+
+def thaw_json(value: Any) -> Any:
+    """Project frozen contract values to plain JSON-native dicts and lists."""
+    if isinstance(value, Mapping):
+        return {str(key): thaw_json(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [thaw_json(item) for item in value]
+    return value
 
 
 class DecisionKind(StrEnum):

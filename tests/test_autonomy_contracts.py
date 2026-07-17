@@ -12,6 +12,7 @@ from peermarket_agent.autonomy.contracts import (
     FrozenDecision,
     HookExperiment,
     HookVariant,
+    thaw_json,
 )
 
 
@@ -145,6 +146,21 @@ def test_recursive_frozen_contract_containers_cannot_be_reinitialized():
     assert dict(variant.language_bundles["NL"]) == original_nl
 
 
+def test_recursive_frozen_contracts_reject_builtin_base_class_mutation_paths():
+    variant = _hook_variant()
+    with pytest.raises(TypeError):
+        dict.__setitem__(variant.fixed_identity, "audience", "mutated")
+    with pytest.raises(TypeError):
+        dict.update(variant.language_bundles["NL"], {"headline": "mutated"})
+    with pytest.raises(TypeError):
+        dict.__init__(variant.fixed_identity, {"audience": "mutated"})
+    with pytest.raises(TypeError):
+        list.append(variant.fixed_identity["placements"], "mutated")
+    assert variant.fixed_identity["audience"] == "declutterers"
+    assert variant.language_bundles["NL"]["headline"] == "NL headline"
+    assert tuple(variant.fixed_identity["placements"]) == ("feed",)
+
+
 def _decision(**overrides):
     values = {
         "kind": DecisionKind.OBSERVE,
@@ -218,7 +234,7 @@ def test_frozen_decision_deeply_isolates_and_freezes_evidence():
 def test_frozen_decision_evidence_remains_json_serializable():
     decision = _decision(evidence={"metrics": [1, {"valid": True}], "labels": {"a", "b"}})
 
-    assert json.loads(json.dumps(decision.evidence)) == {
+    assert json.loads(json.dumps(thaw_json(decision.evidence))) == {
         "metrics": [1, {"valid": True}],
         "labels": ["a", "b"],
     }

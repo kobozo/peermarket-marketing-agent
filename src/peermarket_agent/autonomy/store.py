@@ -13,7 +13,12 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import (
+    ActionStatus,
+    DecisionKind,
+    FrozenDecision,
+    thaw_json,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,9 +72,9 @@ def _json_default(value: Any) -> str:
 
 
 async def _record_decision(conn: AsyncConnection, decision: FrozenDecision) -> RecordedDecision:
-    evidence = dict(decision.evidence)
+    evidence = thaw_json(decision.evidence)
     if decision.allocations is not None:
-        evidence["allocations"] = decision.allocations
+        evidence["allocations"] = thaw_json(decision.allocations)
     inserted = await conn.scalar(
         text(
             "INSERT INTO autonomous_decisions "

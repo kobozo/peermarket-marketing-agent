@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
@@ -450,7 +450,7 @@ async def _publication(engine: Any, campaign_id: str) -> dict[str, Any] | None:
 async def _aggregate_publication(engine: Any, claim: Any) -> dict[str, Any] | None:
     frozen = claim.decision.evidence.get("frozen_basis") or {}
     expected = frozen.get("campaign_publications")
-    if not isinstance(expected, list) or not expected:
+    if not isinstance(expected, Sequence) or isinstance(expected, (str, bytes)) or not expected:
         return await _publication(engine, claim.campaign_id)
     async with engine.connect() as conn:
         rows = [
@@ -986,7 +986,8 @@ async def execute_claim(
             DecisionKind.REALLOCATE,
             DecisionKind.SCALE,
         } and isinstance(
-            (claim.decision.evidence.get("frozen_basis") or {}).get("campaign_publications"), list
+            (claim.decision.evidence.get("frozen_basis") or {}).get("campaign_publications"),
+            Sequence,
         )
         if aggregate_budget:
             active = {"status": "ACTIVE", "effective_status": "ACTIVE"}
