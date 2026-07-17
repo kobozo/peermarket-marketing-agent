@@ -13,4 +13,6 @@ Final remediation aligns the gate with every recognized neutral and qualified ho
 
 The policy-reason classifier now enumerates every OBSERVE reason emitted by `policy.py`, including validation/history/window, delivery diagnosis, cooldown, incomplete experiment, replacement/reallocation limits, and all scale headroom/budget/allocation guards. The non-emitted `technical_delivery_failure` label was removed; both real dynamic delivery diagnoses are covered explicitly.
 
+The deployed verifier now changes to `/opt/peermarket-agent` and runs `/opt/peermarket-agent/.venv/bin/python`, ensuring the installed src-layout package and its dependencies are used instead of the runner's system interpreter. An executable harness launches the project venv from the repository root and imports the exact verifier classifier path.
+
 Verification: `uv run pytest -q tests/test_deploy_workflow.py` (6 passed), YAML loaded by the test suite, and `git diff --check` clean.

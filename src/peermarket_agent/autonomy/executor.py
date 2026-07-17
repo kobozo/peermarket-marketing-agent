@@ -1259,11 +1259,21 @@ async def _replace_hook_experiment(
         )
         if any(not _bundle_verified(state, True, budget) for state in active.values()):
             raise RuntimeError("hook_experiment_not_active")
+        frozen_basis = claim.decision.evidence.get("frozen_basis") or {}
+        fresh_source = await _external(
+            engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
+        )
+        if not _source_ok(
+            fresh_source,
+            claim.campaign_id,
+            frozen_basis.get("external_ids") or _source_ids(source),
+            frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
+        ):
+            raise RuntimeError("hook_experiment_source_precondition_changed")
         await _write_external(engine, claim, meta, "pause_source", source=source)
         source_after = await _external(
             engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
         )
-        frozen_basis = claim.decision.evidence.get("frozen_basis") or {}
         if not _paused_source_ok(
             source_after,
             frozen_basis.get("external_ids") or _source_ids(source),

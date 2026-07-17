@@ -886,6 +886,7 @@ class _PersistedHookBuilder:
         "lease_loss",
         "campaign_adset_loss",
         "adset_first_loss",
+        "source_drift",
         "cleanup_failure",
         "cleanup_ambiguous",
         "cleanup_lease_loss",
@@ -959,7 +960,11 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         }
 
     async def budget(config, ids):
-        return {"ad_set": {"daily_budget": 1000}}
+        return {
+            "ad_set": {
+                "daily_budget": 999 if failure == "source_drift" and len(active_ads) == 9 else 1000
+            }
+        }
 
     async def activate(config, ids):
         active_ads.add(ids["ad_id"])
@@ -1058,7 +1063,8 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
     expected_creatives = (
         9
-        if failure in {None, "lease_loss", "campaign_adset_loss", "adset_first_loss"}
+        if failure
+        in {None, "lease_loss", "campaign_adset_loss", "adset_first_loss", "source_drift"}
         else 3
         if failure
         in {

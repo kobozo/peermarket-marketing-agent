@@ -192,6 +192,29 @@ def test_hook_dispatch_retries_blank_run_list_before_unique_numeric_id(tmp_path)
     assert watched.read_text().strip() == "4242 --exit-status"
 
 
+def test_hook_verifier_uses_project_venv_and_src_layout_import():
+    workflow = DEPLOY_WORKFLOW.read_text()
+    assert "cd /opt/peermarket-agent" in workflow
+    assert "REPORT=\"$report\" /opt/peermarket-agent/.venv/bin/python - <<'PY'" in workflow
+    verifier = workflow.split("- name: Verify hook experiment shadow canary", 1)[1]
+    assert 'REPORT="$report" python3' not in verifier
+
+    root = DEPLOY_WORKFLOW.parents[2]
+    result = subprocess.run(
+        [
+            str(root / ".venv" / "bin" / "python"),
+            "-c",
+            "from peermarket_agent.cli_performance import classify_experiment_reason; "
+            "assert classify_experiment_reason('insufficient_evidence') == 'neutral'",
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials():
     text = RUNBOOK.read_text()
     required = {

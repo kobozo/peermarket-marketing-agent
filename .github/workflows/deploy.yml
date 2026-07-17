@@ -204,7 +204,8 @@ jobs:
             cd /opt/peermarket-agent
             /opt/peermarket-agent/.venv/bin/peermarket-performance autonomy --draft-id 156
           ')"
-          REPORT="$report" python3 - <<'PY'
+          cd /opt/peermarket-agent
+          REPORT="$report" /opt/peermarket-agent/.venv/bin/python - <<'PY'
           import json, os
           from peermarket_agent.cli_performance import classify_experiment_reason
           report = json.loads(os.environ["REPORT"])
