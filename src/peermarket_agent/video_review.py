@@ -55,7 +55,9 @@ async def extract_keyframes(video: Path, output_dir: Path, count: int = 6) -> li
     )
     _stdout, stderr = await process.communicate()
     if process.returncode != 0:
-        raise RuntimeError(f"ffmpeg keyframe extraction failed: {stderr.decode(errors='replace').strip()}")
+        raise RuntimeError(
+            f"ffmpeg keyframe extraction failed: {stderr.decode(errors='replace').strip()}"
+        )
     frames = sorted(await asyncio.to_thread(lambda: list(output_dir.glob("frame-*.jpg"))))
     if not frames:
         raise ValueError("ffmpeg extracted no JPEG keyframes")

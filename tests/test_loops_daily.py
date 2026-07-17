@@ -89,9 +89,7 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             ),
             # 5) Email gen
             ClaudeResponse(
-                text=json.dumps(
-                    {"subject": "Je hebt nog niets verkocht", "body": "woord " * 80}
-                ),
+                text=json.dumps({"subject": "Je hebt nog niets verkocht", "body": "woord " * 80}),
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",
