@@ -101,3 +101,11 @@ The former combined campaign/ad-set/first-ad activation was split into three sin
 PostgreSQL fault injection now steals leases at the exact campaign→ad-set boundary, ad-set→first-ad boundary, a later-ad boundary, and between reverse variant pauses. Each case proves no later stale write occurs and finalization remains fail-closed.
 
 Combined command result: `11 passed, 85 deselected in 7.28s`. Ruff format/check and `git diff --check` passed.
+
+## Live-verified reverse cleanup
+
+Before every reverse pause, after both lease fences, cleanup reconstructs the persisted variant's exact creative/ad IDs and invokes the live verifier with the frozen landing page and NL/FR/EN payload matrix. Missing partial identity or any parent/creative/content drift prevents that pause entirely and leaves reconciliation required.
+
+Cleanup verification now consumes the real adapter shape: `pause_errors` must be empty, `observed` must be non-empty, and every observed configured/effective state must be paused or an accepted paused/review state. Tests cover verified real-shape success, explicit pause errors, and an ambiguous ACTIVE observation. Creative drift asserts zero pause SDK calls.
+
+Combined clean-DB result: `12 passed, 85 deselected in 17.32s`. Ruff format/check and `git diff --check` passed.

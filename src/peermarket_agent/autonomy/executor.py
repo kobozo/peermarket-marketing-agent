@@ -261,6 +261,8 @@ class MetaExecutionAdapter:
                     raise RuntimeError("replacement publication ownership was lost")
 
         matrix = hook_experiment_meta_matrix(experiment, image_bytes=image_bytes)
+        self._hook_identities[experiment.experiment_id] = matrix
+        self._hook_landings[experiment.experiment_id] = experiment.landing_page_url
         result = await create_meta_hook_experiment_bundles_paused(
             config=self.config,
             experiment_id=experiment.experiment_id,
@@ -272,8 +274,6 @@ class MetaExecutionAdapter:
             persist_progress=persist,
         )
         self._hook_results[experiment.experiment_id] = result
-        self._hook_identities[experiment.experiment_id] = matrix
-        self._hook_landings[experiment.experiment_id] = experiment.landing_page_url
         return result
 
     async def read_hook_experiment(self, experiment_id: str) -> dict[str, Any]:
@@ -359,6 +359,7 @@ class MetaExecutionAdapter:
         if not campaign or not ad_set:
             return {"verified": True, "mutations": {}}
         mutations = {}
+        verified_results = []
         prefixes = sorted(
             {key.rsplit(":ad_id:", 1)[0] for key in progress if ":ad_id:" in key}, reverse=True
         )
@@ -369,11 +370,47 @@ class MetaExecutionAdapter:
                 for locale in ("NL", "FR", "EN")
                 if progress.get(f"{prefix}:ad_id:{locale}")
             }
-            mutations[prefix] = await pause_meta_replacement_bundle(
-                self.config, campaign, ad_set, ad_ids
+            variant_id = prefix.removeprefix("variant:")
+            creative_ids = {
+                locale: progress[f"{prefix}:creative_id:{locale}"]
+                for locale in ("NL", "FR", "EN")
+                if progress.get(f"{prefix}:creative_id:{locale}")
+            }
+            if set(ad_ids) != {"NL", "FR", "EN"} or set(creative_ids) != {
+                "NL",
+                "FR",
+                "EN",
+            }:
+                raise RuntimeError("partial hook bundle identity cannot be proven")
+            await get_meta_replacement_bundle_statuses(
+                self.config,
+                campaign,
+                ad_set,
+                ad_ids,
+                creative_ids=creative_ids,
+                landing_page_url=self._hook_landings[
+                    claim.decision.evidence["source"]["experiment_id"]
+                ],
+                locales=self._hook_identities[claim.decision.evidence["source"]["experiment_id"]][
+                    variant_id
+                ],
+            )
+            mutation = await pause_meta_replacement_bundle(self.config, campaign, ad_set, ad_ids)
+            mutations[prefix] = mutation
+            observed = mutation.get("observed") if isinstance(mutation, Mapping) else None
+            errors = mutation.get("pause_errors") if isinstance(mutation, Mapping) else None
+            statuses = observed.values() if isinstance(observed, Mapping) else ()
+            verified_results.append(
+                errors == {}
+                and bool(observed)
+                and all(
+                    item.get("status") == "PAUSED"
+                    and item.get("effective_status") in _PAUSED_EFFECTIVE
+                    for item in statuses
+                )
             )
         return {
-            "verified": all(not errors for errors in mutations.values()),
+            "verified": all(verified_results),
             "mutations": mutations,
         }
 

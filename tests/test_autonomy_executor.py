@@ -887,6 +887,7 @@ class _PersistedHookBuilder:
         "campaign_adset_loss",
         "adset_first_loss",
         "cleanup_failure",
+        "cleanup_ambiguous",
         "cleanup_lease_loss",
     ],
 )
@@ -914,7 +915,8 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         variant = name.split()[-1]
         if f"creative_id:{locale}" not in progress:
             if (
-                failure in {"rate_limit", "cleanup_failure", "cleanup_lease_loss"}
+                failure
+                in {"rate_limit", "cleanup_failure", "cleanup_ambiguous", "cleanup_lease_loss"}
                 and len(created_payloads) == 3
                 and not rate_injected
             ):
@@ -1002,7 +1004,20 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
                     ),
                     {"id": claim.id},
                 )
-        return {"ad": "pause failed"} if failure == "cleanup_failure" else {}
+        paused = {
+            "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+            "ad_set": {"status": "PAUSED", "effective_status": "PAUSED"},
+            **{
+                f"ad:{locale}": {"status": "PAUSED", "effective_status": "PAUSED"}
+                for locale in ad_ids
+            },
+        }
+        if failure == "cleanup_ambiguous":
+            paused["ad:NL"] = {"status": "ACTIVE", "effective_status": "ACTIVE"}
+        return {
+            "observed": paused,
+            "pause_errors": {"ad": "pause failed"} if failure == "cleanup_failure" else {},
+        }
 
     monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_resource)
     monkeypatch.setattr(
@@ -1044,14 +1059,27 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         9
         if failure in {None, "lease_loss", "campaign_adset_loss", "adset_first_loss"}
         else 3
-        if failure in {"rate_limit", "cleanup_failure", "cleanup_lease_loss"}
+        if failure
+        in {
+            "rate_limit",
+            "cleanup_failure",
+            "cleanup_ambiguous",
+            "cleanup_lease_loss",
+        }
         else 9
     )
     assert len(created_payloads) == expected_creatives
     if failure is not None:
         assert source_paused is False
-        if failure not in {"lease_loss", "campaign_adset_loss", "adset_first_loss"}:
+        if failure not in {
+            "lease_loss",
+            "campaign_adset_loss",
+            "adset_first_loss",
+            "creative_drift",
+        }:
             assert cleanup_calls
+        if failure == "creative_drift":
+            assert cleanup_calls == []
         if failure == "rate_limit":
             async with engine.begin() as conn:
                 await conn.execute(
