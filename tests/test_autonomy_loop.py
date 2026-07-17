@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from peermarket_agent.agent.loops.autonomy import (
     _audit,
+    _eligible_campaigns,
     _persisted_hook_variants,
     persist_autonomy_inputs,
     prepare_hook_experiment,
@@ -109,7 +110,7 @@ async def test_persisted_nine_locale_rows_feed_three_logical_policy_variants(eng
     variants = await _persisted_hook_variants(
         engine,
         experiment.experiment_id,
-        {"publication_id": 7},
+        {"publication_id": 7, "external_ids": {"campaign_id": experiment.campaign_id}},
         {"hook_experiment_variants": samples},
     )
     assert [item["variant_id"] for item in variants] == [
@@ -118,6 +119,89 @@ async def test_persisted_nine_locale_rows_feed_three_logical_policy_variants(eng
     assert [item["impressions"] for item in variants] == [1200, 1200, 1200]
     assert [item["registrations"] for item in variants] == [3, 6, 9]
     assert all(item["creative_dimension"] == "hook" for item in variants)
+
+
+@pytest.mark.asyncio
+async def test_real_candidate_cycle_uses_collected_hook_metrics_for_neutral_and_qualified(engine):
+    experiment = build_hook_experiment(_hook_draft(), "warm", "cycle")
+    await record_experiment(engine, experiment)
+    metrics = {
+        variant.variant_id: {
+            locale: {"impressions": 400, "landing_page_views": 20, "registrations": number * 4}
+            for locale in ("NL", "FR", "EN")
+        }
+        for number, variant in enumerate(experiment.variants, 1)
+    }
+    ids = {"campaign_id": experiment.campaign_id, "ad_set_id": "20", "ad_id": "30"}
+    basis = {
+        "campaign_id": experiment.campaign_id,
+        "external_ids": ids,
+        "approved_budget_cents": 1000,
+        "captured_at": NOW.isoformat(),
+        "window_start": (NOW - timedelta(days=1)).isoformat(),
+        "window_end": NOW.isoformat(),
+        "delivery_state": "healthy",
+        "attribution_complete": True,
+        "complete": True,
+    }
+    async with engine.begin() as conn:
+        action_type = await conn.scalar(
+            text(
+                "INSERT INTO action_types(name,risk_tier,default_autonomy) VALUES ('hook-cycle','high','propose') RETURNING id"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status,metadata) VALUES (156,:type,'meta','MULTI','published','{}')"
+            ),
+            {"type": action_type},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO publications(draft_id,channel,state,external_ids,approved_budget_cents,performance) VALUES (156,'meta','active',CAST(:ids AS JSONB),1000,CAST(:performance AS JSONB))"
+            ),
+            {
+                "ids": json.dumps(ids),
+                "performance": json.dumps(
+                    {"autonomy_basis": basis, "hook_experiment_variants": metrics}
+                ),
+            },
+        )
+    settings = _limits(
+        meta_autonomy_campaign_ids=(experiment.campaign_id,),
+        meta_autonomy_experiment_id=experiment.experiment_id,
+        learning_min_impressions=1000,
+        learning_min_landing_page_views=30,
+        learning_min_registrations=10,
+    )
+    qualified = (await _eligible_campaigns(engine, settings, NOW))[0]["decision"]
+    assert qualified.evidence["experiment_id"] == experiment.experiment_id
+    assert qualified.kind is not DecisionKind.OBSERVE
+    await _audit(engine, draft_id=156, decision=qualified, outcome="shadow", detail="experiment")
+    async with engine.connect() as conn:
+        audit_payload = await conn.scalar(
+            text("SELECT payload FROM slack_outbox WHERE autonomy_campaign_id=:campaign"),
+            {"campaign": experiment.campaign_id},
+        )
+    assert audit_payload["experiment_id"] == experiment.experiment_id
+    assert audit_payload["variant_ids"] == [variant.variant_id for variant in experiment.variants]
+    assert len(audit_payload["evidence"]) == 3
+    assert audit_payload["thresholds"]["min_impressions"] == 1000
+    assert audit_payload["evidence_window"]["captured_at"] == NOW.isoformat()
+    assert audit_payload["next_evaluation_at"]
+    assert "baseline" not in json.dumps(audit_payload).casefold()
+    for locale in ("NL", "FR", "EN"):
+        metrics[experiment.variants[2].variant_id][locale]["registrations"] = 0
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE publications SET performance=jsonb_set(performance,'{hook_experiment_variants}',CAST(:metrics AS JSONB)) WHERE draft_id=156"
+            ),
+            {"metrics": json.dumps(metrics)},
+        )
+    neutral = (await _eligible_campaigns(engine, settings, NOW))[0]["decision"]
+    assert neutral.kind is DecisionKind.OBSERVE
+    assert neutral.reason == "insufficient_evidence"
 
 
 @pytest.fixture

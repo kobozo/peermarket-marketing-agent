@@ -30,3 +30,11 @@ The autonomy cycle now reads the configured experiment's nine append-only locale
 Slack text now explicitly includes experiment ID and the frozen start/end/captured-at evidence window, in addition to its structured fields. The lifecycle runbook and deploy contract test require prepare/inspect plus all-three-ID audit verification.
 
 Remediation GREEN: PostgreSQL snapshot/audit `2 passed, 13 deselected`; experiment policy `4 passed, 53 deselected`; deploy/runbook `5 passed`; Ruff and diff checks passed.
+
+## Real collector and cycle remediation
+
+Hourly collection now resolves the persisted replacement progress for the configured experiment, reads Insights for all nine ad IDs, joins aggregate registrations by variant/locale UTM identity, and durably merges impressions, LPV, registrations, account window, UTC window, and capture time into the source publication.
+
+The loader validates exact IDs, current campaign, hook dimension, and one fixed campaign/ad-set/landing/fixed-identity control tuple before aggregation. A PostgreSQL collector test proves nine real Insights results are written. A PostgreSQL candidate-cycle test then consumes collected-format metrics through the real loader/snapshot/policy: qualified evidence produces a deterministic non-observe decision, while lowering one variant below floors produces `insufficient_evidence`. Its real policy decision also generates the complete three-member sanitized Slack audit.
+
+Focused GREEN: collector `1 passed`; real candidate cycle/audit `1 passed`; persisted aggregation/audit `2 passed`; experiment policy `4 passed`; deploy/runbook `5 passed`. Ruff and diff checks passed.

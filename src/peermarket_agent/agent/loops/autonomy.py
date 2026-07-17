@@ -375,7 +375,8 @@ async def _persisted_hook_variants(
             for item in (
                 await conn.execute(
                     text(
-                        "SELECT variant_id,language,campaign_id,changed_dimension,fixed_identity "
+                        "SELECT variant_id,language,campaign_id,ad_set_id,landing_page_url,"
+                        "changed_dimension,fixed_identity "
                         "FROM autonomous_hook_experiment_variants WHERE experiment_id=:id "
                         "ORDER BY variant_id,CASE language WHEN 'NL' THEN 1 WHEN 'FR' THEN 2 ELSE 3 END"
                     ),
@@ -385,6 +386,23 @@ async def _persisted_hook_variants(
         ]
     expected_ids = [f"{experiment_id}:{number:02}" for number in (1, 2, 3)]
     if len(records) != 9 or sorted({item["variant_id"] for item in records}) != expected_ids:
+        return None
+    controls = {
+        (
+            item["campaign_id"],
+            item["ad_set_id"],
+            item["landing_page_url"],
+            item["changed_dimension"],
+            json.dumps(item["fixed_identity"], sort_keys=True),
+        )
+        for item in records
+    }
+    current_campaign = str((row.get("external_ids") or {}).get("campaign_id") or "")
+    if (
+        len(controls) != 1
+        or records[0]["campaign_id"] != current_campaign
+        or records[0]["changed_dimension"] != "hook"
+    ):
         return None
     samples = performance.get("hook_experiment_variants")
     samples = samples if isinstance(samples, dict) else {}

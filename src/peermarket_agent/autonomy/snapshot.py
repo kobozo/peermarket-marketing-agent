@@ -89,6 +89,10 @@ def build_autonomy_snapshot(
     source_experiment = (
         replacement_source.get("experiment_id") if isinstance(replacement_source, Mapping) else None
     )
+    if source_experiment is None and variants:
+        candidate = str(variants[0].get("variant_id", "")).rsplit(":", 1)[0]
+        if candidate:
+            source_experiment = candidate
     if isinstance(source_experiment, str) and {item.get("variant_id") for item in variants} == {
         f"{source_experiment}:{number:02}" for number in (1, 2, 3)
     }:
