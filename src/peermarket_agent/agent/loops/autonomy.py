@@ -473,6 +473,13 @@ async def _audit(
         "outcome": outcome,
         "decision": decision.kind.value,
         "reason": decision.reason,
+        "experiment_id": decision.evidence.get("experiment_id"),
+        "variant_ids": sorted(
+            str(item.get("variant_id")) for item in decision.evidence.get("variants", ())
+        ),
+        "evidence_window": _sanitize_audit_value(
+            dict(decision.evidence.get("evidence_window") or {})
+        ),
         "thresholds": thresholds,
         "evidence": evidence,
         "affected_ads": affected_ads,

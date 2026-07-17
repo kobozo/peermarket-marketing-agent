@@ -341,6 +341,12 @@ async def test_autonomy_audit_freezes_meaningful_sanitized_campaign_content(engi
         "10",
         {
             "snapshot_id": "audit-content",
+            "experiment_id": "draft-156-hook-test",
+            "evidence_window": {
+                "start": "2026-07-16T12:00:00+00:00",
+                "end": "2026-07-17T12:00:00+00:00",
+                "captured_at": "2026-07-17T11:30:00+00:00",
+            },
             "policy_limits": {"min_impressions": 100, "cooldown_hours": 24},
             "variants": [
                 {
@@ -392,6 +398,9 @@ async def test_autonomy_audit_freezes_meaningful_sanitized_campaign_content(engi
         )
 
     assert payload["campaign_id"] == "10"
+    assert payload["experiment_id"] == "draft-156-hook-test"
+    assert payload["variant_ids"] == ["NL"]
+    assert payload["evidence_window"]["end"] == "2026-07-17T12:00:00+00:00"
     assert payload["thresholds"] == {"min_impressions": 100, "cooldown_hours": 24}
     assert payload["evidence"][0]["impressions"] == 250
     assert payload["affected_ads"] == [{"ad_id": "31", "ad_set_id": "21", "publication_id": 1}]

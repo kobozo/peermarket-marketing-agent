@@ -117,6 +117,11 @@ allowlisted, shadow is true, a recent decision and evidence window are present,
 and no action was queued. Confirm collection is live from the recent evidence
 window and `attribution_complete`; otherwise autonomy is inert and must not be
 enabled. It must not show raw PeerMarket records or credentials.
+For the hook experiment, require one campaign-scoped audit containing the configured
+experiment ID, all three ordered variant IDs, thresholds, per-variant samples, the
+complete fresh evidence window, and next evaluation. `insufficient_evidence`,
+`neutral_tie`, `stale_snapshot`, and `missing_attribution` are neutral and must not
+trigger Meta mutation.
 Repeat the health check after inspection.
 
 ## Enable the canary
