@@ -19,6 +19,28 @@ from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
 
 _CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+_NEUTRAL_EXPERIMENT_REASONS = {
+    "insufficient_evidence",
+    "neutral_tie",
+    "maximum_test_duration_without_qualified_comparison",
+    "stale_snapshot",
+    "missing_attribution",
+    "not_comparable",
+    "technical_delivery_failure",
+}
+_QUALIFIED_EXPERIMENT_REASONS = {
+    "proven_loser_replace",
+    "proven_winner_reallocate",
+    "proven_winner_scale",
+}
+
+
+def classify_experiment_reason(reason: str) -> str:
+    if reason in _NEUTRAL_EXPERIMENT_REASONS:
+        return "neutral"
+    if reason in _QUALIFIED_EXPERIMENT_REASONS:
+        return "qualified"
+    raise ValueError("unknown experiment policy reason")
 
 
 @asynccontextmanager
@@ -259,9 +281,22 @@ def _safe_experiment_evidence(value: object, reason: str | None) -> dict[str, An
             item["variant_id"] for item in result["samples"] if "variant_id" in item
         ]
     result["thresholds"] = {
-        key: value["thresholds"][key]
-        for key in ("min_impressions", "min_landing_page_views", "min_registrations")
-        if isinstance(value.get("thresholds"), dict) and key in value["thresholds"]
+        key: value["policy_limits"][key]
+        for key in (
+            "min_impressions",
+            "min_landing_page_views",
+            "min_registrations",
+            "cooldown_hours",
+            "max_test_days",
+            "max_increase_percent",
+            "max_daily_budget_cents",
+            "max_replacements_24h",
+            "snapshot_age_hours",
+            "no_delivery_grace_hours",
+            "complete_window_required",
+            "account_timezone",
+        )
+        if isinstance(value.get("policy_limits"), dict) and key in value["policy_limits"]
     }
     result["window"] = {
         key: value["evidence_window"][key]
@@ -294,9 +329,13 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                             "FROM autonomous_actions aa WHERE aa.campaign_id="
                             "p.external_ids->>'campaign_id' AND aa.status NOT IN "
                             "('succeeded','failed','cancelled')) AS active_action_statuses,"
-                            "(SELECT jsonb_build_object('id',o.id,'status',o.status) "
+                            "(SELECT jsonb_build_object('id',o.id,'status',o.status,"
+                            "'idempotency_key',o.idempotency_key,'decision_id',d.id,"
+                            "'experiment_id',o.payload->'experiment_id','variant_ids',"
+                            "o.payload->'variant_ids','evidence_window',o.payload->'evidence_window') "
                             "FROM slack_outbox o WHERE o.autonomy_campaign_id="
                             "p.external_ids->>'campaign_id' AND o.message_kind='autonomy_audit' "
+                            "AND o.idempotency_key LIKE 'autonomy:'||d.decision_key||':%' "
                             "ORDER BY o.id DESC LIMIT 1) AS slack_audit "
                             "FROM publications p JOIN drafts dr ON dr.id=p.draft_id "
                             "LEFT JOIN LATERAL (SELECT * FROM autonomous_decisions "
@@ -378,11 +417,6 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
             else None
         )
         report["experiment_evidence"] = _safe_experiment_evidence(row["evidence"], row["reason"])
-        report["experiment_evidence"]["thresholds"] = {
-            "min_impressions": settings.learning_min_impressions,
-            "min_landing_page_views": settings.learning_min_landing_page_views,
-            "min_registrations": settings.learning_min_registrations,
-        }
         report["active_action_count"] = int(row["active_action_count"] or 0)
         report["active_action_statuses"] = list(row["active_action_statuses"] or [])
         report["slack_audit"] = dict(row["slack_audit"]) if row["slack_audit"] else None

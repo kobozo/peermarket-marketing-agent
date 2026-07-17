@@ -187,6 +187,14 @@ jobs:
         if: ${{ vars.META_AUTONOMY_EXPERIMENT_ID != '' && vars.META_AUTONOMY_ENABLED == 'true' && vars.META_AUTONOMY_SHADOW == 'true' }}
         env:
           EXPECTED_EXPERIMENT_ID: ${{ vars.META_AUTONOMY_EXPERIMENT_ID }}
+          EXPECTED_MIN_IMPRESSIONS: ${{ vars.LEARNING_MIN_IMPRESSIONS || '1000' }}
+          EXPECTED_MIN_LANDING_PAGE_VIEWS: ${{ vars.LEARNING_MIN_LANDING_PAGE_VIEWS || '30' }}
+          EXPECTED_MIN_REGISTRATIONS: ${{ vars.LEARNING_MIN_REGISTRATIONS || '10' }}
+          EXPECTED_COOLDOWN_HOURS: ${{ vars.META_AUTONOMY_COOLDOWN_HOURS || '24' }}
+          EXPECTED_MAX_TEST_DAYS: ${{ vars.META_AUTONOMY_MAX_TEST_DAYS || '7' }}
+          EXPECTED_MAX_REPLACEMENTS_24H: ${{ vars.META_AUTONOMY_MAX_REPLACEMENTS_24H || '1' }}
+          EXPECTED_MAX_INCREASE_PERCENT: ${{ vars.META_AUTONOMY_MAX_INCREASE_PERCENT || '20' }}
+          EXPECTED_MAX_DAILY_BUDGET_EUR: ${{ vars.META_AUTONOMY_MAX_DAILY_BUDGET_EUR || '20' }}
         run: |
           set -euo pipefail
           report="$(sudo -u peermarket-agent bash -c '
@@ -198,6 +206,7 @@ jobs:
           ')"
           REPORT="$report" python3 - <<'PY'
           import json, os
+          from peermarket_agent.cli_performance import classify_experiment_reason
           report = json.loads(os.environ["REPORT"])
           experiment = report["hook_experiment"]
           experiment_id = os.environ["EXPECTED_EXPERIMENT_ID"]
@@ -209,11 +218,25 @@ jobs:
           assert experiment["variant_count"] == 3 and actual == expected
           assert experiment["fixed_identity_match"] and experiment["ready"]
           evidence = report["experiment_evidence"]
-          assert evidence["reason"] in {"insufficient_evidence", "neutral_tie", "proven_winner_reallocate"}
+          assert classify_experiment_reason(evidence["reason"]) in {"neutral", "qualified"}
           assert evidence["variant_ids"] == expected and len(evidence["samples"]) == 3
           assert evidence["window"] and evidence["thresholds"]
           assert evidence["delivery_state"] == "healthy" and evidence["attribution_complete"] is True
+          limits = evidence["thresholds"]
+          assert limits["min_impressions"] == int(os.environ["EXPECTED_MIN_IMPRESSIONS"])
+          assert limits["min_landing_page_views"] == int(os.environ["EXPECTED_MIN_LANDING_PAGE_VIEWS"])
+          assert limits["min_registrations"] == int(os.environ["EXPECTED_MIN_REGISTRATIONS"])
+          assert limits["cooldown_hours"] == int(os.environ["EXPECTED_COOLDOWN_HOURS"])
+          assert limits["max_test_days"] == int(os.environ["EXPECTED_MAX_TEST_DAYS"])
+          assert limits["max_replacements_24h"] == int(os.environ["EXPECTED_MAX_REPLACEMENTS_24H"])
+          assert limits["max_increase_percent"] == int(os.environ["EXPECTED_MAX_INCREASE_PERCENT"])
+          assert limits["max_daily_budget_cents"] == int(os.environ["EXPECTED_MAX_DAILY_BUDGET_EUR"]) * 100
           assert report["active_action_count"] == 0 and report["active_action_statuses"] == []
           audit = report["slack_audit"]
           assert audit and audit["status"] in {"pending", "delivered"} and int(audit["id"]) > 0
+          assert audit["decision_id"] == report["decision"]["id"]
+          assert audit["idempotency_key"].startswith("autonomy:")
+          assert audit["experiment_id"] == experiment_id
+          assert audit["variant_ids"] == expected
+          assert audit["evidence_window"] == evidence["window"]
           PY

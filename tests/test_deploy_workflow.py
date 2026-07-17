@@ -142,7 +142,7 @@ def test_hook_canary_uses_correlated_ci_dispatch_and_deployed_read_only_gate():
     assert '[[ -n "$candidate" ]] && run_ids+=("$candidate")' in runbook
     assert "exactly `:01`, `:02`, and `:03`" in runbook
     assert "fixed landing page and audience identity" in runbook
-    assert "sufficient or insufficient evidence" in runbook
+    assert "policy-recognized neutral or qualified evidence" in runbook
     assert "no queued action" in runbook
     assert "durable Slack audit" in runbook
     assert "explicit later canary approval" in runbook
@@ -152,6 +152,10 @@ def test_hook_canary_uses_correlated_ci_dispatch_and_deployed_read_only_gate():
     assert 'report["active_action_count"] == 0' in workflow
     assert '{"pending", "delivered"}' in workflow
     assert 'evidence["variant_ids"] == expected' in workflow
+    assert 'audit["decision_id"] == report["decision"]["id"]' in workflow
+    assert 'audit["experiment_id"] == experiment_id' in workflow
+    assert 'audit["evidence_window"] == evidence["window"]' in workflow
+    assert 'limits["max_daily_budget_cents"]' in workflow
 
 
 def test_hook_dispatch_retries_blank_run_list_before_unique_numeric_id(tmp_path):

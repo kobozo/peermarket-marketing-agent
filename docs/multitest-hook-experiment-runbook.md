@@ -58,7 +58,7 @@ Run the read-only inspection on the deployed host:
 peermarket-performance autonomy --draft-id 156
 ```
 
-The sanitized `hook_experiment` result must show the configured experiment ID, `variant_count: 3`, exactly `:01`, `:02`, and `:03` with EN/FR/NL, `fixed_identity_match: true`, `ready: true`, and no blocked reason. Confirm the fixed landing page and audience identity, a sufficient or insufficient evidence state, no queued action, and a durable Slack audit. It intentionally omits hook text, fixed identity values, tokens, and credentials.
+The sanitized `hook_experiment` result must show the configured experiment ID, `variant_count: 3`, exactly `:01`, `:02`, and `:03` with EN/FR/NL, `fixed_identity_match: true`, `ready: true`, and no blocked reason. Confirm the fixed landing page and audience identity, a policy-recognized neutral or qualified evidence state, no queued action, and a durable Slack audit. The audit must link to the latest decision ID/idempotency key and repeat that decision's experiment ID, exact variant IDs, and evidence window; a prior experiment's campaign audit is not acceptable. Compare frozen `policy_limits` from decision evidence to the staged GitHub values—never substitute current settings for missing frozen limits. It intentionally omits hook text, fixed identity values, tokens, and credentials.
 
 Keep shadow true and execution writes disabled until an explicit later canary approval. Record the correlated successful CI run ID and commit SHA in the handoff; this implementation task does not dispatch it.
 

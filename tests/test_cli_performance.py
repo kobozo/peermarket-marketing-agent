@@ -406,6 +406,13 @@ def test_experiment_evidence_projection_whitelists_samples_window_and_qualificat
                 "captured_at": "2026-07-17T12:00:00Z",
                 "secret": "raw-window-secret",
             },
+            "policy_limits": {
+                "min_impressions": 1000,
+                "min_landing_page_views": 30,
+                "min_registrations": 10,
+                "cooldown_hours": 24,
+                "secret": "raw-limit-secret",
+            },
         },
         "insufficient_evidence",
     )
@@ -414,7 +421,41 @@ def test_experiment_evidence_projection_whitelists_samples_window_and_qualificat
     assert projected["variant_ids"] == ["exp:01"]
     assert projected["samples"][0]["registrations"] == 10
     assert projected["window"]["captured_at"] == "2026-07-17T12:00:00Z"
+    assert projected["thresholds"] == {
+        "min_impressions": 1000,
+        "min_landing_page_views": 30,
+        "min_registrations": 10,
+        "cooldown_hours": 24,
+    }
     assert "raw-" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("reason", "classification"),
+    [
+        ("insufficient_evidence", "neutral"),
+        ("neutral_tie", "neutral"),
+        ("maximum_test_duration_without_qualified_comparison", "neutral"),
+        ("stale_snapshot", "neutral"),
+        ("missing_attribution", "neutral"),
+        ("not_comparable", "neutral"),
+        ("technical_delivery_failure", "neutral"),
+        ("proven_loser_replace", "qualified"),
+        ("proven_winner_reallocate", "qualified"),
+        ("proven_winner_scale", "qualified"),
+    ],
+)
+def test_experiment_reason_classifier_accepts_policy_outcomes(reason, classification):
+    from peermarket_agent.cli_performance import classify_experiment_reason
+
+    assert classify_experiment_reason(reason) == classification
+
+
+def test_experiment_reason_classifier_rejects_unknown():
+    from peermarket_agent.cli_performance import classify_experiment_reason
+
+    with pytest.raises(ValueError, match="unknown experiment policy reason"):
+        classify_experiment_reason("unknown_new_reason")
 
 
 @pytest.mark.parametrize(

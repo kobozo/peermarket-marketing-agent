@@ -9,4 +9,6 @@ Implemented the CI-only Draft 156 hook canary contract without changing reposito
 
 Rejection remediation makes blank `gh run list` polls true zero-match retries (covered by an executable fake-`gh` shell test), extends the PostgreSQL READ ONLY autonomy projection with whitelisted experiment samples/window/qualification, campaign-wide nonterminal action state, and the latest durable Slack audit ID/status, and makes the deploy gate independently compare the staged experiment ID before enforcing exact membership, evidence, zero active actions, and pending/delivered audit state.
 
+Final remediation aligns the gate with every recognized neutral and qualified hook-policy reason, rejects unknown reasons, projects only frozen `policy_limits`, and links the durable audit to the current decision through its decision ID/idempotency key plus matching experiment, ordered variants, and evidence window. Older campaign audits cannot satisfy the SQL lookup or workflow predicate.
+
 Verification: `uv run pytest -q tests/test_deploy_workflow.py` (6 passed), YAML loaded by the test suite, and `git diff --check` clean.
