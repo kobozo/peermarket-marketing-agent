@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import asdict
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from sqlalchemy import text
@@ -677,6 +677,20 @@ async def test_live_budget_mismatch_marks_action_and_attempt_reconciliation(
             }
         ),
     )
+    pause = AsyncMock(
+        return_value={
+            "observed": {
+                "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+                "ad_set": {"status": "PAUSED", "effective_status": "CAMPAIGN_PAUSED"},
+                **{
+                    f"ad:{x}": {"status": "PAUSED", "effective_status": "ADSET_PAUSED"}
+                    for x in ("NL", "FR", "EN")
+                },
+            },
+            "pause_errors": {},
+        }
+    )
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.pause_meta_replacement_bundle", pause)
     monkeypatch.setattr(
         "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused",
         AsyncMock(
@@ -693,6 +707,12 @@ async def test_live_budget_mismatch_marks_action_and_attempt_reconciliation(
         await publish_replacement_paused(
             engine=engine, settings=_make_settings(), claim=claim, draft=draft
         )
+    pause.assert_awaited_once_with(
+        ANY,
+        "new-c",
+        "new-as",
+        {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+    )
     async with engine.connect() as conn:
         attempt_state = await conn.scalar(
             text("SELECT state FROM autonomous_replacement_publications WHERE action_id=:id"),

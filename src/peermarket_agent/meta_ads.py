@@ -60,6 +60,7 @@ class MetaReplacementBundleResult:
     ads_manager_url: str
     status: str = "PAUSED"
     image_hashes: Mapping[str, str] = field(default_factory=dict)
+    local_image_sha256s: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -365,6 +366,16 @@ def _sync_create_bundle_resource(
     api = _init_api(config)
     account = AdAccount(config.ad_account_id, api=api)
 
+    safe_effective = {
+        "PAUSED",
+        "CAMPAIGN_PAUSED",
+        "ADSET_PAUSED",
+        "PENDING_REVIEW",
+        "IN_PROCESS",
+        "PREAPPROVED",
+        "PENDING_BILLING_INFO",
+    }
+
     def existing(
         getter_name: str,
         resource_name: str,
@@ -372,6 +383,8 @@ def _sync_create_bundle_resource(
         fields: list[str],
         expected: Mapping[str, object],
         id_field: str = "id",
+        hierarchy_factory: Callable[[str], list[tuple[str, type, str]]] | None = None,
+        require_paused: bool = False,
     ) -> str | None:
         getter = getattr(account, getter_name)
         named = [
@@ -398,6 +411,62 @@ def _sync_create_bundle_resource(
                 "Meta bundle identity is incomplete during reconciliation",
                 phase="reconcile_bundle_identity",
             )
+        if require_paused:
+            hierarchy = hierarchy_factory(value) if hierarchy_factory else []
+            observed = {
+                "status": candidate.get("status"),
+                "effective_status": candidate.get("effective_status"),
+            }
+            if observed["status"] != "PAUSED" or observed["effective_status"] not in safe_effective:
+                pause_errors: dict[str, str] = {}
+                reread: dict[str, dict[str, object]] = {}
+                for label, resource_type, resource_id in hierarchy:
+                    try:
+                        resource_type(resource_id).api_update(params={"status": "PAUSED"})
+                    except Exception as exc:
+                        pause_errors[label] = _redact_credentials(str(exc), config)
+                for label, resource_type, resource_id in hierarchy:
+                    try:
+                        reread[label] = dict(
+                            resource_type(resource_id).api_get(
+                                fields=["status", "effective_status"]
+                            )
+                        )
+                    except Exception as exc:
+                        pause_errors[f"{label}_reread"] = _redact_credentials(str(exc), config)
+                candidate_state = reread.get(hierarchy[0][0], {}) if hierarchy else {}
+                if (
+                    pause_errors
+                    or candidate_state.get("status") != "PAUSED"
+                    or candidate_state.get("effective_status") not in safe_effective
+                    or any(
+                        state.get("status") != "PAUSED"
+                        or state.get("effective_status") not in safe_effective
+                        for state in reread.values()
+                    )
+                ):
+                    raise MetaAdsError(
+                        "Meta bundle identity could not be made safely paused",
+                        phase="reconcile_bundle_identity",
+                        resource_ids={label: rid for label, _, rid in hierarchy},
+                        observed_statuses=reread,
+                        rollback_errors=pause_errors,
+                    )
+        elif candidate.get("status") is not None and (
+            candidate.get("status") != "PAUSED"
+            or candidate.get("effective_status") not in safe_effective
+        ):
+            raise MetaAdsError(
+                "Meta bundle identity is not safely paused",
+                phase="reconcile_bundle_identity",
+                resource_ids={id_field: value},
+                observed_statuses={
+                    "candidate": {
+                        "status": str(candidate.get("status")),
+                        "effective_status": str(candidate.get("effective_status")),
+                    }
+                },
+            )
         return value
 
     if "campaign_id" not in progress:
@@ -406,12 +475,22 @@ def _sync_create_bundle_resource(
         if found := existing(
             "get_campaigns",
             resource_name,
-            fields=["id", "name", "objective", "special_ad_categories", "account_id"],
+            fields=[
+                "id",
+                "name",
+                "objective",
+                "special_ad_categories",
+                "account_id",
+                "status",
+                "effective_status",
+            ],
             expected={
                 "objective": "OUTCOME_TRAFFIC",
                 "special_ad_categories": [],
                 "account_id": account_id,
             },
+            hierarchy_factory=lambda candidate_id: [("campaign", Campaign, candidate_id)],
+            require_paused=True,
         ):
             return "campaign_id", found
         item = account.create_campaign(
@@ -441,6 +520,8 @@ def _sync_create_bundle_resource(
                 "bid_strategy",
                 "targeting",
                 "destination_type",
+                "status",
+                "effective_status",
             ],
             expected={
                 "campaign_id": progress["campaign_id"],
@@ -451,6 +532,11 @@ def _sync_create_bundle_resource(
                 "targeting": expected_targeting,
                 "destination_type": "WEBSITE",
             },
+            hierarchy_factory=lambda candidate_id: [
+                ("ad_set", AdSet, candidate_id),
+                ("campaign", Campaign, progress["campaign_id"]),
+            ],
+            require_paused=True,
         ):
             return "ad_set_id", found
         item = account.create_ad_set(
@@ -474,11 +560,15 @@ def _sync_create_bundle_resource(
     creative_key = f"creative_id:{locale}"
     ad_key = f"ad_id:{locale}"
     if creative.image_bytes and image_key not in progress:
-        image_name = (
-            f"{name} {locale} image {hashlib.sha256(creative.image_bytes).hexdigest()[:20]}"
-        )
+        local_sha256 = hashlib.sha256(creative.image_bytes).hexdigest()
+        expected_meta_hash = hashlib.md5(creative.image_bytes).hexdigest()  # noqa: S324 -- Meta content identity
+        image_name = f"{name} {locale} image {local_sha256[:20]}"
         if found := existing(
-            "get_ad_images", image_name, fields=["hash", "name"], expected={}, id_field="hash"
+            "get_ad_images",
+            image_name,
+            fields=["hash", "name"],
+            expected={"hash": expected_meta_hash},
+            id_field="hash",
         ):
             return image_key, found
         image = account.create_ad_image(
@@ -488,7 +578,13 @@ def _sync_create_bundle_resource(
             },
             fields=["hash"],
         )
-        return image_key, image["hash"]
+        if image.get("hash") != expected_meta_hash:
+            raise MetaAdsError(
+                "Meta image upload returned unexpected content hash",
+                phase="verify_bundle_image_hash",
+                observed_statuses={"image": {"hash": str(image.get("hash"))}},
+            )
+        return image_key, expected_meta_hash
     if creative_key not in progress:
         if creative.cta_type not in _ALLOWED_CTA_TYPES:
             raise MetaAdsError("invalid bundle CTA", phase="validate_bundle")
@@ -506,7 +602,7 @@ def _sync_create_bundle_resource(
         if found := existing(
             "get_ad_creatives",
             resource_name,
-            fields=["id", "name", "object_story_spec"],
+            fields=["id", "name", "object_story_spec", "status", "effective_status"],
             expected={"object_story_spec": story_spec},
         ):
             return creative_key, found
@@ -525,8 +621,14 @@ def _sync_create_bundle_resource(
     if found := existing(
         "get_ads",
         resource_name,
-        fields=["id", "name", "adset_id", "creative"],
+        fields=["id", "name", "adset_id", "creative", "status", "effective_status"],
         expected={"adset_id": progress["ad_set_id"], "creative": {"id": progress[creative_key]}},
+        hierarchy_factory=lambda candidate_id: [
+            ("ad", Ad, candidate_id),
+            ("ad_set", AdSet, progress["ad_set_id"]),
+            ("campaign", Campaign, progress["campaign_id"]),
+        ],
+        require_paused=True,
     ):
         return ad_key, found
     item = account.create_ad(
@@ -562,6 +664,12 @@ async def create_meta_replacement_bundle_paused(
             locale is not None and f"ad_id:{locale}" not in current
         ):
             try:
+                if locale is not None and child is not None and child.image_bytes:
+                    sha_key = f"local_image_sha256:{locale}"
+                    sha_value = hashlib.sha256(child.image_bytes).hexdigest()
+                    if sha_key not in current:
+                        current[sha_key] = sha_value
+                        await persist_progress(sha_key, sha_value)
                 if "campaign_id" not in current:
                     request_key, request_name = "request_name:campaign", f"{name} — campaign"
                 elif "ad_set_id" not in current:
@@ -610,6 +718,11 @@ async def create_meta_replacement_bundle_paused(
             locale: current[f"image_hash:{locale}"]
             for locale in ("NL", "FR", "EN")
             if f"image_hash:{locale}" in current
+        },
+        local_image_sha256s={
+            locale: current[f"local_image_sha256:{locale}"]
+            for locale in ("NL", "FR", "EN")
+            if f"local_image_sha256:{locale}" in current
         },
     )
 
@@ -669,7 +782,14 @@ def _sync_get_replacement_bundle_statuses(
                 "description": frozen.description,
                 "call_to_action": {"type": frozen.cta_type},
             }
-            if image_hashes and locale in image_hashes:
+            if frozen.image_bytes:
+                expected_image_hash = hashlib.md5(frozen.image_bytes).hexdigest()  # noqa: S324
+                if image_hashes and image_hashes.get(locale) != expected_image_hash:
+                    raise MetaAdsError(
+                        "Meta bundle frozen image hash mismatch", phase="verify_bundle"
+                    )
+                link_data["image_hash"] = expected_image_hash
+            elif image_hashes and locale in image_hashes:
                 link_data["image_hash"] = image_hashes[locale]
             expected_story = {"page_id": config.page_id, "link_data": link_data}
             if observed.get("object_story_spec") != expected_story:
@@ -770,6 +890,53 @@ def _redact_credentials(message: str, config: MetaConfig) -> str:
 async def pause_meta_ad(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
     """Best-effort pause in child-to-parent order; return failures by resource."""
     return await asyncio.to_thread(_sync_pause, config, ids)
+
+
+def _sync_pause_replacement_bundle(
+    config: MetaConfig,
+    campaign_id: str,
+    ad_set_id: str,
+    ad_ids: Mapping[str, str],
+) -> dict[str, object]:
+    """Fence a newly-created replacement hierarchy, then retain live evidence."""
+    _ensure_enabled(config)
+    _init_api(config)
+    errors: dict[str, str] = {}
+    resources: list[tuple[str, object]] = [
+        *[(f"ad:{locale}", Ad(ad_id)) for locale, ad_id in ad_ids.items()],
+        ("ad_set", AdSet(ad_set_id)),
+        ("campaign", Campaign(campaign_id)),
+    ]
+    for label, resource in resources:
+        try:
+            resource.api_update(params={"status": "PAUSED"})
+        except Exception as exc:
+            errors[label] = _redact_credentials(str(exc), config)
+    observed: dict[str, dict[str, object]] = {}
+    for label, resource in resources:
+        try:
+            observed[label] = dict(resource.api_get(fields=["status", "effective_status"]))
+        except Exception as exc:
+            errors[f"{label}:reread"] = _redact_credentials(str(exc), config)
+    return {"observed": observed, "pause_errors": errors}
+
+
+async def pause_meta_replacement_bundle(
+    config: MetaConfig,
+    campaign_id: str,
+    ad_set_id: str,
+    ad_ids: Mapping[str, str],
+) -> dict[str, object]:
+    """Best-effort child-to-parent fence for only the new replacement hierarchy."""
+    try:
+        return await asyncio.to_thread(
+            _sync_pause_replacement_bundle, config, campaign_id, ad_set_id, ad_ids
+        )
+    except Exception as exc:
+        return {
+            "observed": {},
+            "pause_errors": {"setup": _redact_credentials(str(exc), config)},
+        }
 
 
 _MUTABLE_AD_STATUSES = {"ACTIVE", "PAUSED"}

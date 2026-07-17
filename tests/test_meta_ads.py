@@ -1,5 +1,6 @@
 """Meta Ads connector tests — no real API calls."""
 
+import hashlib
 import traceback
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,9 +18,41 @@ from peermarket_agent.meta_ads import (
     create_meta_replacement_bundle_paused,
     get_meta_budget_state,
     get_meta_replacement_bundle_statuses,
+    pause_meta_replacement_bundle,
     set_meta_ad_status,
     set_meta_adset_daily_budget,
 )
+
+
+async def test_pause_replacement_bundle_orders_all_children_before_parents_and_rereads(monkeypatch):
+    calls = []
+
+    class Resource:
+        def __init__(self, kind, rid):
+            self.kind, self.rid = kind, rid
+
+        def api_update(self, *, params):
+            calls.append(("pause", self.kind, self.rid))
+
+        def api_get(self, *, fields):
+            calls.append(("read", self.kind, self.rid))
+            return {"status": "PAUSED", "effective_status": "PAUSED"}
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: None)
+    monkeypatch.setattr("peermarket_agent.meta_ads.Ad", lambda rid: Resource("ad", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdSet", lambda rid: Resource("ad_set", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.Campaign", lambda rid: Resource("campaign", rid))
+    result = await pause_meta_replacement_bundle(
+        _FULL_CONFIG, "new-c", "new-as", {"NL": "new-nl", "FR": "new-fr", "EN": "new-en"}
+    )
+    assert calls[:5] == [
+        ("pause", "ad", "new-nl"),
+        ("pause", "ad", "new-fr"),
+        ("pause", "ad", "new-en"),
+        ("pause", "ad_set", "new-as"),
+        ("pause", "campaign", "new-c"),
+    ]
+    assert not result["pause_errors"]
 
 
 def _identity_account(kind, candidates):
@@ -149,6 +182,108 @@ def test_bundle_retry_rejects_ambiguous_exact_campaign_matches(monkeypatch):
     monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *a, **k: account)
     with pytest.raises(MetaAdsError, match="ambiguous"):
         _sync_create_bundle_resource(**_bundle_identity_kwargs("campaign"))
+
+
+@pytest.mark.parametrize("kind", ["campaign", "ad_set", "ad"])
+def test_bundle_retry_pauses_active_exact_identity_before_adoption(monkeypatch, kind):
+    kwargs = _bundle_identity_kwargs(kind)
+    name = {
+        "campaign": f"{kwargs['name']} — campaign",
+        "ad_set": f"{kwargs['name']} — adset",
+        "ad": f"{kwargs['name']} NL",
+    }[kind]
+    immutable = {
+        "campaign": {
+            "objective": "OUTCOME_TRAFFIC",
+            "special_ad_categories": [],
+            "account_id": "999",
+        },
+        "ad_set": {
+            "campaign_id": "campaign-1",
+            "daily_budget": "1000",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "LINK_CLICKS",
+            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+            "targeting": __import__(
+                "peermarket_agent.meta_ads", fromlist=["_TARGETING_TEMPLATES"]
+            )._TARGETING_TEMPLATES["declutterers"],
+            "destination_type": "WEBSITE",
+        },
+        "ad": {"adset_id": "adset-1", "creative": {"id": "creative-1"}},
+    }[kind]
+    candidate = {
+        "id": f"{kind}-active",
+        "name": name,
+        **immutable,
+        "status": "ACTIVE",
+        "effective_status": "ACTIVE",
+    }
+    account = _identity_account(kind, [candidate])
+    calls = []
+    states = {
+        ("campaign", "campaign-active" if kind == "campaign" else "campaign-1"): candidate
+        if kind == "campaign"
+        else {"status": "PAUSED", "effective_status": "PAUSED"},
+        ("ad_set", "ad_set-active" if kind == "ad_set" else "adset-1"): candidate
+        if kind == "ad_set"
+        else {"status": "PAUSED", "effective_status": "CAMPAIGN_PAUSED"},
+        ("ad", "ad-active"): candidate,
+    }
+
+    class Resource:
+        def __init__(self, resource_kind, rid):
+            self.kind, self.rid = resource_kind, rid
+
+        def api_update(self, *, params):
+            calls.append((self.kind, self.rid, params["status"]))
+            states[(self.kind, self.rid)] = {
+                **states[(self.kind, self.rid)],
+                "status": "PAUSED",
+                "effective_status": "PAUSED",
+            }
+
+        def api_get(self, *, fields):
+            return states[(self.kind, self.rid)]
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *a, **k: account)
+    monkeypatch.setattr("peermarket_agent.meta_ads.Campaign", lambda rid: Resource("campaign", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdSet", lambda rid: Resource("ad_set", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.Ad", lambda rid: Resource("ad", rid))
+
+    assert _sync_create_bundle_resource(**kwargs)[1] == f"{kind}-active"
+    expected_order = {
+        "campaign": [("campaign", "campaign-active", "PAUSED")],
+        "ad_set": [("ad_set", "ad_set-active", "PAUSED"), ("campaign", "campaign-1", "PAUSED")],
+        "ad": [
+            ("ad", "ad-active", "PAUSED"),
+            ("ad_set", "adset-1", "PAUSED"),
+            ("campaign", "campaign-1", "PAUSED"),
+        ],
+    }[kind]
+    assert calls == expected_order
+
+
+def test_bundle_retry_rejects_wrong_nonempty_image_hash(monkeypatch):
+    kwargs = _bundle_identity_kwargs("image")
+    digest = hashlib.sha256(b"same-image").hexdigest()
+    name = f"{kwargs['name']} NL image {digest[:20]}"
+    account = _identity_account("image", [{"name": name, "hash": "f" * 32}])
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *a, **k: account)
+    with pytest.raises(MetaAdsError, match="identity"):
+        _sync_create_bundle_resource(**kwargs)
+    account.create_ad_image.assert_not_called()
+
+
+def test_bundle_image_upload_requires_expected_meta_hash(monkeypatch):
+    kwargs = _bundle_identity_kwargs("image")
+    account = _identity_account("image", [])
+    account.create_ad_image.return_value = {"hash": "f" * 32}
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *a, **k: account)
+    with pytest.raises(MetaAdsError, match="hash"):
+        _sync_create_bundle_resource(**kwargs)
 
 
 async def test_live_bundle_validation_reads_parent_links_and_frozen_creative_identity(monkeypatch):
@@ -354,6 +489,7 @@ def test_bundle_retry_looks_up_resource_created_before_id_persistence(
         def _create(self, kind, params):
             self.creates += 1
             item = {"id": f"{kind}-id", **params}
+            item.update(status="PAUSED", effective_status="PAUSED")
             if kind == "campaign":
                 item["account_id"] = "999"
             if kind == "ad_set":
@@ -406,7 +542,7 @@ def test_bundle_retry_finds_image_uploaded_before_hash_persistence(monkeypatch):
 
         def create_ad_image(self, params, fields):
             self.uploads += 1
-            item = {"hash": "image-hash", "name": params["name"]}
+            item = {"hash": hashlib.md5(b"same-image").hexdigest(), "name": params["name"]}
             self.images.append(item)
             return item
 
@@ -425,7 +561,7 @@ def test_bundle_retry_finds_image_uploaded_before_hash_persistence(monkeypatch):
     )
     first = _sync_create_bundle_resource(**kwargs)
     second = _sync_create_bundle_resource(**kwargs)
-    assert first == second == ("image_hash:NL", "image-hash")
+    assert first == second == ("image_hash:NL", hashlib.md5(b"same-image").hexdigest())
     assert account.uploads == 1
 
 

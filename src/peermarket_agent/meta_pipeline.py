@@ -1,6 +1,7 @@
 """Approved Meta draft to durable, activated publication."""
 
 import asyncio
+import hashlib
 import json
 import uuid
 from contextlib import suppress
@@ -30,6 +31,7 @@ from peermarket_agent.meta_ads import (
     get_meta_ad_statuses,
     get_meta_replacement_bundle_statuses,
     pause_meta_ad,
+    pause_meta_replacement_bundle,
 )
 from peermarket_agent.nano_banana import (
     ImageEditDisabled,
@@ -404,17 +406,38 @@ async def publish_replacement_paused(
                 raise
             valid = False
         if not valid:
+            cleanup = await pause_meta_replacement_bundle(
+                _meta_config(settings),
+                progress["campaign_id"],
+                progress["ad_set_id"],
+                ad_ids,
+            )
             async with engine.begin() as conn:
                 fenced = await conn.execute(
                     text(
                         "UPDATE autonomous_replacement_publications r SET "
                         "state='reconciliation_required', failure_category='completed_live_validation', "
-                        "updated_at=NOW() WHERE r.id=:id AND r.state='paused' AND EXISTS (SELECT 1 "
+                        "progress=progress || CAST(:diagnostics AS JSONB), updated_at=NOW() "
+                        "WHERE r.id=:id AND r.state='paused' AND EXISTS (SELECT 1 "
                         "FROM autonomous_actions a WHERE a.id=r.action_id AND a.status IN "
                         "('leased','executing','reconciliation_required') AND a.lease_owner=:owner "
                         "AND a.lease_token=:token AND a.lease_expires_at>NOW())"
                     ),
-                    {"id": attempt["id"], "owner": claim.lease_owner, "token": claim.lease_token},
+                    {
+                        "id": attempt["id"],
+                        "owner": claim.lease_owner,
+                        "token": claim.lease_token,
+                        "diagnostics": json.dumps(
+                            {
+                                "completed_validation_observed": json.dumps(
+                                    cleanup.get("observed", {}), sort_keys=True
+                                ),
+                                "completed_validation_pause_failures": json.dumps(
+                                    cleanup.get("pause_errors", {}), sort_keys=True
+                                ),
+                            }
+                        ),
+                    },
                 )
                 if fenced.rowcount != 1:
                     raise RuntimeError("replacement publication ownership was lost")
@@ -480,20 +503,21 @@ async def publish_replacement_paused(
                 if result.rowcount != 1:
                     raise RuntimeError("replacement publication progress persistence failed")
 
+        publication_locales = {
+            locale: MetaBundleLocale(
+                item.primary_text,
+                item.headline,
+                item.description,
+                ctas[item.cta_label],
+                image,
+            )
+            for locale, item in draft.locales.items()
+        }
         try:
             result = await create_meta_replacement_bundle_paused(
                 config=_meta_config(settings),
                 name=f"PeerMarket autonomous draft #{draft.id}",
-                locales={
-                    locale: MetaBundleLocale(
-                        item.primary_text,
-                        item.headline,
-                        item.description,
-                        ctas[item.cta_label],
-                        image,
-                    )
-                    for locale, item in draft.locales.items()
-                },
+                locales=publication_locales,
                 landing_page_url=draft.landing_page_url,
                 audience_profile_key=draft.audience_profile_key,
                 daily_budget_eur=draft.daily_budget_eur,
@@ -539,8 +563,12 @@ async def publish_replacement_paused(
                 result.ad_ids,
                 creative_ids=result.creative_ids,
                 landing_page_url=draft.landing_page_url,
-                locales=frozen_locales,
-                image_hashes=result.image_hashes,
+                locales=publication_locales,
+                image_hashes={
+                    locale: hashlib.md5(item.image_bytes).hexdigest()  # noqa: S324
+                    for locale, item in publication_locales.items()
+                    if item.image_bytes
+                },
             )
             valid = _is_verified_paused_bundle(observed, draft.daily_budget_eur * 100)
             if result.status != "PAUSED" or not valid:
@@ -550,6 +578,24 @@ async def publish_replacement_paused(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            cleanup = await pause_meta_replacement_bundle(
+                _meta_config(settings),
+                result.campaign_id,
+                result.ad_set_id,
+                result.ad_ids,
+            )
+            try:
+                await persist_progress(
+                    "post_validation_observed",
+                    json.dumps(cleanup.get("observed", {}), sort_keys=True),
+                )
+                await persist_progress(
+                    "post_validation_pause_failures",
+                    json.dumps(cleanup.get("pause_errors", {}), sort_keys=True),
+                )
+            except Exception:
+                # Reconciliation below remains authoritative even if diagnostic persistence loses its fence.
+                pass
             async with engine.begin() as conn:
                 reconciled = await conn.execute(
                     text(
