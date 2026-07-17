@@ -23,6 +23,7 @@ from peermarket_agent.autonomy.store import (
     record_budget_event,
     record_decision,
     release_action,
+    require_reconciliation,
 )
 from peermarket_agent.db.migrations import run_migrations
 
@@ -242,6 +243,27 @@ async def test_transitions_reject_wrong_token_and_unexpected_status(engine):
     assert await finish_action(engine, claim, status=ActionStatus.SUCCEEDED) is False
     assert await begin_execution(engine, claim) is True
     assert await begin_execution(engine, claim) is False
+
+
+async def test_stale_worker_cannot_mark_reconciliation_after_takeover(engine):
+    await enqueue_action(engine, decision())
+    stale = await claim_next_action(engine, "old", lease_seconds=60)
+    assert stale is not None
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "UPDATE autonomous_actions SET lease_expires_at=NOW()-INTERVAL '1 second' WHERE id=:id"
+        ), {"id": stale.id})
+    current = await claim_next_action(engine, "new", lease_seconds=60)
+    assert current is not None and current.lease_token != stale.lease_token
+    assert not await require_reconciliation(
+        engine, stale, failure_category="stale-worker", failure_message="must not persist"
+    )
+    async with engine.connect() as conn:
+        row = (await conn.execute(text(
+            "SELECT status, failure_category, lease_token FROM autonomous_actions WHERE id=:id"
+        ), {"id": stale.id})).mappings().one()
+    assert row == {"status": "leased", "failure_category": None,
+                   "lease_token": current.lease_token}
 
 
 async def test_successful_finish_writes_audit_and_budget_atomically(engine):

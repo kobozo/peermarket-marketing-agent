@@ -1,7 +1,9 @@
 """Approved Meta draft to durable, activated publication."""
 
+import asyncio
 import json
 import uuid
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 
 import structlog
@@ -10,7 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.autonomy.contracts import DecisionKind
 from peermarket_agent.autonomy.replacements import ReplacementDraft
-from peermarket_agent.autonomy.store import ClaimedAction, require_reconciliation
+from peermarket_agent.autonomy.store import (
+    ClaimedAction,
+    renew_replacement_leases,
+    require_reconciliation,
+)
 from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.config import Settings
 from peermarket_agent.meta_ads import (
@@ -54,6 +60,36 @@ _BRAND_FRAME_PROMPT = (
 _LANDING_PAGE = "https://peermarket.eu/"
 _META_RECONCILIATION_ID_KEYS = {"campaign_id", "ad_set_id", "creative_id", "ad_id"}
 _TERMINAL_META_STATUSES = {"ARCHIVED", "DELETED"}
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _start_replacement_heartbeat(
+    engine: AsyncEngine, claim: ClaimedAction, publication_id: int, publication_token: str
+) -> tuple[asyncio.Task, asyncio.Event]:
+    lost = asyncio.Event()
+
+    async def beat() -> None:
+        try:
+            while True:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                await renew_replacement_leases(
+                    engine,
+                    claim,
+                    publication_id=publication_id,
+                    publication_token=publication_token,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            lost.set()
+
+    return asyncio.create_task(beat()), lost
+
+
+async def _stop_heartbeat(task: asyncio.Task) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 @dataclass(frozen=True)
@@ -277,16 +313,30 @@ async def publish_replacement_paused(
             },
             progress["ads_manager_url"],
         )
-    screenshot = await screenshot_url(
-        draft.landing_page_url, viewport_width=1080, viewport_height=1080
+    heartbeat, ownership_lost = _start_replacement_heartbeat(
+        engine, claim, attempt["id"], attempt_token
     )
+    try:
+        screenshot = await screenshot_url(
+            draft.landing_page_url, viewport_width=1080, viewport_height=1080
+        )
+    except BaseException:
+        await _stop_heartbeat(heartbeat)
+        raise
+    if ownership_lost.is_set():
+        await _stop_heartbeat(heartbeat)
+        raise RuntimeError("replacement lease ownership was lost")
     image = screenshot
     try:
-        image = await edit_image(
-            api_key=settings.gemini_api_key, image_bytes=screenshot, prompt=_BRAND_FRAME_PROMPT
-        )
-    except (ImageEditDisabled, ImageEditError):
-        image = screenshot
+        try:
+            image = await edit_image(
+                api_key=settings.gemini_api_key, image_bytes=screenshot, prompt=_BRAND_FRAME_PROMPT
+            )
+        except (ImageEditDisabled, ImageEditError):
+            image = screenshot
+    except BaseException:
+        await _stop_heartbeat(heartbeat)
+        raise
     ctas = {
         "Learn More": "LEARN_MORE",
         "Sign Up": "SIGN_UP",
@@ -295,6 +345,8 @@ async def publish_replacement_paused(
     }
 
     async def persist_progress(key: str, value: str) -> None:
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement lease ownership was lost")
         async with engine.begin() as conn:
             result = await conn.execute(
                 text(
@@ -322,6 +374,7 @@ async def publish_replacement_paused(
             persist_progress=persist_progress,
         )
     except Exception as exc:
+        await _stop_heartbeat(heartbeat)
         recovered_ids = exc.resource_ids if isinstance(exc, MetaAdsError) else {}
         async with engine.begin() as conn:
             await conn.execute(
@@ -339,6 +392,8 @@ async def publish_replacement_paused(
             raise RuntimeError("replacement action ownership was lost") from exc
         raise
     try:
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement lease ownership was lost")
         observed = await get_meta_replacement_bundle_statuses(
             _meta_config(settings), result.campaign_id, result.ad_set_id, result.ad_ids
         )
@@ -352,6 +407,7 @@ async def publish_replacement_paused(
         if result.status != "PAUSED" or not valid:
             raise RuntimeError("live Meta replacement bundle is not exactly paused at frozen budget")
     except Exception:
+        await _stop_heartbeat(heartbeat)
         async with engine.begin() as conn:
             await conn.execute(text(
                 "UPDATE autonomous_replacement_publications SET state='reconciliation_required', "
@@ -363,9 +419,12 @@ async def publish_replacement_paused(
         ):
             raise RuntimeError("replacement action ownership was lost")
         raise
+    if ownership_lost.is_set():
+        await _stop_heartbeat(heartbeat)
+        raise RuntimeError("replacement lease ownership was lost")
     await persist_progress("ads_manager_url", result.ads_manager_url)
     async with engine.begin() as conn:
-        await conn.execute(
+        finalized = await conn.execute(
             text(
                 "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, "
                 "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
@@ -373,6 +432,9 @@ async def publish_replacement_paused(
             ),
             {"id": attempt["id"], "token": attempt_token},
         )
+        if finalized.rowcount != 1:
+            await _stop_heartbeat(heartbeat)
+            raise RuntimeError("replacement publication ownership was lost")
         for locale in ("NL", "FR", "EN"):
             await conn.execute(
                 text(
@@ -392,6 +454,7 @@ async def publish_replacement_paused(
                     ),
                 },
             )
+    await _stop_heartbeat(heartbeat)
     return ReplacementBundlePublication(
         draft.id,
         draft.source_draft_id,

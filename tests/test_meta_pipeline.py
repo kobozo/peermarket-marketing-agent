@@ -431,6 +431,46 @@ async def test_concurrent_same_draft_has_one_bundle_owner(monkeypatch, engine_wi
     assert create.await_count == 1
 
 
+async def test_long_meta_call_heartbeats_action_and_attempt_without_task_leak(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline._HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    expiries = []
+
+    async def held(**kwargs):
+        for _ in range(2):
+            async with engine.connect() as conn:
+                expiries.append((await conn.execute(text(
+                    "SELECT a.lease_expires_at, r.lease_expires_at "
+                    "FROM autonomous_actions a JOIN autonomous_replacement_publications r "
+                    "ON r.action_id=a.id WHERE a.id=:id"
+                ), {"id": claim.id})).one())
+            await asyncio.sleep(0.04)
+        values = {"campaign_id": "new-c", "ad_set_id": "new-as",
+                  **{f"creative_id:{x}": f"cr-{x}" for x in ("NL", "FR", "EN")},
+                  **{f"ad_id:{x}": f"ad-{x}" for x in ("NL", "FR", "EN")}}
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        return MetaReplacementBundleResult(
+            "new-c", "new-as", {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager"
+        )
+
+    create = AsyncMock(side_effect=held)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create)
+    before_tasks = set(asyncio.all_tasks())
+    await publish_replacement_paused(engine=engine, settings=_make_settings(), claim=claim, draft=draft)
+    await asyncio.sleep(0)
+    assert expiries[1][0] > expiries[0][0]
+    assert expiries[1][1] > expiries[0][1]
+    assert not (set(asyncio.all_tasks()) - before_tasks)
+    create.assert_awaited_once()
+
+
 async def test_live_budget_mismatch_marks_action_and_attempt_reconciliation(
     monkeypatch, engine_with_meta_draft
 ):

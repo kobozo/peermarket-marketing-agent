@@ -132,6 +132,40 @@ def test_bundle_retry_looks_up_resource_created_before_id_persistence(
     assert account.creates == 1
 
 
+def test_bundle_retry_finds_image_uploaded_before_hash_persistence(monkeypatch):
+    class FakeAccount:
+        def __init__(self):
+            self.images = []
+            self.uploads = 0
+
+        def get_ad_images(self, fields):
+            return list(self.images)
+
+        def create_ad_image(self, params, fields):
+            self.uploads += 1
+            item = {"hash": "image-hash", "name": params["name"]}
+            self.images.append(item)
+            return item
+
+    account = FakeAccount()
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *args, **kwargs: account)
+    kwargs = dict(
+        config=_FULL_CONFIG,
+        name="PeerMarket autonomous action-7",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        landing_page_url="https://peermarket.eu/",
+        locale="NL",
+        creative=MetaBundleLocale("body", "head", "desc", "LEARN_MORE", b"same-image"),
+        progress={"campaign_id": "c1", "ad_set_id": "as1"},
+    )
+    first = _sync_create_bundle_resource(**kwargs)
+    second = _sync_create_bundle_resource(**kwargs)
+    assert first == second == ("image_hash:NL", "image-hash")
+    assert account.uploads == 1
+
+
 async def test_replacement_bundle_retry_reuses_durable_progress(monkeypatch):
     created = []
 
