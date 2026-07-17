@@ -461,6 +461,43 @@ async def renew_replacement_leases(
     return True
 
 
+async def renew_replacement_generation_leases(
+    engine: AsyncEngine,
+    claim: ClaimedAction,
+    *,
+    generation_token: str,
+    lease_seconds: int = 300,
+) -> bool:
+    """Atomically renew a generation only while both fenced leases are live."""
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text(
+                "WITH live AS (SELECT a.id FROM autonomous_actions a JOIN "
+                "autonomous_replacement_generations g ON g.action_id=a.id "
+                "WHERE a.id=:id AND a.status IN ('leased','executing') "
+                "AND a.lease_owner=:owner AND a.lease_token=:claim_token "
+                "AND a.lease_expires_at>NOW() AND g.state='generating' "
+                "AND g.lease_owner=:owner AND g.lease_token=:generation_token "
+                "AND g.lease_expires_at>NOW() FOR UPDATE OF a,g), renewed_action AS ("
+                "UPDATE autonomous_actions a SET lease_expires_at=NOW()+make_interval(secs=>:seconds), "
+                "updated_at=NOW() FROM live WHERE a.id=live.id RETURNING a.id) "
+                "UPDATE autonomous_replacement_generations g SET "
+                "lease_expires_at=NOW()+make_interval(secs=>:seconds), updated_at=NOW() "
+                "FROM renewed_action WHERE g.action_id=renewed_action.id RETURNING g.action_id"
+            ),
+            {
+                "id": claim.id,
+                "owner": claim.lease_owner,
+                "claim_token": claim.lease_token,
+                "generation_token": generation_token,
+                "seconds": lease_seconds,
+            },
+        )
+        if result.first() is None:
+            raise RuntimeError("replacement generation ownership was lost")
+    return True
+
+
 async def record_budget_event(
     engine: AsyncEngine,
     action_id: int,

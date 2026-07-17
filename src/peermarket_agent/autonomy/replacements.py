@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -16,7 +17,7 @@ from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.agent.cli_draft import recent_relevant_learnings
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
-from peermarket_agent.autonomy.store import ClaimedAction
+from peermarket_agent.autonomy.store import ClaimedAction, renew_replacement_generation_leases
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
 from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.claude import ClaudeClient
@@ -29,6 +30,7 @@ from peermarket_agent.prompts.meta_ad_creative import (
 )
 
 LOCALES = ("NL", "FR", "EN")
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
 DIMENSIONS = {"hook", "copy", "visual", "audience"}
 _LOCALE_MARKER = re.compile(r"(^|\s)(?:\[(?:NL|FR|EN)\]|(?:NL|FR|EN):)(?:\s|$)", re.I)
 
@@ -452,12 +454,55 @@ async def build_replacement(
         generation_token, completed_id = await _claim_generation(engine, claim)
         if completed_id is not None:
             return await _load_replacement(engine, completed_id)
+    heartbeat: asyncio.Task | None = None
+    ownership_lost = asyncio.Event()
+    if generation_token is not None:
+        # Close the post-acquire scheduling gap before any external call.
+        await renew_replacement_generation_leases(engine, claim, generation_token=generation_token)
+
+        async def beat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                    await renew_replacement_generation_leases(
+                        engine, claim, generation_token=generation_token
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                ownership_lost.set()
+
+        heartbeat = asyncio.create_task(beat())
+    try:
+        return await _build_replacement_owned(
+            engine, claude, source, claim, persist, generation_token, ownership_lost
+        )
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+
+
+async def _build_replacement_owned(
+    engine: AsyncEngine,
+    claude: ClaudeClient,
+    source: ReplacementSource,
+    claim: ClaimedAction | None,
+    persist: Callable[[ReplacementDraft], int | Awaitable[int]] | None,
+    generation_token: str | None,
+    ownership_lost: asyncio.Event,
+) -> ReplacementDraft:
     brand_voice = load_brand_voice()
     locales: dict[str, ReplacementLocale] = {}
     scores: dict[str, int] = {}
     quality: dict[str, dict] = {}
     total_cost = 0
     for locale in LOCALES:
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement generation ownership was lost")
         learnings = (
             await recent_relevant_learnings(
                 engine,
@@ -487,16 +532,22 @@ async def build_replacement(
             temperature=0.7,
             max_tokens=700,
         )
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement generation ownership was lost")
         item = _validate_locale(parse_claude_json(response.text), source, locale)
         locales[locale] = item
         total_cost += _cost_cents(response)
         score, _ = await score_draft(
             claude=claude, brand_voice_md=brand_voice, copy=item.complete_text()
         )
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement generation ownership was lost")
         if score < BRAND_SCORE_THRESHOLD:
             raise ValueError(f"{locale} complete replacement failed brand validation")
         scores[locale] = int(score)
         quality[locale] = await _review_native_quality(claude, locale, item)
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement generation ownership was lost")
     normalized = [_normalized(item.complete_text()) for item in locales.values()]
     if len(set(normalized)) != len(LOCALES):
         raise ValueError("literal translation detector rejected cross-locale sameness")
@@ -523,5 +574,7 @@ async def build_replacement(
     writer = persist or (lambda value: _persist(engine, value, claim, generation_token))
     result = writer(provisional)
     draft_id = await result if inspect.isawaitable(result) else result
+    if ownership_lost.is_set():
+        raise RuntimeError("replacement generation ownership was lost")
     destination = build_campaign_url(source.landing_page_url, int(draft_id))
     return replace(provisional, id=int(draft_id), landing_page_url=destination)

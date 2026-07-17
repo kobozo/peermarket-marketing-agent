@@ -1,5 +1,6 @@
 """Controlled autonomous replacement generation contracts."""
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ from peermarket_agent.autonomy.replacements import (
     ReplacementSource,
     build_replacement,
 )
+from peermarket_agent.autonomy.store import ClaimedAction
 from peermarket_agent.claude import ClaudeResponse
 
 
@@ -71,6 +73,20 @@ def _decision(source: ReplacementSource) -> FrozenDecision:
         window_start=datetime(2026, 7, 16, tzinfo=UTC),
         window_end=datetime(2026, 7, 17, tzinfo=UTC),
         idempotency_key="replace-1",
+    )
+
+
+def _claim(source: ReplacementSource) -> ClaimedAction:
+    decision = _decision(source)
+    return ClaimedAction(
+        7,
+        8,
+        source.campaign_id,
+        DecisionKind.REPLACE,
+        "worker",
+        "action-token",
+        datetime(2026, 7, 17, 1, tzinfo=UTC),
+        decision,
     )
 
 
@@ -326,3 +342,48 @@ def test_dimension_needing_missing_baseline_fails_closed():
     object.__setattr__(source, "asset_path", "")
     with pytest.raises(ValueError, match="visual baseline"):
         source.validate_baseline()
+
+
+@pytest.mark.asyncio
+async def test_production_generation_renews_all_six_claude_calls_and_stops_task(monkeypatch):
+    source = _source("hook")
+    responses = [
+        response
+        for locale in ("NL", "FR", "EN")
+        for response in (
+            _response(source, locale, hook=f"{source.locales[locale].hook} nieuw"),
+            _quality(locale),
+        )
+    ]
+
+    async def slow_complete(**kwargs):
+        await asyncio.sleep(0.025)
+        return responses.pop(0)
+
+    claude = AsyncMock()
+    claude.complete.side_effect = slow_complete
+    renew = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.replacements.renew_replacement_generation_leases", renew
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.replacements._claim_generation",
+        AsyncMock(return_value=("generation-token", None)),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.replacements.recent_relevant_learnings",
+        AsyncMock(return_value=()),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.replacements._persist", AsyncMock(return_value=99)
+    )
+    monkeypatch.setattr("peermarket_agent.autonomy.replacements._HEARTBEAT_INTERVAL_SECONDS", 0.005)
+    before = set(asyncio.all_tasks())
+    draft = await build_replacement(
+        AsyncMock(), claude, source, _decision(source), claim=_claim(source)
+    )
+    await asyncio.sleep(0)
+    assert draft.id == 99
+    assert claude.complete.await_count == 6
+    assert renew.await_count > 6
+    assert not (set(asyncio.all_tasks()) - before)

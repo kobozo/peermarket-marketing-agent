@@ -93,13 +93,13 @@ def _start_replacement_heartbeat(
     async def beat() -> None:
         try:
             while True:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
                 await renew_replacement_leases(
                     engine,
                     claim,
                     publication_id=publication_id,
                     publication_token=publication_token,
                 )
-                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -109,7 +109,8 @@ def _start_replacement_heartbeat(
 
 
 async def _stop_heartbeat(task: asyncio.Task) -> None:
-    task.cancel()
+    if not task.done():
+        task.cancel()
     with suppress(asyncio.CancelledError):
         await task
 
@@ -359,6 +360,44 @@ async def publish_replacement_paused(
             attempt = inserted
     if attempt["state"] == "paused":
         progress = attempt["progress"]
+        ad_ids = {
+            key.split(":", 1)[1]: value
+            for key, value in progress.items()
+            if key.startswith("ad_id:")
+        }
+        try:
+            observed = await get_meta_replacement_bundle_statuses(
+                _meta_config(settings),
+                progress["campaign_id"],
+                progress["ad_set_id"],
+                ad_ids,
+            )
+            valid = set(ad_ids) == {"NL", "FR", "EN"} and _is_verified_paused_bundle(
+                observed, draft.daily_budget_eur * 100
+            )
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            valid = False
+        if not valid:
+            async with engine.begin() as conn:
+                fenced = await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications r SET "
+                        "state='reconciliation_required', failure_category='completed_live_validation', "
+                        "updated_at=NOW() WHERE r.id=:id AND r.state='paused' AND EXISTS (SELECT 1 "
+                        "FROM autonomous_actions a WHERE a.id=r.action_id AND a.status IN "
+                        "('leased','executing','reconciliation_required') AND a.lease_owner=:owner "
+                        "AND a.lease_token=:token AND a.lease_expires_at>NOW())"
+                    ),
+                    {"id": attempt["id"], "owner": claim.lease_owner, "token": claim.lease_token},
+                )
+                if fenced.rowcount != 1:
+                    raise RuntimeError("replacement publication ownership was lost")
+            await require_reconciliation(
+                engine, claim, failure_category="completed_live_validation"
+            )
+            raise RuntimeError("completed replacement failed live paused validation")
         return ReplacementBundlePublication(
             draft.id,
             draft.source_draft_id,
@@ -369,13 +408,16 @@ async def publish_replacement_paused(
                 for key, value in progress.items()
                 if key.startswith("creative_id:")
             },
-            {
-                key.split(":", 1)[1]: value
-                for key, value in progress.items()
-                if key.startswith("ad_id:")
-            },
+            ad_ids,
             progress["ads_manager_url"],
         )
+    # Validate both fenced leases synchronously before scheduling external work.
+    await renew_replacement_leases(
+        engine,
+        claim,
+        publication_id=attempt["id"],
+        publication_token=attempt_token,
+    )
     heartbeat, ownership_lost = _start_replacement_heartbeat(
         engine, claim, attempt["id"], attempt_token
     )
@@ -514,55 +556,56 @@ async def publish_replacement_paused(
     if ownership_lost.is_set():
         await _stop_heartbeat(heartbeat)
         raise RuntimeError("replacement lease ownership was lost")
-    await persist_progress("ads_manager_url", result.ads_manager_url)
-    async with engine.begin() as conn:
-        finalized = await conn.execute(
-            text(
-                "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, "
-                "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
-                "WHERE id=:id AND state IN ('creating','reconciliation_required') "
-                "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW() "
-                "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
-            ),
-            {
-                "id": attempt["id"],
-                "owner": claim.lease_owner,
-                "token": attempt_token,
-                "claim_token": claim.lease_token,
-            },
-        )
-        if finalized.rowcount != 1:
-            await _stop_heartbeat(heartbeat)
-            raise RuntimeError("replacement publication ownership was lost")
-        for locale in ("NL", "FR", "EN"):
-            await conn.execute(
+    try:
+        await persist_progress("ads_manager_url", result.ads_manager_url)
+        async with engine.begin() as conn:
+            finalized = await conn.execute(
                 text(
-                    "INSERT INTO creatives_archive (asset_path, prompt, model, cost_cents, performance_summary) VALUES (:path, :prompt, 'autonomous-replacement', 0, CAST(:summary AS JSONB))"
+                    "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, "
+                    "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
+                    "WHERE id=:id AND state IN ('creating','reconciliation_required') "
+                    "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW() "
+                    "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
                 ),
                 {
-                    "path": f"autonomous:draft-{draft.id}:{locale}",
-                    "prompt": draft.image_prompt,
-                    "summary": json.dumps(
-                        {
-                            "source_draft_id": draft.source_draft_id,
-                            "campaign_id": result.campaign_id,
-                            "ad_set_id": result.ad_set_id,
-                            "creative_id": result.creative_ids[locale],
-                            "ad_id": result.ad_ids[locale],
-                        }
-                    ),
+                    "id": attempt["id"],
+                    "owner": claim.lease_owner,
+                    "token": attempt_token,
+                    "claim_token": claim.lease_token,
                 },
             )
-    await _stop_heartbeat(heartbeat)
-    return ReplacementBundlePublication(
-        draft.id,
-        draft.source_draft_id,
-        result.campaign_id,
-        result.ad_set_id,
-        dict(result.creative_ids),
-        dict(result.ad_ids),
-        result.ads_manager_url,
-    )
+            if finalized.rowcount != 1:
+                raise RuntimeError("replacement publication ownership was lost")
+            for locale in ("NL", "FR", "EN"):
+                await conn.execute(
+                    text(
+                        "INSERT INTO creatives_archive (asset_path, prompt, model, cost_cents, performance_summary) VALUES (:path, :prompt, 'autonomous-replacement', 0, CAST(:summary AS JSONB))"
+                    ),
+                    {
+                        "path": f"autonomous:draft-{draft.id}:{locale}",
+                        "prompt": draft.image_prompt,
+                        "summary": json.dumps(
+                            {
+                                "source_draft_id": draft.source_draft_id,
+                                "campaign_id": result.campaign_id,
+                                "ad_set_id": result.ad_set_id,
+                                "creative_id": result.creative_ids[locale],
+                                "ad_id": result.ad_ids[locale],
+                            }
+                        ),
+                    },
+                )
+        return ReplacementBundlePublication(
+            draft.id,
+            draft.source_draft_id,
+            result.campaign_id,
+            result.ad_set_id,
+            dict(result.creative_ids),
+            dict(result.ad_ids),
+            result.ads_manager_url,
+        )
+    finally:
+        await _stop_heartbeat(heartbeat)
 
 
 async def _refuse_terminal_replacement(
