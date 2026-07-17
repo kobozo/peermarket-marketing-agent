@@ -81,6 +81,8 @@ def test_deploy_wires_safe_autonomy_variables():
 def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials():
     text = RUNBOOK.read_text()
     required = {
+        "gh variable set META_INSIGHTS_ENABLED --body true",
+        "gh variable set PEERMARKET_ATTRIBUTION_ENABLED --body true",
         "gh variable set META_AUTONOMY_ENABLED --body false",
         "gh variable set META_AUTONOMY_SHADOW --body true",
         "gh variable set META_AUTONOMY_CAMPAIGN_IDS_CSV --body 120249125021520342",
@@ -89,7 +91,8 @@ def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials(
         "gh variable set META_AUTONOMY_MAX_REPLACEMENTS_24H --body 1",
         "gh variable set META_AUTONOMY_MAX_TEST_DAYS --body 7",
         "gh variable set META_AUTONOMY_COOLDOWN_HOURS --body 24",
-        "gh workflow run deploy.yml",
+        'run_url="$(gh workflow run deploy.yml)"',
+        'gh run watch "$run_id" --exit-status',
         "peermarket-performance autonomy --draft-id 156",
         "curl -fsS http://127.0.0.1:8090/agent/healthz",
     }
@@ -97,6 +100,13 @@ def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials(
     assert "Draft 156" in text
     assert "reconciliation_required" in text
     assert "kill switch" in text.casefold()
+    assert "verified audit result" not in text.casefold()
+    assert "rollback_recorded" in text
+    assert "failure_category" in text
+    assert text.count('run_url="$(gh workflow run deploy.yml)"') == text.count(
+        'gh run watch "$run_id" --exit-status'
+    )
+    assert "gh run watch\n" not in text
     assert "gh secret set" not in text
     for forbidden in ("sk-", "xoxb-", "Bearer ", "password=", "token="):
         assert forbidden not in text

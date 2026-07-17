@@ -18,6 +18,8 @@ disabled configuration:
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body false
 gh variable set META_AUTONOMY_SHADOW --body true
+gh variable set META_INSIGHTS_ENABLED --body true
+gh variable set PEERMARKET_ATTRIBUTION_ENABLED --body true
 gh variable set META_AUTONOMY_CAMPAIGN_IDS_CSV --body 120249125021520342
 gh variable set META_AUTONOMY_MAX_INCREASE_PERCENT --body 20
 gh variable set META_AUTONOMY_MAX_DAILY_BUDGET_EUR --body 20
@@ -34,8 +36,9 @@ not credentials. Do not run secret-management commands as part of this rollout.
 Dispatch only the tested CI workflow and watch it finish:
 
 ```bash
-gh workflow run deploy.yml
-gh run watch
+run_url="$(gh workflow run deploy.yml)"
+run_id="${run_url##*/}"
+gh run watch "$run_id" --exit-status
 ```
 
 On the self-hosted runner, the workflow runs migrations before restarting the
@@ -58,8 +61,9 @@ keeping shadow mode true, then deploy through CI again:
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body true
 gh variable set META_AUTONOMY_SHADOW --body true
-gh workflow run deploy.yml
-gh run watch
+run_url="$(gh workflow run deploy.yml)"
+run_id="${run_url##*/}"
+gh run watch "$run_id" --exit-status
 ```
 
 Wait for a successful hourly collection. On the host, inspect only the persisted,
@@ -71,7 +75,9 @@ peermarket-performance autonomy --draft-id 156
 
 The report must show Draft 156 exists, campaign `120249125021520342` is
 allowlisted, shadow is true, a recent decision and evidence window are present,
-and no action was queued. It must not show raw PeerMarket records or credentials.
+and no action was queued. Confirm collection is live from the recent evidence
+window and `attribution_complete`; otherwise autonomy is inert and must not be
+enabled. It must not show raw PeerMarket records or credentials.
 Repeat the health check after inspection.
 
 ## Enable the canary
@@ -83,13 +89,16 @@ shadow mode:
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body true
 gh variable set META_AUTONOMY_SHADOW --body false
-gh workflow run deploy.yml
-gh run watch
+run_url="$(gh workflow run deploy.yml)"
+run_id="${run_url##*/}"
+gh run watch "$run_id" --exit-status
 ```
 
 After deployment, check health and run the same Draft 156 read-only inspection.
-Confirm budgets remain within EUR 20, the latest action has a verified audit
-result, and Slack has the newest campaign lifecycle notice.
+Confirm budgets remain within EUR 20, `reconciliation_blocked` is false, and the
+latest action's sanitized `status`, `failure_category`, and `rollback_recorded`
+fields agree with the expected outcome. Slack must have the newest campaign
+lifecycle notice. The CLI intentionally does not claim external audit verification.
 
 ## Kill switch and reconciliation
 
@@ -100,8 +109,9 @@ Meta state, an unverified rollback, stale evidence, service instability, or any
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body false
 gh variable set META_AUTONOMY_SHADOW --body true
-gh workflow run deploy.yml
-gh run watch
+run_url="$(gh workflow run deploy.yml)"
+run_id="${run_url##*/}"
+gh run watch "$run_id" --exit-status
 ```
 
 Verify health, then inspect Draft 156 again with the read-only command. Do not
