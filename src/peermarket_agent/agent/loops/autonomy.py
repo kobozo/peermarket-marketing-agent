@@ -245,22 +245,26 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                 for item in campaign_rows
             ]
             basis = dict(performance["autonomy_basis"])
+            touched_budget = (
+                inputs["reallocation"]["old_budget_cents"]
+                if inputs.get("reallocation") is not None
+                else int(row["approved_budget_cents"])
+            )
             basis.update(
                 {
-                    "approved_budget_cents": sum(
-                        item["approved_budget_cents"] for item in publications
-                    ),
+                    "approved_budget_cents": touched_budget,
                     "publication_ids": [item["publication_id"] for item in publications],
                     "campaign_publications": publications,
                     "campaign_total_budget_cents": sum(
                         item["approved_budget_cents"] for item in publications
                     ),
+                    "touched_allocation_budget_cents": touched_budget,
                 }
             )
             performance["autonomy_basis"] = basis
             publication = {
                 "external_ids": dict(row["external_ids"] or {}),
-                "approved_budget_cents": basis["campaign_total_budget_cents"],
+                "approved_budget_cents": touched_budget,
                 "performance": performance,
             }
             history_rows = await campaign_history(engine, campaign_id)

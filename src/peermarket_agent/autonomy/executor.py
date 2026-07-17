@@ -438,12 +438,23 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
         for row in rows
         if row["state"] in {"active", "published"}
     ]
-    if actual != expected:
+
+    def identity_key(item: Mapping[str, Any]) -> tuple[int, int]:
+        return int(item["publication_id"]), int(item["draft_id"])
+
+    if sorted(actual, key=identity_key) != sorted(
+        (dict(item) for item in expected), key=identity_key
+    ):
         return None
     total = sum(item["approved_budget_cents"] for item in actual)
+    touched = sum(
+        int(item["old_budget_cents"]) for item in (claim.decision.allocations or {}).values()
+    )
     if (
         total != frozen.get("campaign_total_budget_cents")
-        or total != claim.decision.old_budget_cents
+        or touched != frozen.get("touched_allocation_budget_cents")
+        or touched != claim.decision.old_budget_cents
+        or claim.decision.new_budget_cents != touched
     ):
         return None
     canonical = rows[0]
@@ -452,7 +463,7 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
     return {
         **canonical,
         "external_ids": dict(frozen.get("external_ids") or canonical["external_ids"]),
-        "approved_budget_cents": total,
+        "approved_budget_cents": touched,
         "performance": performance,
     }
 

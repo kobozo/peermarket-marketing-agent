@@ -106,6 +106,43 @@ async def test_shadow_cycle_persists_every_decision_without_queue_or_execution(m
 
 
 @pytest.mark.asyncio
+async def test_one_campaign_persistence_failure_does_not_block_the_next(monkeypatch):
+    decisions = [
+        FrozenDecision(
+            DecisionKind.OBSERVE,
+            campaign,
+            {"snapshot_id": campaign},
+            "observe",
+            NOW - timedelta(days=1),
+            NOW,
+            f"isolation-{campaign}",
+        )
+        for campaign in ("10", "11")
+    ]
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.autonomy._eligible_campaigns",
+        AsyncMock(
+            return_value=[
+                {"decision": decisions[0], "draft_id": 1},
+                {"decision": decisions[1], "draft_id": 2},
+            ]
+        ),
+    )
+    record = AsyncMock(side_effect=[RuntimeError("campaign 10"), object()])
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.record_decision", record)
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy._audit", AsyncMock())
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.deliver_pending_outbox", AsyncMock())
+
+    result = await run_autonomy_cycle(
+        object(), object(), object(), _limits(meta_autonomy_campaign_ids=("10", "11")), now=NOW
+    )
+
+    assert result["failed"] == 1
+    assert result["evaluated"] == 1
+    assert record.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_real_single_collected_publication_persists_canonical_input_and_observe(engine):
     performance = {
         "meta": {
@@ -280,8 +317,40 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
                 "performance": json.dumps(second),
             },
         )
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status,metadata) "
+                "SELECT 158,action_type_id,'meta','MULTI','published',CAST(:metadata AS JSONB) "
+                "FROM drafts WHERE id=156"
+            ),
+            {
+                "metadata": json.dumps(
+                    {
+                        "experiment_id": "unrelated-experiment",
+                        "changed_dimension": "hook",
+                        "audience_profile_key": "declutterers",
+                    }
+                )
+            },
+        )
+        unrelated = json.loads(json.dumps(first))
+        unrelated["autonomy_basis"]["external_ids"] = {
+            "campaign_id": "10",
+            "ad_set_id": "22",
+            "ad_id": "32",
+        }
+        await conn.execute(
+            text(
+                "INSERT INTO publications(draft_id,channel,state,external_ids,approved_budget_cents,performance) "
+                "VALUES (158,'meta','active',CAST(:ids AS JSONB),500,CAST(:performance AS JSONB))"
+            ),
+            {
+                "ids": json.dumps({"campaign_id": "10", "ad_set_id": "22", "ad_id": "32"}),
+                "performance": json.dumps(unrelated),
+            },
+        )
     await persist_autonomy_inputs(engine)
-    budgets = {"20": 1000, "21": 1000}
+    budgets = {"20": 1000, "21": 1000, "22": 500}
     writes = []
 
     async def allocation(config, campaign_id, ad_set_id, ad_id):
@@ -317,6 +386,7 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
     assert result["queued"] == 1
     assert result["executed"] == 1
     assert writes == [("20", 800), ("21", 1200)]
+    assert budgets["22"] == 500
     async with engine.connect() as conn:
         assert (
             await conn.scalar(
