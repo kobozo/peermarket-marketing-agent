@@ -134,6 +134,41 @@ async def test_claim_skips_a_row_locked_by_an_open_transaction(engine):
     assert claimed.id == second.id
 
 
+async def test_claim_skips_locked_expired_execution_during_reconciliation(engine):
+    expired = await enqueue_action(engine, decision("expired-execution", "101"))
+    stale = await claim_next_action(engine, "crashed-worker", lease_seconds=60)
+    assert stale is not None and stale.id == expired.id
+    assert await begin_execution(engine, stale)
+    available = await enqueue_action(engine, decision("available", "202"))
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE autonomous_actions SET lease_expires_at=NOW()-INTERVAL '1 second' "
+                "WHERE id=:id"
+            ),
+            {"id": expired.id},
+        )
+
+    claimant_engine = create_async_engine(
+        os.environ["AGENT_DB_URL"],
+        future=True,
+        connect_args={"server_settings": {"statement_timeout": "500"}},
+    )
+    async with engine.connect() as locking_conn:
+        transaction = await locking_conn.begin()
+        await locking_conn.execute(
+            text("SELECT id FROM autonomous_actions WHERE id=:id FOR UPDATE"), {"id": expired.id}
+        )
+        try:
+            claimed = await claim_next_action(claimant_engine, "replacement", lease_seconds=60)
+        finally:
+            await transaction.rollback()
+            await claimant_engine.dispose()
+
+    assert claimed is not None
+    assert claimed.id == available.id
+
+
 async def test_expired_lease_is_recovered_with_a_new_token(engine):
     await enqueue_action(engine, decision())
     stale = await claim_next_action(engine, "old", lease_seconds=60)
@@ -266,6 +301,14 @@ async def test_failure_is_sanitized_and_release_returns_to_pending(engine):
     "message,secrets",
     [
         ("Authorization: Bearer auth-secret", ["auth-secret"]),
+        ("Authorization: Basic dXNlcjpwYXNz", ["dXNlcjpwYXNz"]),
+        (
+            'Authorization = Digest username="admin", response="digest-secret"',
+            ["admin", "digest-secret"],
+        ),
+        ("Authorization: Custom-Scheme custom-secret", ["custom-secret"]),
+        ('{"Authorization":"Basic json-ish-secret"}', ["json-ish-secret"]),
+        ("Authorization: 'Custom quoted secret'", ["Custom quoted secret"]),
         ("request failed Bearer bare-secret", ["bare-secret"]),
         ('{"access_token":"json-secret","token": "json-token"}', ["json-secret", "json-token"]),
         (

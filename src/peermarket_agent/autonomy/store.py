@@ -165,11 +165,16 @@ async def claim_next_action(
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "UPDATE autonomous_actions SET status='reconciliation_required', "
+                "WITH expired_execution AS ("
+                " SELECT id FROM autonomous_actions"
+                " WHERE status='executing' AND lease_expires_at <= NOW()"
+                " ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 100"
+                ") UPDATE autonomous_actions AS action "
+                "SET status='reconciliation_required', "
                 "failure_category='worker_crash_during_execution', "
                 "failure_message='execution lease expired; external state requires reconciliation', "
                 "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
-                "WHERE status='executing' AND lease_expires_at <= NOW()"
+                "FROM expired_execution WHERE action.id=expired_execution.id"
             )
         )
         row = (
@@ -490,6 +495,12 @@ def _sanitize_category(value: str | None) -> str | None:
 def _sanitize_message(value: str | None) -> str | None:
     if value is None:
         return None
+    value = re.sub(
+        r"(?i)(?:\"|')?authorization(?:\"|')?\s*[:=]\s*"
+        r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n;}]+)",
+        "Authorization: [redacted]",
+        value,
+    )
     value = re.sub(
         r"(?i)\b(?:authorization\s*[:=]\s*)?bearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s,;}&\]]+)",
         "Bearer [redacted]",
