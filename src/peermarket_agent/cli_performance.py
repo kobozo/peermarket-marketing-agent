@@ -238,6 +238,39 @@ def _safe_autonomy_evidence(value: object) -> dict[str, Any]:
     return {key: value[key] for key in sorted(allowed & value.keys())}
 
 
+def _safe_experiment_evidence(value: object, reason: str | None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    result = {"reason": reason}
+    for key in ("experiment_id", "variant_ids", "delivery_state", "attribution_complete"):
+        if key in value:
+            result[key] = value[key]
+    result["samples"] = [
+        {
+            key: item[key]
+            for key in ("variant_id", "impressions", "landing_page_views", "registrations")
+            if key in item
+        }
+        for item in value.get("variants", [])
+        if isinstance(item, dict)
+    ]
+    if "variant_ids" not in result:
+        result["variant_ids"] = [
+            item["variant_id"] for item in result["samples"] if "variant_id" in item
+        ]
+    result["thresholds"] = {
+        key: value["thresholds"][key]
+        for key in ("min_impressions", "min_landing_page_views", "min_registrations")
+        if isinstance(value.get("thresholds"), dict) and key in value["thresholds"]
+    }
+    result["window"] = {
+        key: value["evidence_window"][key]
+        for key in ("start", "end", "window_start", "window_end", "captured_at")
+        if isinstance(value.get("evidence_window"), dict) and key in value["evidence_window"]
+    }
+    return result
+
+
 async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
     """Return a fixed, sanitized autonomous-lifecycle projection for one draft."""
     settings = get_settings()
@@ -253,7 +286,18 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                             "p.external_ids->>'ad_set_id' AS publication_ad_set_id,dr.metadata AS draft_metadata,"
                             "d.kind,d.reason,d.window_start,d.window_end,d.evidence,"
                             "d.old_budget_cents,d.new_budget_cents,a.id AS action_id,a.status AS action_status,"
-                            "a.failure_category,a.next_evaluation_at,a.audit "
+                            "a.failure_category,a.next_evaluation_at,a.audit,"
+                            "(SELECT count(*) FROM autonomous_actions aa WHERE aa.campaign_id="
+                            "p.external_ids->>'campaign_id' AND aa.status NOT IN "
+                            "('succeeded','failed','cancelled')) AS active_action_count,"
+                            "(SELECT COALESCE(jsonb_agg(DISTINCT aa.status),'[]'::jsonb) "
+                            "FROM autonomous_actions aa WHERE aa.campaign_id="
+                            "p.external_ids->>'campaign_id' AND aa.status NOT IN "
+                            "('succeeded','failed','cancelled')) AS active_action_statuses,"
+                            "(SELECT jsonb_build_object('id',o.id,'status',o.status) "
+                            "FROM slack_outbox o WHERE o.autonomy_campaign_id="
+                            "p.external_ids->>'campaign_id' AND o.message_kind='autonomy_audit' "
+                            "ORDER BY o.id DESC LIMIT 1) AS slack_audit "
                             "FROM publications p JOIN drafts dr ON dr.id=p.draft_id "
                             "LEFT JOIN LATERAL (SELECT * FROM autonomous_decisions "
                             "WHERE campaign_id=p.external_ids->>'campaign_id' ORDER BY id DESC LIMIT 1) d "
@@ -333,6 +377,15 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
             if row["decision_id"] is not None
             else None
         )
+        report["experiment_evidence"] = _safe_experiment_evidence(row["evidence"], row["reason"])
+        report["experiment_evidence"]["thresholds"] = {
+            "min_impressions": settings.learning_min_impressions,
+            "min_landing_page_views": settings.learning_min_landing_page_views,
+            "min_registrations": settings.learning_min_registrations,
+        }
+        report["active_action_count"] = int(row["active_action_count"] or 0)
+        report["active_action_statuses"] = list(row["active_action_statuses"] or [])
+        report["slack_audit"] = dict(row["slack_audit"]) if row["slack_audit"] else None
         audit = row["audit"] if isinstance(row["audit"], dict) else {}
         report["action"] = (
             {

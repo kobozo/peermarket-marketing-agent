@@ -382,6 +382,41 @@ def test_hook_experiment_projection_is_sanitized_and_ready():
     assert "sensitive-audience-value" not in json.dumps(status)
 
 
+def test_experiment_evidence_projection_whitelists_samples_window_and_qualification():
+    from peermarket_agent.cli_performance import _safe_experiment_evidence
+
+    projected = _safe_experiment_evidence(
+        {
+            "experiment_id": "exp",
+            "delivery_state": "healthy",
+            "attribution_complete": True,
+            "variants": [
+                {
+                    "variant_id": "exp:01",
+                    "impressions": 1000,
+                    "landing_page_views": 30,
+                    "registrations": 10,
+                    "hook": "raw-hook-secret",
+                    "token": "raw-token-secret",
+                }
+            ],
+            "evidence_window": {
+                "start": "2026-07-16T12:00:00Z",
+                "end": "2026-07-17T12:00:00Z",
+                "captured_at": "2026-07-17T12:00:00Z",
+                "secret": "raw-window-secret",
+            },
+        },
+        "insufficient_evidence",
+    )
+    serialized = json.dumps(projected)
+    assert projected["reason"] == "insufficient_evidence"
+    assert projected["variant_ids"] == ["exp:01"]
+    assert projected["samples"][0]["registrations"] == 10
+    assert projected["window"]["captured_at"] == "2026-07-17T12:00:00Z"
+    assert "raw-" not in serialized
+
+
 @pytest.mark.parametrize(
     "field,value,reason",
     [

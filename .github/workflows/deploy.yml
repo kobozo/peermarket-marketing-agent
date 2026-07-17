@@ -185,6 +185,8 @@ jobs:
 
       - name: Verify hook experiment shadow canary
         if: ${{ vars.META_AUTONOMY_EXPERIMENT_ID != '' && vars.META_AUTONOMY_ENABLED == 'true' && vars.META_AUTONOMY_SHADOW == 'true' }}
+        env:
+          EXPECTED_EXPERIMENT_ID: ${{ vars.META_AUTONOMY_EXPERIMENT_ID }}
         run: |
           set -euo pipefail
           report="$(sudo -u peermarket-agent bash -c '
@@ -198,12 +200,20 @@ jobs:
           import json, os
           report = json.loads(os.environ["REPORT"])
           experiment = report["hook_experiment"]
-          experiment_id = experiment["experiment_id"]
+          experiment_id = os.environ["EXPECTED_EXPERIMENT_ID"]
+          assert experiment["experiment_id"] == experiment_id
           expected = [f"{experiment_id}:{number:02}" for number in (1, 2, 3)]
           actual = [item["variant_id"] for item in experiment["variants"]]
           assert report["draft_id"] == 156
           assert report["feature_flags"] == {"enabled": True, "shadow": True, "allowlisted": True}
           assert experiment["variant_count"] == 3 and actual == expected
           assert experiment["fixed_identity_match"] and experiment["ready"]
-          assert report["action"] is None
+          evidence = report["experiment_evidence"]
+          assert evidence["reason"] in {"insufficient_evidence", "neutral_tie", "proven_winner_reallocate"}
+          assert evidence["variant_ids"] == expected and len(evidence["samples"]) == 3
+          assert evidence["window"] and evidence["thresholds"]
+          assert evidence["delivery_state"] == "healthy" and evidence["attribution_complete"] is True
+          assert report["active_action_count"] == 0 and report["active_action_statuses"] == []
+          audit = report["slack_audit"]
+          assert audit and audit["status"] in {"pending", "delivered"} and int(audit["id"]) > 0
           PY

@@ -29,7 +29,10 @@ deploy_ref="$(git branch --show-current)"
 gh workflow run deploy.yml --ref "$deploy_ref"
   for attempt in {1..12}; do
     run_output="$(gh run list --workflow deploy.yml --event workflow_dispatch --branch "$deploy_ref" --commit "$head_sha" --created ">=$boundary" --limit 20 --json databaseId --jq ".[].databaseId")" || return 1
-    mapfile -t run_ids <<<"$run_output"
+    run_ids=()
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] && run_ids+=("$candidate")
+    done <<<"$run_output"
     if (( ${#run_ids[@]} > 1 )); then return 1; fi
     if (( ${#run_ids[@]} == 1 )); then
       run_id="${run_ids[0]}"

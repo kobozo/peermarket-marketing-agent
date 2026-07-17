@@ -7,4 +7,6 @@ Implemented the CI-only Draft 156 hook canary contract without changing reposito
 - Adds a guarded deployed read-only `peermarket-performance autonomy --draft-id 156` gate that verifies enabled shadow flags, the allowlist, exact ordered `:01/:02/:03` membership, fixed identity readiness, and no action.
 - Documents the evidence state and durable Slack audit checks, the handoff requirement for the successful correlated CI run, and the explicit later approval required before writes.
 
+Rejection remediation makes blank `gh run list` polls true zero-match retries (covered by an executable fake-`gh` shell test), extends the PostgreSQL READ ONLY autonomy projection with whitelisted experiment samples/window/qualification, campaign-wide nonterminal action state, and the latest durable Slack audit ID/status, and makes the deploy gate independently compare the staged experiment ID before enforcing exact membership, evidence, zero active actions, and pending/delivered audit state.
+
 Verification: `uv run pytest -q tests/test_deploy_workflow.py` (6 passed), YAML loaded by the test suite, and `git diff --check` clean.
