@@ -641,7 +641,14 @@ def _replace_claim():
 
 
 class ReplacementMeta:
-    def __init__(self, *, source_pause_fails=False, rollback_verified=True, activation_fails=False):
+    def __init__(
+        self,
+        *,
+        source_pause_fails=False,
+        rollback_verified=True,
+        activation_fails=False,
+        create_fails=False,
+    ):
         self.calls = []
         self.active = False
         self.source_pause_fails = source_pause_fails
@@ -649,9 +656,12 @@ class ReplacementMeta:
         self.source_paused = False
         self.rollback_phase = False
         self.activation_fails = activation_fails
+        self.create_fails = create_fails
 
     async def create_paused(self, **kwargs):
         self.calls.append("create_paused")
+        if self.create_fails:
+            raise RuntimeError("ambiguous create failure")
         return {
             "campaign_id": "50",
             "ad_set_id": "60",
@@ -702,6 +712,10 @@ class ReplacementMeta:
         self.active = False
         self.rollback_phase = True
         return {"paused": True}
+
+    async def pause_persisted(self, **kwargs):
+        self.calls.append("pause_persisted")
+        return {"verified": self.rollback_verified, "observed": {"persisted": True}}
 
 
 class ReplacementBuilder:
@@ -855,6 +869,74 @@ async def test_public_replace_split_failures_persist_proven_compensation(
     assert row["failure_category"] == category
     assert row["audit"]["rollback_result"]["verified"] is verified
     assert meta.calls.count("pause_replacement") == 1
+
+
+@pytest.mark.asyncio
+async def test_public_ambiguous_create_uses_persisted_adoption_cleanup_and_audit(
+    engine, monkeypatch
+):
+    claim = await _public_replace_claim(engine)
+    meta = ReplacementMeta(create_fails=True)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+    result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
+    assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    assert meta.calls == ["read_source", "create_paused", "pause_persisted"]
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT failure_category,audit FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["failure_category"] == "external_state_unproven"
+    assert row["audit"]["rollback_result"] == {
+        "verified": True,
+        "observed": {"persisted": True},
+    }
+
+
+class LeaseStealingReplacementMeta(ReplacementMeta):
+    async def create_paused(self, **kwargs):
+        bundle = await super().create_paused(**kwargs)
+        async with kwargs["engine"].begin() as conn:
+            await conn.execute(
+                text("UPDATE autonomous_actions SET lease_token='stolen' WHERE id=:id"),
+                {"id": kwargs["claim"].id},
+            )
+        return bundle
+
+
+@pytest.mark.asyncio
+async def test_public_lease_loss_between_replacement_writes_prevents_stale_finish(
+    engine, monkeypatch
+):
+    claim = await _public_replace_claim(engine)
+    meta = LeaseStealingReplacementMeta()
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+    result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
+    assert result.status is ExecutionStatus.FAILED
+    assert result.reason == "lease_lost"
+    assert meta.calls == ["read_source", "create_paused"]
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,lease_token,after_state FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "executing"
+    assert row["lease_token"] == "stolen"
+    assert row["after_state"] == {}
 
 
 @pytest.mark.asyncio
