@@ -631,6 +631,25 @@ def _bundle_verified(state: Mapping[str, Any], active: bool, budget_cents: int) 
     )
 
 
+def _bundle_pauseable(state: Mapping[str, Any], budget_cents: int) -> bool:
+    """Accept an exact, identity-verified bundle at any partial activation stage."""
+    keys = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
+    if (
+        frozenset(state)
+        not in {
+            frozenset(keys),
+            frozenset(keys | {"creative:NL", "creative:FR", "creative:EN"}),
+        }
+        or state.get("ad_set", {}).get("daily_budget") != budget_cents
+    ):
+        return False
+    return all(
+        state[key].get("status") in {"ACTIVE", "PAUSED"}
+        and state[key].get("effective_status") in (_ACTIVE_EFFECTIVE | _PAUSED_EFFECTIVE)
+        for key in keys
+    )
+
+
 async def _replace(
     engine: Any, settings: Any, meta: Any, builder: Any, claim: Any, source: Mapping[str, Any]
 ) -> tuple[Any, Any]:
@@ -698,7 +717,7 @@ async def _replace(
                 rollback_before = await _external(engine, claim, meta, "read_replacement", **ids)
                 if _bundle_verified(rollback_before, False, budget_cents):
                     mutation = None
-                elif _bundle_verified(rollback_before, True, budget_cents):
+                elif _bundle_pauseable(rollback_before, budget_cents):
                     mutation = await _write_external(
                         engine, claim, meta, "pause_replacement", **ids
                     )
@@ -729,9 +748,7 @@ async def _replace(
                         rollback_before, False, frozen_source.daily_budget_eur * 100
                     ):
                         rollback = None
-                    elif _bundle_verified(
-                        rollback_before, True, frozen_source.daily_budget_eur * 100
-                    ):
+                    elif _bundle_pauseable(rollback_before, frozen_source.daily_budget_eur * 100):
                         rollback = await _write_external(
                             engine, claim, meta, "pause_replacement", **ids
                         )

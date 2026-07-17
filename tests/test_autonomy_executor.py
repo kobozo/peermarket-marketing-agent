@@ -1538,6 +1538,207 @@ class CheckpointProxy:
         return call
 
 
+class AppliedWriteCrashProxy:
+    """Apply the fake Meta mutation, then lose the response."""
+
+    def __init__(self, target, checkpoints):
+        self.target = target
+        self.checkpoints = set(checkpoints)
+        self.counts = {}
+        self.applied = []
+
+    def __getattr__(self, name):
+        value = getattr(self.target, name)
+        if not callable(value):
+            return value
+
+        async def call(*args, **kwargs):
+            self.counts[name] = self.counts.get(name, 0) + 1
+            checkpoint = f"{name}:{self.counts[name]}"
+            result = await value(*args, **kwargs)
+            if checkpoint in self.checkpoints:
+                self.applied.append(checkpoint)
+                raise RuntimeError(f"response lost after applied write {checkpoint}")
+            return result
+
+        return call
+
+
+@pytest.mark.parametrize(
+    ("kind", "checkpoints"),
+    [
+        (DecisionKind.PAUSE, {"pause_source:1"}),
+        (DecisionKind.SCALE, {"set_budget:1"}),
+        (DecisionKind.REALLOCATE, {"set_budget:1"}),
+        (DecisionKind.REALLOCATE, {"set_budget:2"}),
+        (DecisionKind.REALLOCATE, {"set_budget:2", "set_budget:3"}),
+        (DecisionKind.REALLOCATE, {"set_budget:2", "set_budget:4"}),
+        (DecisionKind.REPLACE, {"create_paused:1"}),
+        (DecisionKind.REPLACE, {"activate_replacement:1", "pause_replacement:1"}),
+        (DecisionKind.REPLACE, {"pause_source:1", "pause_replacement:1"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_after_applied_write_crash_never_blindly_retries_and_audits_reconciliation(
+    engine, kind, checkpoints
+):
+    if kind is DecisionKind.REPLACE:
+        claim = await _public_replace_claim(engine)
+        base, builder = ReplacementMeta(), ReplacementBuilder()
+    else:
+        claim = await _scale_claim(engine, kind)
+        base = ReallocationMeta() if kind is DecisionKind.REALLOCATE else BudgetMeta()
+        builder = None
+    meta = AppliedWriteCrashProxy(base, checkpoints)
+
+    result = await execute_claim(engine, _settings(), meta, builder, claim, NOW)
+
+    assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    assert set(meta.applied) == checkpoints
+    if kind is DecisionKind.PAUSE:
+        assert base.paused is True
+    elif kind is DecisionKind.SCALE:
+        assert base.budget == 1200
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,audit,failure_category FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "reconciliation_required"
+    assert row["failure_category"] in {
+        "external_state_unproven",
+        "reallocation_rollback_unproven",
+        "replacement_rollback_unproven",
+    }
+    if kind in {DecisionKind.REALLOCATE, DecisionKind.REPLACE}:
+        assert "rollback_result" in row["audit"]
+
+
+@pytest.mark.parametrize("stage", ["campaign", "ad_set", "NL", "FR", "EN"])
+@pytest.mark.parametrize("steal_lease", [False, True], ids=["reconcile", "lease_lost"])
+@pytest.mark.asyncio
+async def test_public_real_adapter_applied_activation_stage_crash_compensates_or_fences_stale_worker(
+    engine, monkeypatch, stage, steal_lease
+):
+    claim = await _public_replace_claim(engine)
+    settings = _settings(
+        meta_app_id="app",
+        meta_app_secret="secret",
+        meta_system_user_token="token",
+        meta_ad_account_id="act",
+        meta_page_id="page",
+    )
+    adapter = MetaExecutionAdapter(settings, object())
+    adapter._drafts["50"] = SimpleNamespace(daily_budget_eur=10)
+    adapter._identities["50"] = {}
+    bundle = {
+        "campaign_id": "50",
+        "ad_set_id": "60",
+        "ad_ids": {"NL": "71", "FR": "72", "EN": "73"},
+        "creative_ids": {"NL": "81", "FR": "82", "EN": "83"},
+    }
+
+    async def create_paused(**kwargs):
+        return bundle
+
+    adapter.create_paused = create_paused
+    active = set()
+    writes = []
+
+    async def steal():
+        if steal_lease:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE autonomous_actions SET lease_token='stage-stolen' WHERE id=:id"),
+                    {"id": claim.id},
+                )
+
+    async def replacement_statuses(*args, **kwargs):
+        result = {}
+        hierarchy = "ACTIVE" if active else "PAUSED"
+        for key in ("campaign", "ad_set"):
+            result[key] = {"status": hierarchy, "effective_status": hierarchy}
+        result["ad_set"]["daily_budget"] = 1000
+        for locale in ("NL", "FR", "EN"):
+            value = "ACTIVE" if locale in active else "PAUSED"
+            result[f"ad:{locale}"] = {"status": value, "effective_status": value}
+        return result
+
+    async def activate(*args, **kwargs):
+        for item in ("campaign", "ad_set", "NL"):
+            active.add(item if item == "NL" else "NL" if False else item)
+            writes.append(item)
+            if stage == item:
+                await steal()
+                raise RuntimeError(f"lost response after {item}")
+        # Only locale status matters to the adapter's bundle readback.
+        active.discard("campaign")
+        active.discard("ad_set")
+        return {"status": "ACTIVE"}
+
+    async def set_status(config, ad_id, status):
+        locale = {"72": "FR", "73": "EN", "31": "source"}[ad_id]
+        if locale != "source":
+            active.add(locale)
+        writes.append(locale)
+        if stage == locale:
+            await steal()
+            raise RuntimeError(f"lost response after {locale}")
+        return {"status": status}
+
+    async def pause_bundle(*args, **kwargs):
+        writes.append("compensation_pause")
+        active.clear()
+        return {"paused": True}
+
+    async def source_statuses(config, ids):
+        return {
+            key: {"status": "ACTIVE", "effective_status": "ACTIVE"}
+            for key in ("campaign", "ad_set", "ad")
+        }
+
+    async def budget(*args, **kwargs):
+        return {
+            "ad": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+            "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE", "daily_budget": 1000},
+        }
+
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.get_meta_replacement_bundle_statuses",
+        replacement_statuses,
+    )
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.activate_meta_ad", activate)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_ad_status", set_status)
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.pause_meta_replacement_bundle", pause_bundle
+    )
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_ad_statuses", source_statuses)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_budget_state", budget)
+
+    result = await execute_claim(engine, settings, adapter, ReplacementBuilder(), claim, NOW)
+
+    if steal_lease:
+        assert result.status is ExecutionStatus.FAILED
+        assert result.reason == "lease_lost"
+        assert "compensation_pause" not in writes
+    else:
+        assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+        assert writes[-1] == "compensation_pause"
+        async with engine.connect() as conn:
+            audit = await conn.scalar(
+                text("SELECT audit FROM autonomous_actions WHERE id=:id"), {"id": claim.id}
+            )
+        assert audit["rollback_result"]["verified"] is True
+
+
 @pytest.mark.parametrize(
     ("kind", "checkpoint", "transient"),
     [

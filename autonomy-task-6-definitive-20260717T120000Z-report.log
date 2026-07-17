@@ -1,0 +1,22 @@
+Task: Definitive Task 6 applied-write crash and activation-stage matrix
+Date: 2026-07-17 UTC
+
+Implemented:
+- Added an applied-write crash proxy that delegates the external mutation, records the changed
+  fake live state, and only then loses the response.
+- Covered public execute_claim after-write ambiguity for pause, scale, both reallocation forward
+  writes, each reallocation rollback write, replacement paused creation, activation rollback,
+  source pause, and replacement compensation pause.
+- Added public execute_claim coverage through a real MetaExecutionAdapter for applied campaign,
+  ad-set, NL, FR, and EN activation-stage failures.
+- Added lease-loss variants for every activation stage proving stale workers perform no later
+  compensation write or stale finalization.
+- Made exact identity/budget replacement bundles safely pauseable during mixed ACTIVE/PAUSED
+  partial activation, while malformed or foreign bundles remain fail-closed.
+
+Verification:
+- Applied-write crash matrix: 9 passed.
+- Real adapter stage/lease matrix: 10 passed.
+- Full executor suite: 86 passed in 29.09s.
+- Full repository suite: 813 passed in 150.20s.
+- Ruff check, Ruff format check, and git diff --check: passed.
