@@ -1,5 +1,6 @@
 """Claude async wrapper tests — no real API calls."""
 
+import base64
 from unittest.mock import AsyncMock
 
 import pytest
@@ -71,3 +72,46 @@ async def test_complete_strips_text_blocks(fake_anthropic_client):
     client = ClaudeClient(api_key="sk-ant-test")
     resp = await client.complete(system="x", user="y")
     assert resp.text == "line one\nline two"
+
+
+async def test_complete_with_images_sends_ordered_jpeg_blocks(fake_anthropic_client, tmp_path):
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpeg"
+    first.write_bytes(b"first jpeg")
+    second.write_bytes(b"second jpeg")
+    client = ClaudeClient(api_key="sk-ant-test")
+
+    response = await client.complete_with_images(
+        system="Review the recording.",
+        user="Approved script: hello",
+        images=[first, second],
+        temperature=0.0,
+        max_tokens=400,
+    )
+
+    assert response.text == "hello world"
+    _args, kwargs = fake_anthropic_client.messages.create.await_args
+    assert kwargs["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64.b64encode(b"first jpeg").decode("ascii"),
+                    },
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64.b64encode(b"second jpeg").decode("ascii"),
+                    },
+                },
+                {"type": "text", "text": "Approved script: hello"},
+            ],
+        }
+    ]

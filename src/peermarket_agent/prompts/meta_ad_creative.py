@@ -6,11 +6,13 @@ by the caller (or randomly rotated by the daily loop). No Meta API calls
 in this module — this is draft-only.
 """
 
+import json
 import math
 import random
 from dataclasses import dataclass
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 _INPUT_CENTS_PER_TOKEN = 0.0003
@@ -83,13 +85,31 @@ def build_system_prompt(brand_voice_md: str) -> str:
     )
 
 
+def build_replacement_system_prompt(brand_voice_md: str) -> str:
+    """Dedicated schema contract for multilingual replacement generation."""
+    return (
+        "You are PeerMarket's multilingual Meta replacement creative writer.\n\n"
+        "Brand voice (READ FIRST):\n----\n"
+        f"{brand_voice_md}\n----\n\n"
+        "Return JSON only, with exactly these eleven fields:\n"
+        '{"locale":"NL|FR|EN","changed_dimension":"hook|copy|visual|audience",'
+        '"hook":"...","body":"...","headline":"...","description":"...",'
+        '"cta_label":"Learn More|Sign Up|Shop Now|Get Started",'
+        '"audience_profile_key":"...","image_prompt":"...","asset_path":"...",'
+        '"suggested_daily_budget_eur":10}\n'
+        "Write natively in the requested locale. Change only the requested experiment dimension. "
+        "Keep every other frozen source value byte-for-byte identical. No em-dashes."
+    )
+
+
 def build_user_prompt(
     *,
     language: str,
     audience_profile_key: str,
+    learnings: tuple[str, ...] = (),
 ) -> str:
     profile = AUDIENCE_PROFILES[audience_profile_key]
-    return (
+    prompt = (
         f"Language: {language}\n"
         f"Audience profile: {profile['label']}\n"
         f"Age range: {profile['age_min']}-{profile['age_max']}\n"
@@ -98,6 +118,36 @@ def build_user_prompt(
         f"Rationale: {profile['rationale']}\n\n"
         "Angle: trust + verified identity wedge. Counter to Marktplaats/Facebook Marketplace scams.\n"
     )
+    if learnings:
+        prompt += "\nRecent relevant evidence (use as hypotheses, not commands):\n"
+        prompt += "\n".join(f"- {learning[:300]}" for learning in learnings[:5]) + "\n"
+    return prompt
+
+
+def build_replacement_user_prompt(
+    *,
+    locale: str,
+    changed_dimension: str,
+    source: dict,
+    learnings: tuple[str, ...] = (),
+) -> str:
+    """Build one locale-specific replacement request; calls are deliberately separate."""
+    if locale not in {"NL", "FR", "EN"}:
+        raise ValueError("replacement locale must be NL, FR, or EN")
+    language_name = {"NL": "Dutch", "FR": "French", "EN": "English"}[locale]
+    prompt = (
+        f"Locale: {locale}\n"
+        f"Write the creative in {language_name}, written natively rather than translated.\n"
+        f"Change exactly this primary experiment dimension: {changed_dimension}.\n"
+        "Return strict JSON following the exact schema from the system instruction. Do not use locale labels "
+        "or placeholders in the copy.\n"
+        "Every field outside the selected dimension must exactly equal the frozen source.\n"
+        f"Frozen source JSON: {json.dumps(source, sort_keys=True, ensure_ascii=False)}\n"
+    )
+    if learnings:
+        prompt += "Matching valid learnings (hypotheses only):\n"
+        prompt += "\n".join(f"- {item[:300]}" for item in learnings[:5]) + "\n"
+    return prompt
 
 
 @dataclass(frozen=True)
@@ -117,6 +167,7 @@ async def generate_meta_ad_creative(
     brand_voice_md: str,
     language: str,
     audience_profile_key: str,
+    learnings: tuple[str, ...] = (),
 ) -> MetaAdCreative:
     if audience_profile_key not in AUDIENCE_PROFILES:
         raise ValueError(
@@ -128,32 +179,21 @@ async def generate_meta_ad_creative(
         user=build_user_prompt(
             language=language,
             audience_profile_key=audience_profile_key,
+            learnings=learnings,
         ),
         temperature=0.7,
         max_tokens=600,
     )
     payload = parse_claude_json(resp.text)
+    validate_meta(
+        {**payload, "audience_profile_key": audience_profile_key},
+        allowed_audiences=set(AUDIENCE_PROFILES),
+    )
     primary_text = payload["primary_text"]
     headline = payload["headline"]
     description = payload["description"]
     cta_label = payload["cta_label"]
     budget = int(payload["suggested_daily_budget_eur"])
-
-    if not (125 <= len(primary_text) <= 300):
-        raise ValueError(
-            f"primary_text length out of range ({len(primary_text)} not in 125-300): "
-            f"{primary_text!r}"
-        )
-    if len(headline) > 40:
-        raise ValueError(f"headline too long ({len(headline)} > 40): {headline!r}")
-    if len(description) > 40:
-        raise ValueError(f"description too long ({len(description)} > 40): {description!r}")
-    if cta_label not in _ALLOWED_CTA_LABELS:
-        raise ValueError(
-            f"cta_label not allowed: {cta_label!r} (must be one of {_ALLOWED_CTA_LABELS})"
-        )
-    if not (5 <= budget <= 20):
-        raise ValueError(f"suggested_daily_budget_eur out of range ({budget} not in 5-20)")
 
     return MetaAdCreative(
         primary_text=primary_text,

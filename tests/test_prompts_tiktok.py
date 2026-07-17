@@ -35,7 +35,7 @@ async def test_generate_tiktok_post_parses_json_response():
     fake_client = AsyncMock()
     fake_client.complete = AsyncMock(
         return_value=ClaudeResponse(
-            text='{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats nu"}',
+            text='{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats het nu", "script": "Verkoop lokaal en veilig via PeerMarket.", "shots": ["Toon het item", "Open PeerMarket"], "on_screen_text": ["Veilig lokaal verkopen"], "recording_notes": "Film verticaal bij daglicht."}',
             input_tokens=200,
             output_tokens=40,
             model="claude-sonnet-4-6",
@@ -48,9 +48,13 @@ async def test_generate_tiktok_post_parses_json_response():
         language="NL",
         theme="declutter",
     )
-    assert result.hook == "Marktplaats moe?"
+    assert result.hook == "Wil je vandaag veilig en lokaal spullen verkopen?"
     assert result.body == "Verkoop veilig op PeerMarket."
-    assert result.cta == "Plaats nu"
+    assert result.cta == "Plaats het nu"
+    assert result.script == "Verkoop lokaal en veilig via PeerMarket."
+    assert result.shots == ["Toon het item", "Open PeerMarket"]
+    assert result.on_screen_text == ["Veilig lokaal verkopen"]
+    assert result.recording_notes == "Film verticaal bij daglicht."
     assert result.cost_cents == 1
 
 

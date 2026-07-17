@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_tiktok
 from peermarket_agent.claude import ClaudeClient, ClaudeResponse
 
 # Sonnet 4.6 approximate pricing: $3/M input, $15/M output → cents per token.
@@ -26,18 +27,24 @@ def build_system_prompt(brand_voice_md: str) -> str:
         f"{brand_voice_md}\n"
         "----\n\n"
         "Your job: write one TikTok organic post in the requested language.\n\n"
-        "Output format: a JSON object with exactly three string fields, "
-        "no markdown, no commentary:\n"
+        "Output format: a JSON object with exactly seven fields, no markdown, no commentary:\n"
         "{\n"
         '  "hook": "<8-12 word punch opener>",\n'
         '  "body": "<1-2 sentence middle, ≤30 words>",\n'
-        '  "cta": "<3-6 word call to action>"\n'
+        '  "cta": "<3-6 word call to action>",\n'
+        '  "script": "<20-40 second spoken script>",\n'
+        '  "shots": ["<shot description>", "<shot description>"],\n'
+        '  "on_screen_text": ["<short text overlay>"],\n'
+        '  "recording_notes": "<practical founder recording notes>"\n'
         "}\n\n"
         "Hard constraints:\n"
         "- Hook ends with a question mark or a short statement, never an exclamation\n"
         "- No em-dashes (—). Commas only.\n"
         "- Stay strictly in the requested language; never mix.\n"
         "- Hook + body + cta ≤ 50 words total.\n"
+        "- Script is spoken aloud and takes 20-40 seconds at a natural pace.\n"
+        "- Provide 2-6 shots and no more than 6 on-screen text overlays.\n"
+        "- Keep every field in the requested language.\n"
     )
 
 
@@ -55,6 +62,10 @@ class TikTokPost:
     hook: str
     body: str
     cta: str
+    script: str
+    shots: list[str]
+    on_screen_text: list[str]
+    recording_notes: str
     cost_cents: int
 
 
@@ -72,9 +83,14 @@ async def generate_tiktok_post(
         max_tokens=400,
     )
     payload = parse_claude_json(resp.text)
+    validate_tiktok(payload)
     return TikTokPost(
         hook=payload["hook"],
         body=payload["body"],
         cta=payload["cta"],
+        script=payload["script"],
+        shots=payload["shots"],
+        on_screen_text=payload["on_screen_text"],
+        recording_notes=payload["recording_notes"],
         cost_cents=_cost_cents(resp),
     )

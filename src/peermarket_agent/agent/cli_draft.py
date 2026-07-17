@@ -4,11 +4,13 @@ Orchestrates: generate → score → persist-if-passing.
 """
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import anthropic
 import click
 import structlog
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.balance_alert import NUDGE_MESSAGE, is_credit_balance_error
@@ -19,11 +21,73 @@ from peermarket_agent.db.engine import get_engine
 from peermarket_agent.drafts import Draft, persist_draft
 from peermarket_agent.prompts.brand_voice import load_brand_voice
 from peermarket_agent.prompts.email_re_engagement import generate_email
+from peermarket_agent.prompts.meta_ad_creative import pick_audience
 from peermarket_agent.prompts.seo_pr import generate_seo_meta
 from peermarket_agent.prompts.tiktok_post import generate_tiktok_post
 from peermarket_agent.slack_notifier import SlackNotifier
 
 log = structlog.get_logger(__name__)
+
+
+def _eligible_nonzero_difference(evidence: object) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    decision = evidence.get("decision")
+    if not isinstance(decision, dict) or decision.get("eligible") is not True:
+        return False
+    outcome = decision.get("outcome")
+    if not isinstance(outcome, dict):
+        return False
+    raw_difference = outcome.get("absolute_difference")
+    if isinstance(raw_difference, bool) or raw_difference is None:
+        return False
+    try:
+        difference = Decimal(str(raw_difference))
+    except (InvalidOperation, ValueError):
+        return False
+    return difference.is_finite() and difference != 0
+
+
+async def recent_relevant_learnings(
+    engine: AsyncEngine,
+    *,
+    channel: str,
+    objective: str,
+    language: str,
+    audience: str,
+    creative_dimension: str | None = None,
+) -> tuple[str, ...]:
+    """Return only bounded, eligible, exact-dimension reusable learnings."""
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT text, evidence_links FROM learnings WHERE "
+                        "split_part(scope, ':', 1) IN ('delivery', 'conversion') "
+                        "AND split_part(scope, ':', 2)=:channel "
+                        "AND split_part(scope, ':', 3)=:objective "
+                        "AND split_part(scope, ':', 4)=:language "
+                        "AND split_part(scope, ':', 5)=:audience "
+                        "AND (CAST(:creative_dimension AS TEXT) IS NULL OR "
+                        "split_part(scope, ':', 6)=CAST(:creative_dimension AS TEXT)) "
+                        "ORDER BY id DESC LIMIT 25"
+                    ),
+                    {
+                        "channel": channel,
+                        "objective": objective,
+                        "language": language,
+                        "audience": audience,
+                        "creative_dimension": creative_dimension,
+                    },
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return tuple(
+        row["text"] for row in rows if _eligible_nonzero_difference(row["evidence_links"])
+    )[:5]
 
 
 def _human_cta_to_meta_enum(human: str) -> str:
@@ -51,8 +115,21 @@ async def _produce_copy_for_action(
             language=action_args["language"],
             theme=action_args.get("theme", "declutter"),
         )
-        copy_text = f"{post.hook}\n\n{post.body}\n\n{post.cta}"
-        return "tiktok", action_args["language"], copy_text, post.cost_cents, {}
+        copy_text = (
+            f"{post.hook}\n\n{post.body}\n\n{post.cta}\n\n"
+            f"Recording brief\n"
+            f"Script: {post.script}\n"
+            f"Shots: {'; '.join(post.shots)}\n"
+            f"On-screen text: {'; '.join(post.on_screen_text)}\n"
+            f"Recording notes: {post.recording_notes}"
+        )
+        metadata = {
+            "script": post.script,
+            "shots": post.shots,
+            "on_screen_text": post.on_screen_text,
+            "recording_notes": post.recording_notes,
+        }
+        return "tiktok", action_args["language"], copy_text, post.cost_cents, metadata
     elif action_type_name == "email_re_engagement":
         email = await generate_email(
             claude=claude,
@@ -87,6 +164,7 @@ async def _produce_copy_for_action(
             brand_voice_md=brand_voice_md,
             language=action_args["language"],
             audience_profile_key=audience_key,
+            learnings=tuple(action_args.get("learnings") or ()),
         )
         copy_text = (
             f"Audience: {audience_key}\n"
@@ -98,6 +176,7 @@ async def _produce_copy_for_action(
         )
         metadata = {
             "audience_profile_key": audience_key,
+            "objective": "OUTCOME_TRAFFIC",
             "headline": ad.headline,
             "description": ad.description,
             "cta_label": ad.cta_label,
@@ -125,6 +204,16 @@ async def run_draft_command(
     """
     try:
         brand_voice_md = load_brand_voice()
+        if action_type_name == "meta_ad_creative":
+            audience_key = action_args.get("audience_profile_key") or pick_audience()
+            action_args["audience_profile_key"] = audience_key
+            action_args["learnings"] = await recent_relevant_learnings(
+                engine,
+                channel="meta",
+                objective="OUTCOME_TRAFFIC",
+                language=action_args["language"],
+                audience=audience_key,
+            )
         channel, language, copy_text, gen_cost, metadata = await _produce_copy_for_action(
             claude=claude,
             brand_voice_md=brand_voice_md,

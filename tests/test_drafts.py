@@ -8,7 +8,16 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
-from peermarket_agent.drafts import Draft, count_drafts_for_action, persist_draft
+from peermarket_agent.drafts import (
+    Draft,
+    VideoAsset,
+    claim_video_asset,
+    count_drafts_for_action,
+    get_video_asset_by_slack_file,
+    persist_draft,
+    persist_video_asset,
+)
+from peermarket_agent.video_workflow import get_source_assets
 
 
 @pytest.fixture
@@ -157,3 +166,143 @@ async def test_persist_draft_stores_metadata(engine):
             )
         ).fetchone()
     assert row[0] == metadata
+
+
+async def test_persist_video_asset_stores_and_retrieves_source_video(engine):
+    draft_id = await persist_draft(
+        engine,
+        Draft(
+            action_type_name="tiktok_post_organic",
+            channel="tiktok",
+            language="NL",
+            copy="x",
+            asset_path=None,
+            generation_cost_cents=0,
+            brand_score=80,
+            visual_truthfulness_pass=True,
+            metadata={"slack_channel_id": "C123", "slack_ts": "1234.5678"},
+        ),
+    )
+    asset = VideoAsset(
+        draft_id=draft_id,
+        slack_file_id="F123",
+        thread_ts="1234.5678",
+        path="/tmp/source.mp4",
+        role="source",
+        mime_type="video/mp4",
+        size_bytes=1234,
+        duration_seconds=12.5,
+        width=1080,
+        height=1920,
+        status="downloaded",
+        review={"speaker": "human"},
+    )
+
+    asset_id = await persist_video_asset(engine, asset)
+    stored = await get_video_asset_by_slack_file(engine, draft_id, "F123")
+
+    assert isinstance(asset_id, int)
+    assert stored == asset
+
+
+async def test_persist_video_asset_returns_existing_id_for_duplicate_slack_file(engine):
+    draft_id = await persist_draft(
+        engine,
+        Draft(
+            action_type_name="tiktok_post_organic",
+            channel="tiktok",
+            language="NL",
+            copy="x",
+            asset_path=None,
+            generation_cost_cents=0,
+            brand_score=80,
+            visual_truthfulness_pass=True,
+            metadata={"slack_channel_id": "C123", "slack_ts": "1234.5678"},
+        ),
+    )
+    asset = VideoAsset(
+        draft_id=draft_id,
+        slack_file_id="F123",
+        thread_ts="1234.5678",
+        path="/tmp/source.mp4",
+        role="source",
+        mime_type="video/mp4",
+        size_bytes=1234,
+        duration_seconds=None,
+        width=None,
+        height=None,
+        status="queued",
+        review={},
+    )
+
+    first_id = await persist_video_asset(engine, asset)
+    second_id = await persist_video_asset(engine, asset)
+
+    assert second_id == first_id
+    async with engine.connect() as conn:
+        count = await conn.scalar(
+            text("SELECT count(*) FROM video_assets WHERE draft_id = :id"), {"id": draft_id}
+        )
+    assert count == 1
+
+
+async def test_claim_video_asset_returns_existing_asset_without_a_second_claim(engine):
+    draft_id = await persist_draft(
+        engine,
+        Draft("tiktok_post_organic", "tiktok", "NL", "x", None, 0, 80, True),
+    )
+    asset = VideoAsset(
+        draft_id,
+        "F123",
+        "1234.5678",
+        "/tmp/source.mp4",
+        "source",
+        "video/mp4",
+        1234,
+        None,
+        None,
+        None,
+        "accepted",
+        {},
+    )
+
+    first, first_claimed = await claim_video_asset(engine, asset)
+    second, second_claimed = await claim_video_asset(engine, asset)
+
+    assert first == asset
+    assert first_claimed is True
+    assert second == asset
+    assert second_claimed is False
+
+
+async def test_get_source_assets_excludes_rejected_and_failed_sources(engine):
+    draft_id = await persist_draft(
+        engine,
+        Draft("tiktok_post_organic", "tiktok", "NL", "x", None, 0, 80, True),
+    )
+    for file_id, status in (
+        ("Fgood", "reviewed"),
+        ("Frejected", "rejected"),
+        ("Ffailed", "failed"),
+    ):
+        await persist_video_asset(
+            engine,
+            VideoAsset(
+                draft_id,
+                file_id,
+                "1234.5678",
+                f"/tmp/{file_id}.mp4",
+                "source",
+                "video/mp4",
+                1234,
+                None,
+                None,
+                None,
+                status,
+                {},
+            ),
+        )
+
+    sources = await get_source_assets(engine, draft_id)
+
+    assert [asset.slack_file_id for asset in sources] == ["Fgood"]

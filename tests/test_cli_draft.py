@@ -1,5 +1,6 @@
 """CLI draft command tests — end-to-end orchestration."""
 
+import json
 import os
 from unittest.mock import AsyncMock
 
@@ -33,7 +34,7 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "Marktplaats moe?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats nu"}',
+                text='{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats het nu", "script": "Verkoop lokaal en veilig via PeerMarket.", "shots": ["Toon het item", "Open PeerMarket"], "on_screen_text": ["Veilig lokaal verkopen"], "recording_notes": "Film verticaal bij daglicht."}',
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -67,7 +68,7 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
                 {"id": draft_id},
             )
         ).fetchone()
-    assert "Marktplaats moe?" in row[0]
+    assert "Wil je vandaag veilig" in row[0]
     assert row[1] == 92
     assert row[2] == "tiktok"
     assert row[3] == "NL"
@@ -79,7 +80,7 @@ async def test_run_draft_rejects_low_score_draft_does_not_persist(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "wrong tone", "body": "amazing offer!!!", "cta": "buy now!"}',
+                text='{"hook": "Buy everything today with this amazing sales offer", "body": "amazing offer!!!", "cta": "buy it now", "script": "Buy everything today with this amazing sales offer.", "shots": ["Show the item", "Open PeerMarket"], "on_screen_text": ["Amazing offer"], "recording_notes": "Film vertically in daylight."}',
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -114,7 +115,7 @@ async def test_run_draft_email_persists(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"subject": "Je hebt nog niets verkocht", "body": "Hoi, je hebt een account..."}',
+                text='{"subject": "Je hebt nog niets verkocht", "body": "' + "woord " * 80 + '"}',
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",
@@ -224,11 +225,150 @@ async def test_run_draft_meta_persists_metadata(prepared_db):
     assert row[0] == "meta"
     meta = row[1]
     assert meta["audience_profile_key"] == "declutterers"
+    assert meta["objective"] == "OUTCOME_TRAFFIC"
     assert meta["headline"] == "Verkoop veilig"
     assert meta["cta_label"] == "Learn More"
     assert meta["cta_type"] == "LEARN_MORE"
     assert meta["suggested_daily_budget_eur"] == 10
     assert "PeerMarket is de Belgische" in meta["primary_text"]
+
+
+async def test_meta_generation_uses_only_five_recent_relevant_learnings(prepared_db):
+    async with prepared_db.begin() as conn:
+        for index in range(7):
+            await conn.execute(
+                text(
+                    "INSERT INTO learnings (scope, text, evidence_links) VALUES "
+                    "(:scope, :learning, CAST(:evidence AS JSONB))"
+                ),
+                {
+                    "scope": "delivery:meta:OUTCOME_TRAFFIC:NL:declutterers:rolling-3",
+                    "learning": f"relevant-{index}",
+                    "evidence": json.dumps(
+                        {
+                            "decision": {
+                                "eligible": True,
+                                "outcome": {"absolute_difference": "0.01"},
+                            }
+                        }
+                    ),
+                },
+            )
+        await conn.execute(
+            text("INSERT INTO learnings (scope, text) VALUES (:scope, 'do-not-use')"),
+            {"scope": "delivery:meta:OUTCOME_TRAFFIC:FR:declutterers:rolling-3"},
+        )
+    fake_claude = AsyncMock()
+    fake_claude.complete = AsyncMock(
+        side_effect=[
+            ClaudeResponse(
+                text=(
+                    '{"primary_text": "PeerMarket is de Belgische marktplaats waar elke verkoper '
+                    "zijn identiteit verifieert. Verkoop veilig en koop met vertrouwen. Plaats "
+                    'vandaag je eerste item gratis.", "headline": "Verkoop veilig", '
+                    '"description": "Geverifieerde verkopers", "cta_label": "Learn More", '
+                    '"suggested_daily_budget_eur": 10}'
+                ),
+                input_tokens=10,
+                output_tokens=10,
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+            ),
+            ClaudeResponse(
+                text='{"score": 90, "notes": "Good."}',
+                input_tokens=10,
+                output_tokens=10,
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+
+    await run_draft_command(
+        engine=prepared_db,
+        claude=fake_claude,
+        action_type_name="meta_ad_creative",
+        language="NL",
+        audience_profile_key="declutterers",
+    )
+
+    prompt = fake_claude.complete.await_args_list[0].kwargs["user"]
+    assert "relevant-6" in prompt and "relevant-2" in prompt
+    assert "relevant-1" not in prompt and "relevant-0" not in prompt
+    assert "do-not-use" not in prompt
+
+
+async def test_meta_prompt_defensively_excludes_neutral_tie_learning(prepared_db):
+    async with prepared_db.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO learnings (scope, text, evidence_links) VALUES "
+                "(:scope, 'tie-must-not-appear', CAST(:evidence AS JSONB))"
+            ),
+            {
+                "scope": "delivery:meta:OUTCOME_TRAFFIC:NL:declutterers:rolling-3",
+                "evidence": json.dumps(
+                    {
+                        "decision": {
+                            "eligible": True,
+                            "reason": "delivery_thresholds_met",
+                            "outcome": {"absolute_difference": "0.00"},
+                        }
+                    }
+                ),
+            },
+        )
+    from peermarket_agent.agent.cli_draft import recent_relevant_learnings
+
+    learnings = await recent_relevant_learnings(
+        prepared_db,
+        channel="meta",
+        objective="OUTCOME_TRAFFIC",
+        language="NL",
+        audience="declutterers",
+    )
+
+    assert learnings == ()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        False,
+        "",
+        "wat",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "0",
+        "0.00",
+        "-0.00",
+        "0e0",
+        "0E-10",
+    ],
+)
+def test_learning_difference_filter_rejects_missing_malformed_nonfinite_and_zero(value):
+    from peermarket_agent.agent.cli_draft import _eligible_nonzero_difference
+
+    evidence = {"decision": {"eligible": True, "outcome": {"absolute_difference": value}}}
+    assert _eligible_nonzero_difference(evidence) is False
+
+
+@pytest.mark.parametrize("value", ["0.01", "-0.01", "1e-10", 2, 0.5])
+def test_learning_difference_filter_accepts_finite_mathematical_nonzero(value):
+    from peermarket_agent.agent.cli_draft import _eligible_nonzero_difference
+
+    evidence = {"decision": {"eligible": True, "outcome": {"absolute_difference": value}}}
+    assert _eligible_nonzero_difference(evidence) is True
+
+
+def test_learning_difference_filter_requires_boolean_true_eligibility():
+    from peermarket_agent.agent.cli_draft import _eligible_nonzero_difference
+
+    evidence = {"decision": {"eligible": "true", "outcome": {"absolute_difference": "0.01"}}}
+    assert _eligible_nonzero_difference(evidence) is False
 
 
 async def test_run_draft_credit_low_dms_founder_and_reraises(prepared_db):

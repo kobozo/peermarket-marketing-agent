@@ -74,6 +74,30 @@ until trust-score calculation is genuinely implemented.
 Draft 156 is retried through this same reconciliation path. Its already-created
 IDs are used; it must not create another campaign, ad set, creative, or ad.
 
+### Terminal-resource replacement
+
+Production verification showed that the previously recorded draft-156 campaign,
+ad set, and ad are all `ARCHIVED`; Meta does not permit archived/deleted
+resources to be reactivated. A separate, explicit operator command may replace
+such a terminal hierarchy. This is not an automatic retry.
+
+Replacement requires the operator to supply the exact currently stored IDs.
+Under the per-draft advisory lock, the agent reads Meta status for campaign, ad
+set, and ad and proceeds only when every resource is terminal (`ARCHIVED` or
+`DELETED`). Any active, paused, review, unknown, missing, or mixed state refuses
+replacement without a database write or Meta creation call.
+
+Before creation, the old IDs and terminal statuses are appended to durable
+replacement history. The approved budget remains frozen and cannot be supplied
+or changed by the replacement command. The pipeline then creates exactly one new
+paused hierarchy and uses the normal activate, verify, persist, and rollback
+path. Concurrent replacement attempts serialize on the same advisory lock.
+
+If new-resource creation partially fails, the partial IDs replace the current
+reconciliation IDs while both the old terminal hierarchy and failed replacement
+remain in history. No automatic second replacement is attempted. Slack and CLI
+output identify both the archived hierarchy and the current replacement state.
+
 ## Meta Insights ingestion
 
 An hourly job retrieves insights for every non-final Meta publication over a
