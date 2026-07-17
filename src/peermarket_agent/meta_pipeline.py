@@ -399,15 +399,20 @@ async def publish_replacement_paused(
                     if f"image_hash:{language}" in progress
                 },
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            valid = False
+        else:
             valid = set(ad_ids) == {"NL", "FR", "EN"} and _is_verified_paused_bundle(
                 observed, draft.daily_budget_eur * 100
             )
+            # A stale worker must propagate ownership loss, not reinterpret it as
+            # a failed Meta reread and enter the cleanup path.
             await _require_live_replacement_claim(engine, claim, draft)
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            valid = False
         if not valid:
+            # Fence synchronously adjacent to the external cleanup mutation.
+            await _require_live_replacement_claim(engine, claim, draft)
             cleanup = await pause_meta_replacement_bundle(
                 _meta_config(settings),
                 progress["campaign_id"],
@@ -580,6 +585,14 @@ async def publish_replacement_paused(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Cleanup itself is an external mutation. Revalidate both the action
+            # claim and publication lease immediately before issuing it.
+            await renew_replacement_leases(
+                engine,
+                claim,
+                publication_id=attempt["id"],
+                publication_token=attempt_token,
+            )
             cleanup = await pause_meta_replacement_bundle(
                 _meta_config(settings),
                 result.campaign_id,

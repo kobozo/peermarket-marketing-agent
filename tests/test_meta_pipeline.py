@@ -671,16 +671,135 @@ async def test_completed_bundle_reread_rejects_claim_takeover_during_meta_call(
         "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses",
         blocking_reread,
     )
+    pause = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.pause_meta_replacement_bundle", pause)
     old_worker = asyncio.create_task(
         publish_replacement_paused(
             engine=engine, settings=_make_settings(), claim=claim, draft=draft
         )
     )
     await reread_started.wait()
+    async with engine.connect() as conn:
+        state_before_takeover = (
+            await conn.execute(
+                text(
+                    "SELECT r.state, r.failure_category, r.progress, a.status "
+                    "FROM autonomous_replacement_publications r "
+                    "JOIN autonomous_actions a ON a.id=r.action_id "
+                    "WHERE r.action_id=:id"
+                ),
+                {"id": claim.id},
+            )
+        ).one()
     claim_taken_over = True
     takeover_complete.set()
-    with pytest.raises(RuntimeError, match="ownership|live paused validation"):
+    with pytest.raises(RuntimeError, match="ownership"):
         await old_worker
+    pause.assert_not_awaited()
+    async with engine.connect() as conn:
+        state_after_takeover = (
+            await conn.execute(
+                text(
+                    "SELECT r.state, r.failure_category, r.progress, a.status "
+                    "FROM autonomous_replacement_publications r "
+                    "JOIN autonomous_actions a ON a.id=r.action_id "
+                    "WHERE r.action_id=:id"
+                ),
+                {"id": claim.id},
+            )
+        ).one()
+    assert state_after_takeover == state_before_takeover
+
+
+async def test_active_bundle_cleanup_requires_current_claim_immediately_before_meta_pause(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline._HEARTBEAT_INTERVAL_SECONDS", 3600)
+
+    async def create_completed_bundle(**kwargs):
+        values = {
+            "campaign_id": "new-c",
+            "ad_set_id": "new-as",
+            **{f"creative_id:{x}": f"cr-{x}" for x in ("NL", "FR", "EN")},
+            **{f"ad_id:{x}": f"ad-{x}" for x in ("NL", "FR", "EN")},
+        }
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        return MetaReplacementBundleResult(
+            "new-c",
+            "new-as",
+            {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager",
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused",
+        create_completed_bundle,
+    )
+    verification_started = asyncio.Event()
+    takeover_complete = asyncio.Event()
+
+    async def blocking_invalid_verification(*args, **kwargs):
+        verification_started.set()
+        await takeover_complete.wait()
+        return {}
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses",
+        blocking_invalid_verification,
+    )
+    pause = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.pause_meta_replacement_bundle", pause)
+
+    from peermarket_agent import meta_pipeline
+
+    real_renew = meta_pipeline.renew_replacement_leases
+    claim_taken_over = False
+
+    async def require_current_leases(*args, **kwargs):
+        if claim_taken_over:
+            raise RuntimeError("replacement action ownership was lost after claim takeover")
+        return await real_renew(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.renew_replacement_leases", require_current_leases
+    )
+    old_worker = asyncio.create_task(
+        publish_replacement_paused(
+            engine=engine, settings=_make_settings(), claim=claim, draft=draft
+        )
+    )
+    await verification_started.wait()
+    async with engine.connect() as conn:
+        state_before_takeover = (
+            await conn.execute(
+                text(
+                    "SELECT state, failure_category, progress "
+                    "FROM autonomous_replacement_publications WHERE action_id=:id"
+                ),
+                {"id": claim.id},
+            )
+        ).one()
+    claim_taken_over = True
+    takeover_complete.set()
+    with pytest.raises(RuntimeError, match="ownership"):
+        await old_worker
+    pause.assert_not_awaited()
+    async with engine.connect() as conn:
+        state_after_takeover = (
+            await conn.execute(
+                text(
+                    "SELECT state, failure_category, progress "
+                    "FROM autonomous_replacement_publications WHERE action_id=:id"
+                ),
+                {"id": claim.id},
+            )
+        ).one()
+    assert state_after_takeover == state_before_takeover
 
 
 class _FatalPublicationError(BaseException):
