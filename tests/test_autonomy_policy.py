@@ -24,6 +24,7 @@ def limits():
         "meta_autonomy_max_replacements_24h": 1,
         "meta_autonomy_max_increase_percent": 20,
         "meta_autonomy_max_daily_budget_eur": 20,
+        "meta_no_delivery_grace_hours": 2,
     }
 
 
@@ -120,7 +121,8 @@ def test_seven_day_terminal_observation_is_not_directional(limits):
 
 @pytest.mark.parametrize("state", ["no_delivery", "rejected_or_error"])
 def test_delivery_failure_observes_with_diagnosis_reason(state, limits):
-    decision = evaluate_campaign(_snapshot(delivery_state=state), (), limits, NOW)
+    extra = {"configured_active_since": NOW - timedelta(hours=2)} if state == "no_delivery" else {}
+    decision = evaluate_campaign(_snapshot(delivery_state=state, **extra), (), limits, NOW)
     assert decision.kind is DecisionKind.OBSERVE
     assert decision.reason == f"diagnose_{state}"
 
@@ -234,6 +236,20 @@ def test_decimal_comparison_does_not_round_close_rates_to_a_tie(limits):
     )
 
 
+def test_rate_order_uses_exact_cross_multiplication_beyond_decimal_precision(limits):
+    base = 10**40
+    snapshot = _snapshot(
+        variants=[
+            _variant("1", base + 1, views=base),
+            _variant("2", base, views=base - 1),
+        ]
+    )
+    decision = evaluate_campaign(snapshot, (), limits, NOW)
+    assert decision.kind is DecisionKind.REPLACE
+    assert decision.evidence["winner_variant_id"] == "2"
+    assert decision.evidence["loser_variant_id"] == "1"
+
+
 @pytest.mark.parametrize("bad", [True, 1.0, Decimal("NaN"), -1])
 def test_invalid_numeric_boundaries_observe(bad, limits):
     snapshot = _snapshot()
@@ -258,3 +274,91 @@ def test_input_order_does_not_change_decision_or_key(limits):
     snapshot["variants"].reverse()
     second = evaluate_campaign(snapshot, tuple(reversed(history)), limits, NOW)
     assert first == second
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_variant_ids_fail_closed_independent_of_order(limits, reverse):
+    variants = [_variant("1", 20), _variant("1", 10)]
+    if reverse:
+        variants.reverse()
+    decision = evaluate_campaign(_snapshot(variants=variants), (), limits, NOW)
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == "invalid_snapshot"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_history_event_ids_fail_closed_independent_of_order(limits, reverse):
+    history = [
+        _event("observe", NOW - timedelta(days=2), event_id="collision"),
+        _event("replace", NOW - timedelta(days=3), event_id="collision"),
+    ]
+    if reverse:
+        history.reverse()
+    decision = evaluate_campaign(_snapshot(), tuple(history), limits, NOW)
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == "invalid_history"
+
+
+class _ExplosiveString:
+    def __str__(self):
+        raise AssertionError("untrusted identifiers must not be stringified")
+
+
+def test_malformed_input_is_deterministic_without_a_valid_now(limits):
+    malformed = _snapshot(snapshot_id=_ExplosiveString(), variants="bad")
+    first = evaluate_campaign(malformed, (), limits, None)
+    second = evaluate_campaign(malformed, (), limits, None)
+    assert first == second
+    assert first.reason == "invalid_snapshot"
+
+
+@pytest.mark.parametrize("bad_now", [None, datetime(2026, 7, 17, 12), "now"])
+def test_normal_evaluation_requires_valid_aware_now(bad_now, limits):
+    decision = evaluate_campaign(_snapshot(), (), limits, bad_now)
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == "invalid_snapshot"
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "reason"),
+    [
+        (timedelta(hours=2) - timedelta(microseconds=1), "no_delivery_grace_period"),
+        (timedelta(hours=2), "diagnose_no_delivery"),
+        (timedelta(hours=2, microseconds=1), "diagnose_no_delivery"),
+    ],
+)
+def test_no_delivery_requires_explicit_elapsed_active_period(elapsed, reason, limits):
+    decision = evaluate_campaign(
+        _snapshot(delivery_state="no_delivery", configured_active_since=NOW - elapsed),
+        (), limits, NOW,
+    )
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == reason
+    assert decision.evidence["configured_active_since"] == (NOW - elapsed).isoformat()
+
+
+def test_no_delivery_without_active_since_fails_closed(limits):
+    decision = evaluate_campaign(_snapshot(delivery_state="no_delivery"), (), limits, NOW)
+    assert decision.reason == "invalid_snapshot"
+
+
+def test_future_history_is_rejected(limits):
+    history = (_event("observe", NOW + timedelta(microseconds=1)),)
+    decision = evaluate_campaign(_snapshot(), history, limits, NOW)
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == "invalid_history"
+
+
+@pytest.mark.parametrize("field", ["snapshot_id"])
+@pytest.mark.parametrize("bad", ["", "   ", 7, _ExplosiveString()])
+def test_snapshot_stable_id_must_be_a_nonempty_string(field, bad, limits):
+    decision = evaluate_campaign(_snapshot(**{field: bad}), (), limits, NOW)
+    assert decision.reason == "invalid_snapshot"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 7, _ExplosiveString()])
+def test_history_stable_id_must_be_a_nonempty_string(bad, limits):
+    decision = evaluate_campaign(
+        _snapshot(), (_event("observe", NOW - timedelta(days=2), event_id=bad),), limits, NOW
+    )
+    assert decision.reason == "invalid_history"
