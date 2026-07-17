@@ -300,7 +300,7 @@ async def test_scale_executes_exact_budget_and_persists_before_intent_after(engi
     )
     result = await execute_claim(engine, settings, meta, None, claim, NOW)
     assert result.status is ExecutionStatus.SUCCEEDED
-    assert meta.calls == ["read_source", "set_budget", "read_source"]
+    assert meta.calls == ["read_source", "read_source", "set_budget", "read_source"]
     async with engine.connect() as conn:
         row = (
             (
@@ -733,34 +733,9 @@ class ReplacementBuilder:
 
 
 async def _public_replace_claim(engine):
-    decision = _replace_claim().decision
+    decision = await _canonical_policy_replace(engine)
     await enqueue_action(engine, decision)
-    claim = await claim_next_action(engine, "worker", lease_seconds=300)
-    async with engine.begin() as conn:
-        action_type = await conn.scalar(
-            text(
-                "INSERT INTO action_types(name,risk_tier,default_autonomy) "
-                "VALUES ('replacement_public','high','propose') RETURNING id"
-            )
-        )
-        draft = await conn.scalar(
-            text(
-                "INSERT INTO drafts(action_type_id,channel,language,status) "
-                "VALUES (:id,'meta','MULTI','published') RETURNING id"
-            ),
-            {"id": action_type},
-        )
-        await conn.execute(
-            text(
-                "INSERT INTO publications"
-                "(id,draft_id,channel,state,external_ids,approved_budget_cents,performance) "
-                "VALUES (2,:draft,'meta','active',"
-                '\'{"campaign_id":"10","ad_set_id":"20","ad_id":"31"}\','
-                "1000,'{}')"
-            ),
-            {"draft": draft},
-        )
-    return claim
+    return await claim_next_action(engine, "worker", lease_seconds=300)
 
 
 @pytest.mark.asyncio
@@ -769,7 +744,6 @@ async def test_public_replace_source_pause_unverified_rollback_persists_exact_au
 ):
     claim = await _public_replace_claim(engine)
     meta = ReplacementMeta(source_pause_fails=True, rollback_verified=False)
-    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
 
     result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
 
@@ -814,17 +788,19 @@ async def test_public_replace_source_pause_unverified_rollback_persists_exact_au
 async def test_public_replace_success_persists_full_final_audit(engine, monkeypatch):
     claim = await _public_replace_claim(engine)
     meta = ReplacementMeta()
-    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
 
     result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
 
     assert result.status is ExecutionStatus.SUCCEEDED
     assert meta.calls == [
         "read_source",
+        "read_source",
         "create_paused",
+        "read_replacement",
         "read_replacement",
         "activate_replacement",
         "read_replacement",
+        "read_source",
         "pause_source",
         "read_source",
     ]
@@ -861,7 +837,6 @@ async def test_public_replace_split_failures_persist_proven_compensation(
     engine, monkeypatch, meta, category, verified
 ):
     claim = await _public_replace_claim(engine)
-    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
     result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
     assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
     async with engine.connect() as conn:
@@ -886,10 +861,9 @@ async def test_public_ambiguous_create_uses_persisted_adoption_cleanup_and_audit
 ):
     claim = await _public_replace_claim(engine)
     meta = ReplacementMeta(create_fails=True)
-    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
     result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
     assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
-    assert meta.calls == ["read_source", "create_paused", "pause_persisted"]
+    assert meta.calls == ["read_source", "read_source", "create_paused", "pause_persisted"]
     async with engine.connect() as conn:
         row = (
             (
@@ -925,11 +899,10 @@ async def test_public_lease_loss_between_replacement_writes_prevents_stale_finis
 ):
     claim = await _public_replace_claim(engine)
     meta = LeaseStealingReplacementMeta()
-    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
     result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
     assert result.status is ExecutionStatus.FAILED
     assert result.reason == "lease_lost"
-    assert meta.calls == ["read_source", "create_paused"]
+    assert meta.calls == ["read_source", "read_source", "create_paused"]
     async with engine.connect() as conn:
         row = (
             (
@@ -972,7 +945,7 @@ class BoundaryLeaseReplacementMeta(ReplacementMeta):
 
 @pytest.mark.parametrize(
     ("steal_on_read", "expected_writes"),
-    [(1, []), (2, ["create_paused", "activate_replacement", "pause_source"])],
+    [(1, []), (4, ["create_paused", "activate_replacement", "pause_source"])],
 )
 @pytest.mark.asyncio
 async def test_public_lease_loss_before_first_write_and_at_finalization_boundary(
@@ -980,7 +953,6 @@ async def test_public_lease_loss_before_first_write_and_at_finalization_boundary
 ):
     claim = await _public_replace_claim(engine)
     meta = BoundaryLeaseReplacementMeta(engine, claim, steal_on_read)
-    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
     result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
     assert result.status is ExecutionStatus.FAILED
     assert result.reason == "lease_lost"
@@ -1018,10 +990,13 @@ async def test_replacement_exact_success_order(monkeypatch):
     assert rollback is None
     assert after["source"]["status"] == "PAUSED"
     assert meta.calls == [
+        "read_source",
         "create_paused",
+        "read_replacement",
         "read_replacement",
         "activate_replacement",
         "read_replacement",
+        "read_source",
         "pause_source",
         "read_source",
     ]
@@ -1091,7 +1066,7 @@ async def test_malformed_bundle_uses_persisted_ids_and_never_claims_unverified_c
             _replace_claim(),
             {"campaign_id": "10", "ad_set_id": "20", "ad_id": "31"},
         )
-    assert meta.calls == ["create_paused", "pause_persisted"]
+    assert meta.calls == ["read_source", "create_paused", "pause_persisted"]
     if not verified:
         assert failure.value.rollback_result["error"] == "RuntimeError"
 
@@ -1316,7 +1291,7 @@ async def test_duplicate_retry_adopts_task5_paused_bundle_without_regeneration_o
         for key in ("campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN")
     }
     paused["ad_set"]["daily_budget"] = 1000
-    replacement_active = False
+    active_locales = set()
     source_paused = False
     task5_read = AsyncMock(return_value=paused)
     create = AsyncMock(side_effect=AssertionError("must adopt persisted Task5 bundle"))
@@ -1328,25 +1303,31 @@ async def test_duplicate_retry_adopts_task5_paused_bundle_without_regeneration_o
     )
 
     async def read_replacement(*args, **kwargs):
-        state = "ACTIVE" if replacement_active else "PAUSED"
         observed = {
-            key: {"status": state, "effective_status": state}
-            for key in ("campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN")
+            key: {"status": "ACTIVE", "effective_status": "ACTIVE"}
+            for key in ("campaign", "ad_set")
         }
+        if not active_locales:
+            observed["campaign"] = observed["ad_set"] = {
+                "status": "PAUSED",
+                "effective_status": "PAUSED",
+            }
+        for locale in ("NL", "FR", "EN"):
+            state = "ACTIVE" if locale in active_locales else "PAUSED"
+            observed[f"ad:{locale}"] = {"status": state, "effective_status": state}
         observed["ad_set"]["daily_budget"] = 1000
         return observed
 
     async def activate(*args, **kwargs):
-        nonlocal replacement_active
-        replacement_active = True
+        active_locales.add("NL")
         return {"status": "ACTIVE"}
 
     async def set_status(config, ad_id, status):
-        nonlocal source_paused, replacement_active
+        nonlocal source_paused
         if ad_id == "31":
             source_paused = status == "PAUSED"
         elif status == "ACTIVE":
-            replacement_active = True
+            active_locales.add({"72": "FR", "73": "EN"}[ad_id])
         return {"status": status}
 
     async def source_statuses(config, ids):
@@ -1390,7 +1371,7 @@ async def test_duplicate_retry_adopts_task5_paused_bundle_without_regeneration_o
     assert result.after_state["replacement"]["ad_set"]["daily_budget"] == 1000
     create.assert_not_awaited()
     task5_read.assert_awaited_once()
-    assert source_paused and replacement_active
+    assert source_paused and active_locales == {"NL", "FR", "EN"}
     async with engine.connect() as conn:
         row = (
             (
@@ -1420,3 +1401,239 @@ async def test_duplicate_retry_adopts_task5_paused_bundle_without_regeneration_o
         assert (
             await conn.scalar(text("SELECT count(*) FROM autonomous_replacement_publications")) == 1
         )
+
+
+class FounderChangedBeforePause(BudgetMeta):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    async def read_source(self, campaign_id, ids):
+        self.reads += 1
+        result = await super().read_source(campaign_id, ids)
+        if self.reads == 2:
+            result["status"] = result["effective_status"] = "PAUSED"
+            result["hierarchy"]["ad"] = {"status": "PAUSED", "effective_status": "PAUSED"}
+        return result
+
+
+@pytest.mark.asyncio
+async def test_pause_fresh_reads_target_immediately_before_mutation_and_founder_change_wins(engine):
+    claim = await _scale_claim(engine, DecisionKind.PAUSE)
+    meta = FounderChangedBeforePause()
+
+    result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
+
+    assert result.status is ExecutionStatus.CANCELLED
+    assert result.reason == "live_state_changed"
+    assert meta.calls == ["read_source", "read_source"]
+
+
+class FounderChangedBeforeScale(BudgetMeta):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    async def read_source(self, campaign_id, ids):
+        self.reads += 1
+        result = await super().read_source(campaign_id, ids)
+        if self.reads == 2:
+            result["budget_cents"] = 1100
+        return result
+
+
+@pytest.mark.asyncio
+async def test_scale_fresh_reads_budget_immediately_before_mutation(engine):
+    claim = await _scale_claim(engine)
+    meta = FounderChangedBeforeScale()
+
+    result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
+
+    assert result.status is ExecutionStatus.CANCELLED
+    assert result.reason == "live_state_changed"
+    assert meta.calls == ["read_source", "read_source"]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_active"),
+    [
+        ("after_nl", {"NL"}),
+        ("after_fr", {"NL", "FR"}),
+        ("during_en", {"NL", "FR"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_production_adapter_fences_each_locale_activation_stage(
+    monkeypatch, failure_stage, expected_active
+):
+    adapter = MetaExecutionAdapter.__new__(MetaExecutionAdapter)
+    adapter.config = object()
+    adapter._drafts = {"50": SimpleNamespace(daily_budget_eur=10)}
+    adapter._identities = {}
+    active = set()
+
+    async def read_replacement(*args, **kwargs):
+        observed = {
+            key: {
+                "status": "ACTIVE" if key in active else "PAUSED",
+                "effective_status": "ACTIVE" if key in active else "PAUSED",
+            }
+            for key in ("NL", "FR", "EN")
+        }
+        result = {f"ad:{key}": value for key, value in observed.items()}
+        hierarchy = "ACTIVE" if active else "PAUSED"
+        result["campaign"] = {"status": hierarchy, "effective_status": hierarchy}
+        result["ad_set"] = {
+            "status": hierarchy,
+            "effective_status": hierarchy,
+            "daily_budget": 1000,
+        }
+        return result
+
+    adapter.read_replacement = read_replacement
+
+    async def activate(*args, **kwargs):
+        active.add("NL")
+        if failure_stage == "after_nl":
+            raise RuntimeError("after NL")
+        return {"status": "ACTIVE"}
+
+    async def set_status(config, ad_id, status):
+        locale = {"72": "FR", "73": "EN"}[ad_id]
+        if failure_stage == "during_en" and locale == "EN":
+            raise RuntimeError("during EN")
+        active.add(locale)
+        if failure_stage == "after_fr" and locale == "FR":
+            raise RuntimeError("after FR")
+        return {"status": status}
+
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.activate_meta_ad", activate)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_ad_status", set_status)
+
+    with pytest.raises(RuntimeError):
+        await adapter.activate_replacement("50", "60", {"NL": "71", "FR": "72", "EN": "73"})
+    assert active == expected_active
+
+
+class CheckpointProxy:
+    def __init__(self, target, checkpoint, *, transient=False):
+        self.target = target
+        self.checkpoint = checkpoint
+        self.transient = transient
+        self.counts = {}
+
+    def __getattr__(self, name):
+        value = getattr(self.target, name)
+        if not callable(value):
+            return value
+
+        async def call(*args, **kwargs):
+            self.counts[name] = self.counts.get(name, 0) + 1
+            if f"{name}:{self.counts[name]}" == self.checkpoint:
+                if self.transient:
+                    raise RateLimited(f"checkpoint {self.checkpoint}")
+                raise RuntimeError(f"checkpoint {self.checkpoint}")
+            return await value(*args, **kwargs)
+
+        return call
+
+
+@pytest.mark.parametrize(
+    ("kind", "checkpoint", "transient"),
+    [
+        (DecisionKind.PAUSE, "pause_source:1", False),
+        (DecisionKind.PAUSE, "read_source:3", True),
+        (DecisionKind.SCALE, "set_budget:1", False),
+        (DecisionKind.SCALE, "read_source:3", True),
+        (DecisionKind.REALLOCATE, "set_budget:1", False),
+        (DecisionKind.REALLOCATE, "set_budget:2", False),
+        (DecisionKind.REALLOCATE, "read_allocation:5", True),
+        (DecisionKind.REALLOCATE, "read_allocation:6", True),
+        (DecisionKind.REPLACE, "create_paused:1", False),
+        (DecisionKind.REPLACE, "read_replacement:1", True),
+        (DecisionKind.REPLACE, "read_replacement:2", True),
+        (DecisionKind.REPLACE, "activate_replacement:1", False),
+        (DecisionKind.REPLACE, "read_replacement:3", True),
+        (DecisionKind.REPLACE, "pause_source:1", False),
+        (DecisionKind.REPLACE, "read_source:4", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_execute_claim_checkpoint_inventory_reconciles_every_attempted_write(
+    engine, kind, checkpoint, transient
+):
+    if kind is DecisionKind.REPLACE:
+        claim = await _public_replace_claim(engine)
+        base = ReplacementMeta()
+        builder = ReplacementBuilder()
+    else:
+        claim = await _scale_claim(engine, kind)
+        base = ReallocationMeta() if kind is DecisionKind.REALLOCATE else BudgetMeta()
+        builder = None
+    meta = CheckpointProxy(base, checkpoint, transient=transient)
+
+    result = await execute_claim(engine, _settings(), meta, builder, claim, NOW)
+
+    assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,failure_category,audit FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "reconciliation_required"
+    assert row["failure_category"] in {
+        "external_state_unproven",
+        "reallocation_rollback_unproven",
+        "replacement_rollback_unproven",
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [DecisionKind.PAUSE, DecisionKind.SCALE, DecisionKind.REALLOCATE, DecisionKind.REPLACE],
+)
+@pytest.mark.asyncio
+async def test_public_execute_claim_final_audit_checkpoint_never_stale_finishes(
+    engine, monkeypatch, kind
+):
+    if kind is DecisionKind.REPLACE:
+        claim = await _public_replace_claim(engine)
+        meta, builder = ReplacementMeta(), ReplacementBuilder()
+    else:
+        claim = await _scale_claim(engine, kind)
+        meta = ReallocationMeta() if kind is DecisionKind.REALLOCATE else BudgetMeta()
+        builder = None
+    original = finish_action
+
+    async def lose_at_success(db, current, **kwargs):
+        if kwargs.get("status") is ActionStatus.SUCCEEDED:
+            return False
+        return await original(db, current, **kwargs)
+
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.finish_action", lose_at_success)
+
+    result = await execute_claim(engine, _settings(), meta, builder, claim, NOW)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert result.reason == "lease_lost"
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT status,after_state FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "executing"
+    assert row["after_state"] == {}

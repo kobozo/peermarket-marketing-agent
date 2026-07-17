@@ -81,6 +81,10 @@ class _AmbiguousExternalWrite(RuntimeError):
     """An external mutation failed without proving whether Meta applied it."""
 
 
+class _PreconditionChanged(RuntimeError):
+    """The authoritative Meta target changed after policy preflight."""
+
+
 class _SagaFailure(RuntimeError):
     def __init__(self, cause: BaseException, rollback_result: Any) -> None:
         self.cause = cause
@@ -192,15 +196,38 @@ class MetaExecutionAdapter:
         )
 
     async def activate_replacement(
-        self, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+        self,
+        campaign_id: str,
+        ad_set_id: str,
+        ad_ids: Mapping[str, str],
+        *,
+        engine: Any | None = None,
+        claim: Any | None = None,
     ) -> Any:
+        async def fence(expected_active: set[str]) -> None:
+            if engine is not None and claim is not None:
+                await _renew_action(engine, claim)
+            observed = await self.read_replacement(campaign_id, ad_set_id, ad_ids)
+            if observed.get("ad_set", {}).get("daily_budget") != (
+                self._drafts[campaign_id].daily_budget_eur * 100
+            ):
+                raise RuntimeError("replacement_activation_precondition_changed")
+            for locale in ("NL", "FR", "EN"):
+                wanted = "ACTIVE" if locale in expected_active else "PAUSED"
+                item = observed.get(f"ad:{locale}", {})
+                if item.get("status") != wanted:
+                    raise RuntimeError("replacement_activation_precondition_changed")
+
+        await fence(set())
         first = ad_ids["NL"]
         result = await activate_meta_ad(
             self.config,
             {"campaign_id": campaign_id, "ad_set_id": ad_set_id, "ad_id": first},
         )
-        for locale in ("FR", "EN"):
-            await set_meta_ad_status(self.config, ad_ids[locale], "ACTIVE")
+        await fence({"NL"})
+        await set_meta_ad_status(self.config, ad_ids["FR"], "ACTIVE")
+        await fence({"NL", "FR"})
+        await set_meta_ad_status(self.config, ad_ids["EN"], "ACTIVE")
         return result
 
     async def pause_replacement(
@@ -340,9 +367,10 @@ async def _external(
 async def _write_external(
     db_engine: Any, execution_claim: Any, target: object, name: str, *args: Any, **kwargs: Any
 ) -> Any:
-    _WRITE_STARTED.set(True)
     try:
-        return await _external(db_engine, execution_claim, target, name, *args, **kwargs)
+        await _renew_action(db_engine, execution_claim)
+        _WRITE_STARTED.set(True)
+        return await _call(target, name, *args, **kwargs)
     except asyncio.CancelledError:
         raise
     except BaseException as exc:
@@ -611,6 +639,17 @@ async def _replace(
     draft = await _call(
         builder, "build", engine=engine, settings=settings, claim=claim, source=frozen_source
     )
+    fresh_source = await _external(
+        engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
+    )
+    frozen_basis = claim.decision.evidence.get("frozen_basis") or {}
+    if not _source_ok(
+        fresh_source,
+        claim.campaign_id,
+        frozen_basis.get("external_ids") or _source_ids(source),
+        frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
+    ):
+        raise _PreconditionChanged("live_state_changed")
     ids = None
     compensated = False
     rollback = None
@@ -623,16 +662,30 @@ async def _replace(
         budget_cents = frozen_source.daily_budget_eur * 100
         if not _bundle_verified(paused, False, budget_cents):
             raise RuntimeError("replacement_not_paused")
-        await _write_external(engine, claim, meta, "activate_replacement", **ids)
+        paused = await _external(engine, claim, meta, "read_replacement", **ids)
+        if not _bundle_verified(paused, False, budget_cents):
+            raise RuntimeError("replacement_activation_precondition_changed")
+        await _write_external(
+            engine, claim, meta, "activate_replacement", **ids, engine=engine, claim=claim
+        )
         active = await _external(engine, claim, meta, "read_replacement", **ids)
         if not _bundle_verified(active, True, budget_cents):
             raise RuntimeError("replacement_not_active")
         try:
+            fresh_source = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
+            )
+            if not _source_ok(
+                fresh_source,
+                claim.campaign_id,
+                frozen_basis.get("external_ids") or _source_ids(source),
+                frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
+            ):
+                raise RuntimeError("replacement_source_precondition_changed")
             await _write_external(engine, claim, meta, "pause_source", source=source)
             source_after = await _external(
                 engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
             )
-            frozen_basis = claim.decision.evidence.get("frozen_basis") or {}
             if not _paused_source_ok(
                 source_after,
                 frozen_basis.get("external_ids") or _source_ids(source),
@@ -642,7 +695,15 @@ async def _replace(
         except BaseException as source_pause_error:
             compensated = True
             try:
-                mutation = await _write_external(engine, claim, meta, "pause_replacement", **ids)
+                rollback_before = await _external(engine, claim, meta, "read_replacement", **ids)
+                if _bundle_verified(rollback_before, False, budget_cents):
+                    mutation = None
+                elif _bundle_verified(rollback_before, True, budget_cents):
+                    mutation = await _write_external(
+                        engine, claim, meta, "pause_replacement", **ids
+                    )
+                else:
+                    raise RuntimeError("replacement_rollback_precondition_changed")
                 observed = await _external(engine, claim, meta, "read_replacement", **ids)
             except Exception as rollback_error:
                 rollback = {"error": type(rollback_error).__name__}
@@ -661,9 +722,21 @@ async def _replace(
         if not compensated:
             try:
                 if ids is not None:
-                    rollback = await _write_external(
-                        engine, claim, meta, "pause_replacement", **ids
+                    rollback_before = await _external(
+                        engine, claim, meta, "read_replacement", **ids
                     )
+                    if _bundle_verified(
+                        rollback_before, False, frozen_source.daily_budget_eur * 100
+                    ):
+                        rollback = None
+                    elif _bundle_verified(
+                        rollback_before, True, frozen_source.daily_budget_eur * 100
+                    ):
+                        rollback = await _write_external(
+                            engine, claim, meta, "pause_replacement", **ids
+                        )
+                    else:
+                        raise RuntimeError("replacement_rollback_precondition_changed")
                     verified = await _external(engine, claim, meta, "read_replacement", **ids)
                     verified_safe = _bundle_verified(
                         verified, False, frozen_source.daily_budget_eur * 100
@@ -764,6 +837,13 @@ async def execute_claim(
                 return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before_state=before)
             return ExecutionResult(ExecutionStatus.CANCELLED, reason, before_state=before)
         if claim.kind is DecisionKind.PAUSE:
+            fresh = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+            )
+            if not _source_ok(
+                fresh, claim.campaign_id, _ids(publication), publication["approved_budget_cents"]
+            ):
+                raise _PreconditionChanged("live_state_changed")
             await _write_external(engine, claim, meta, "pause_source", source=before)
             after = await _external(
                 engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
@@ -780,6 +860,16 @@ async def execute_claim(
                 raise RuntimeError("pause_verification_failed")
             budget_event = None
         elif claim.kind is DecisionKind.SCALE:
+            fresh = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+            )
+            if not _source_ok(
+                fresh,
+                claim.campaign_id,
+                _ids(publication),
+                claim.decision.old_budget_cents,
+            ):
+                raise _PreconditionChanged("live_state_changed")
             await _write_external(
                 engine,
                 claim,
@@ -827,6 +917,19 @@ async def execute_claim(
                         raise RuntimeError("reallocation_live_state_changed")
                 for label in ("loser", "winner"):
                     item = claim.decision.allocations[label]
+                    fresh = await _external(engine, claim, meta, "read_allocation", allocation=item)
+                    if (
+                        any(
+                            fresh.get(key) != item[key]
+                            for key in ("campaign_id", "variant_id", "ad_set_id", "ad_id")
+                        )
+                        or fresh.get("ad_set", {}).get("daily_budget") != item["old_budget_cents"]
+                        or fresh.get("ad_set", {}).get("status") != "ACTIVE"
+                        or fresh.get("ad_set", {}).get("effective_status") not in _ACTIVE_EFFECTIVE
+                        or fresh.get("ad", {}).get("status") != "ACTIVE"
+                        or fresh.get("ad", {}).get("effective_status") not in _ACTIVE_EFFECTIVE
+                    ):
+                        raise _PreconditionChanged("reallocation_live_state_changed")
                     allocation_writes.append(label)
                     await _write_external(
                         engine,
@@ -857,6 +960,15 @@ async def execute_claim(
                 for label in allocation_writes:
                     item = claim.decision.allocations[label]
                     try:
+                        current = await _external(
+                            engine, claim, meta, "read_allocation", allocation=item
+                        )
+                        current_budget = current.get("ad_set", {}).get("daily_budget")
+                        if current_budget == item["old_budget_cents"]:
+                            rollback[label] = {"mutation": None, "verified": current}
+                            continue
+                        if current_budget != item["new_budget_cents"]:
+                            raise RuntimeError("reallocation_rollback_unproven")
                         mutation = await _write_external(
                             engine,
                             claim,
@@ -912,6 +1024,17 @@ async def execute_claim(
     except BaseException as exc:
         if isinstance(exc, asyncio.CancelledError):
             raise
+        if isinstance(exc, _PreconditionChanged):
+            finalized = await finish_action(
+                engine,
+                claim,
+                status=ActionStatus.CANCELLED,
+                before_state={"observed": before, "intent": _intent(claim)},
+                failure_category=str(exc),
+            )
+            if finalized:
+                return ExecutionResult(ExecutionStatus.CANCELLED, str(exc), before)
+            return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before)
         if not _WRITE_STARTED.get() and _transient(exc):
             retry_at = now + timedelta(minutes=5)
             released = await release_action(
