@@ -517,6 +517,147 @@ async def test_long_meta_call_heartbeats_action_and_attempt_without_task_leak(
     create.assert_awaited_once()
 
 
+async def test_completed_bundle_reread_rejects_claim_takeover_during_meta_call(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+
+    async def create_completed_bundle(**kwargs):
+        values = {
+            "campaign_id": "new-c",
+            "ad_set_id": "new-as",
+            **{f"creative_id:{x}": f"cr-{x}" for x in ("NL", "FR", "EN")},
+            **{f"ad_id:{x}": f"ad-{x}" for x in ("NL", "FR", "EN")},
+        }
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        return MetaReplacementBundleResult(
+            "new-c",
+            "new-as",
+            {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager",
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused",
+        create_completed_bundle,
+    )
+    await publish_replacement_paused(
+        engine=engine, settings=_make_settings(), claim=claim, draft=draft
+    )
+
+    claim_taken_over = False
+    from peermarket_agent import meta_pipeline
+
+    real_require_claim = meta_pipeline._require_live_replacement_claim
+
+    async def require_current_claim(*args, **kwargs):
+        if claim_taken_over:
+            raise RuntimeError("replacement action ownership was lost after claim takeover")
+        await real_require_claim(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline._require_live_replacement_claim",
+        require_current_claim,
+    )
+    reread_started = asyncio.Event()
+    takeover_complete = asyncio.Event()
+
+    async def blocking_reread(*args, **kwargs):
+        reread_started.set()
+        await takeover_complete.wait()
+        return {
+            "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+            "ad_set": {
+                "status": "PAUSED",
+                "effective_status": "PAUSED",
+                "daily_budget": 1000,
+            },
+            **{
+                f"ad:{locale}": {"status": "PAUSED", "effective_status": "PAUSED"}
+                for locale in ("NL", "FR", "EN")
+            },
+        }
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses",
+        blocking_reread,
+    )
+    old_worker = asyncio.create_task(
+        publish_replacement_paused(
+            engine=engine, settings=_make_settings(), claim=claim, draft=draft
+        )
+    )
+    await reread_started.wait()
+    claim_taken_over = True
+    takeover_complete.set()
+    with pytest.raises(RuntimeError, match="ownership|live paused validation"):
+        await old_worker
+
+
+class _FatalPublicationError(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("failure_phase", ["create", "verify"])
+async def test_publication_heartbeat_stops_for_arbitrary_baseexception(
+    monkeypatch, engine_with_meta_draft, failure_phase
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline._HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    renewals = 0
+    from peermarket_agent import meta_pipeline
+
+    real_renew = meta_pipeline.renew_replacement_leases
+
+    async def counted_renew(*args, **kwargs):
+        nonlocal renewals
+        renewals += 1
+        return await real_renew(*args, **kwargs)
+
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.renew_replacement_leases", counted_renew)
+
+    async def create(**kwargs):
+        await asyncio.sleep(0.03)
+        if failure_phase == "create":
+            raise _FatalPublicationError("fatal create")
+        return MetaReplacementBundleResult(
+            "new-c",
+            "new-as",
+            {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager",
+        )
+
+    async def verify(*args, **kwargs):
+        if failure_phase == "verify":
+            await asyncio.sleep(0.03)
+            raise _FatalPublicationError("fatal verify")
+        raise AssertionError("verify should not run")
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses", verify
+    )
+    before_tasks = set(asyncio.all_tasks())
+    with pytest.raises(_FatalPublicationError, match=f"fatal {failure_phase}"):
+        await publish_replacement_paused(
+            engine=engine, settings=_make_settings(), claim=claim, draft=draft
+        )
+    renewals_after_failure = renewals
+    await asyncio.sleep(0.04)
+    assert renewals == renewals_after_failure
+    assert not (set(asyncio.all_tasks()) - before_tasks)
+
+
 async def test_live_budget_mismatch_marks_action_and_attempt_reconciliation(
     monkeypatch, engine_with_meta_draft
 ):

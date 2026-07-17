@@ -366,6 +366,7 @@ async def publish_replacement_paused(
             if key.startswith("ad_id:")
         }
         try:
+            await _require_live_replacement_claim(engine, claim, draft)
             observed = await get_meta_replacement_bundle_statuses(
                 _meta_config(settings),
                 progress["campaign_id"],
@@ -375,6 +376,7 @@ async def publish_replacement_paused(
             valid = set(ad_ids) == {"NL", "FR", "EN"} and _is_verified_paused_bundle(
                 observed, draft.daily_budget_eur * 100
             )
+            await _require_live_replacement_claim(engine, claim, draft)
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -421,142 +423,135 @@ async def publish_replacement_paused(
     heartbeat, ownership_lost = _start_replacement_heartbeat(
         engine, claim, attempt["id"], attempt_token
     )
+    primary_error: BaseException | None = None
     try:
         screenshot = await screenshot_url(
             draft.landing_page_url, viewport_width=1080, viewport_height=1080
         )
-    except BaseException:
-        await _stop_heartbeat(heartbeat)
-        raise
-    if ownership_lost.is_set():
-        await _stop_heartbeat(heartbeat)
-        raise RuntimeError("replacement lease ownership was lost")
-    image = screenshot
-    try:
+        if ownership_lost.is_set():
+            raise RuntimeError("replacement lease ownership was lost")
+        image = screenshot
         try:
             image = await edit_image(
                 api_key=settings.gemini_api_key, image_bytes=screenshot, prompt=_BRAND_FRAME_PROMPT
             )
         except (ImageEditDisabled, ImageEditError):
             image = screenshot
-    except BaseException:
-        await _stop_heartbeat(heartbeat)
-        raise
-    ctas = {
-        "Learn More": "LEARN_MORE",
-        "Sign Up": "SIGN_UP",
-        "Shop Now": "SHOP_NOW",
-        "Get Started": "GET_STARTED",
-    }
+        ctas = {
+            "Learn More": "LEARN_MORE",
+            "Sign Up": "SIGN_UP",
+            "Shop Now": "SHOP_NOW",
+            "Get Started": "GET_STARTED",
+        }
 
-    async def persist_progress(key: str, value: str) -> None:
-        if ownership_lost.is_set():
-            raise RuntimeError("replacement lease ownership was lost")
-        async with engine.begin() as conn:
-            result = await conn.execute(
-                text(
-                    "UPDATE autonomous_replacement_publications r SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE r.id=:id AND r.lease_owner=:owner AND r.lease_token=:token AND r.lease_expires_at>NOW() AND r.state IN ('creating','reconciliation_required') AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=r.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
-                ),
-                {
-                    "id": attempt["id"],
-                    "owner": claim.lease_owner,
-                    "token": attempt_token,
-                    "claim_token": claim.lease_token,
-                    "key": key,
-                    "value": value,
-                },
-            )
-            if result.rowcount != 1:
-                raise RuntimeError("replacement publication progress persistence failed")
-
-    try:
-        result = await create_meta_replacement_bundle_paused(
-            config=_meta_config(settings),
-            name=f"PeerMarket autonomous draft #{draft.id}",
-            locales={
-                locale: MetaBundleLocale(
-                    item.primary_text, item.headline, item.description, ctas[item.cta_label], image
+        async def persist_progress(key: str, value: str) -> None:
+            if ownership_lost.is_set():
+                raise RuntimeError("replacement lease ownership was lost")
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications r SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE r.id=:id AND r.lease_owner=:owner AND r.lease_token=:token AND r.lease_expires_at>NOW() AND r.state IN ('creating','reconciliation_required') AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=r.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
+                    ),
+                    {
+                        "id": attempt["id"],
+                        "owner": claim.lease_owner,
+                        "token": attempt_token,
+                        "claim_token": claim.lease_token,
+                        "key": key,
+                        "value": value,
+                    },
                 )
-                for locale, item in draft.locales.items()
-            },
-            landing_page_url=draft.landing_page_url,
-            audience_profile_key=draft.audience_profile_key,
-            daily_budget_eur=draft.daily_budget_eur,
-            progress=attempt["progress"],
-            persist_progress=persist_progress,
-        )
-    except asyncio.CancelledError:
-        await _stop_heartbeat(heartbeat)
-        raise
-    except Exception as exc:
-        await _stop_heartbeat(heartbeat)
-        recovered_ids = exc.resource_ids if isinstance(exc, MetaAdsError) else {}
-        async with engine.begin() as conn:
-            failed = await conn.execute(
-                text(
-                    "UPDATE autonomous_replacement_publications SET "
-                    "state='reconciliation_required', progress=progress || CAST(:ids AS JSONB), "
-                    "failure_category='meta_bundle_creation', lease_owner=NULL, lease_token=NULL, "
-                    "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_owner=:owner "
-                    "AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required') "
-                    "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
-                ),
-                {
-                    "id": attempt["id"],
-                    "owner": claim.lease_owner,
-                    "token": attempt_token,
-                    "claim_token": claim.lease_token,
-                    "ids": json.dumps(recovered_ids),
+                if result.rowcount != 1:
+                    raise RuntimeError("replacement publication progress persistence failed")
+
+        try:
+            result = await create_meta_replacement_bundle_paused(
+                config=_meta_config(settings),
+                name=f"PeerMarket autonomous draft #{draft.id}",
+                locales={
+                    locale: MetaBundleLocale(
+                        item.primary_text,
+                        item.headline,
+                        item.description,
+                        ctas[item.cta_label],
+                        image,
+                    )
+                    for locale, item in draft.locales.items()
                 },
+                landing_page_url=draft.landing_page_url,
+                audience_profile_key=draft.audience_profile_key,
+                daily_budget_eur=draft.daily_budget_eur,
+                progress=attempt["progress"],
+                persist_progress=persist_progress,
             )
-            if failed.rowcount != 1:
-                raise RuntimeError("replacement publication ownership was lost") from exc
-        if not await require_reconciliation(engine, claim, failure_category="meta_bundle_creation"):
-            raise RuntimeError("replacement action ownership was lost") from exc
-        raise
-    try:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            recovered_ids = exc.resource_ids if isinstance(exc, MetaAdsError) else {}
+            async with engine.begin() as conn:
+                failed = await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications SET "
+                        "state='reconciliation_required', progress=progress || CAST(:ids AS JSONB), "
+                        "failure_category='meta_bundle_creation', lease_owner=NULL, lease_token=NULL, "
+                        "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_owner=:owner "
+                        "AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required') "
+                        "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
+                    ),
+                    {
+                        "id": attempt["id"],
+                        "owner": claim.lease_owner,
+                        "token": attempt_token,
+                        "claim_token": claim.lease_token,
+                        "ids": json.dumps(recovered_ids),
+                    },
+                )
+                if failed.rowcount != 1:
+                    raise RuntimeError("replacement publication ownership was lost") from exc
+            if not await require_reconciliation(
+                engine, claim, failure_category="meta_bundle_creation"
+            ):
+                raise RuntimeError("replacement action ownership was lost") from exc
+            raise
+        try:
+            if ownership_lost.is_set():
+                raise RuntimeError("replacement lease ownership was lost")
+            observed = await get_meta_replacement_bundle_statuses(
+                _meta_config(settings), result.campaign_id, result.ad_set_id, result.ad_ids
+            )
+            valid = _is_verified_paused_bundle(observed, draft.daily_budget_eur * 100)
+            if result.status != "PAUSED" or not valid:
+                raise RuntimeError(
+                    "live Meta replacement bundle is not exactly paused at frozen budget"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            async with engine.begin() as conn:
+                reconciled = await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications SET state='reconciliation_required', "
+                        "failure_category='post_create_validation', lease_owner=NULL, lease_token=NULL, "
+                        "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_owner=:owner "
+                        "AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required') "
+                        "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
+                    ),
+                    {
+                        "id": attempt["id"],
+                        "owner": claim.lease_owner,
+                        "token": attempt_token,
+                        "claim_token": claim.lease_token,
+                    },
+                )
+                if reconciled.rowcount != 1:
+                    raise RuntimeError("replacement publication ownership was lost") from exc
+            if not await require_reconciliation(
+                engine, claim, failure_category="post_create_validation"
+            ):
+                raise RuntimeError("replacement action ownership was lost") from exc
+            raise
         if ownership_lost.is_set():
             raise RuntimeError("replacement lease ownership was lost")
-        observed = await get_meta_replacement_bundle_statuses(
-            _meta_config(settings), result.campaign_id, result.ad_set_id, result.ad_ids
-        )
-        valid = _is_verified_paused_bundle(observed, draft.daily_budget_eur * 100)
-        if result.status != "PAUSED" or not valid:
-            raise RuntimeError(
-                "live Meta replacement bundle is not exactly paused at frozen budget"
-            )
-    except asyncio.CancelledError:
-        await _stop_heartbeat(heartbeat)
-        raise
-    except Exception as exc:
-        await _stop_heartbeat(heartbeat)
-        async with engine.begin() as conn:
-            reconciled = await conn.execute(
-                text(
-                    "UPDATE autonomous_replacement_publications SET state='reconciliation_required', "
-                    "failure_category='post_create_validation', lease_owner=NULL, lease_token=NULL, "
-                    "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_owner=:owner "
-                    "AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required') "
-                    "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
-                ),
-                {
-                    "id": attempt["id"],
-                    "owner": claim.lease_owner,
-                    "token": attempt_token,
-                    "claim_token": claim.lease_token,
-                },
-            )
-            if reconciled.rowcount != 1:
-                raise RuntimeError("replacement publication ownership was lost") from exc
-        if not await require_reconciliation(
-            engine, claim, failure_category="post_create_validation"
-        ):
-            raise RuntimeError("replacement action ownership was lost") from exc
-        raise
-    if ownership_lost.is_set():
-        await _stop_heartbeat(heartbeat)
-        raise RuntimeError("replacement lease ownership was lost")
-    try:
         await persist_progress("ads_manager_url", result.ads_manager_url)
         async with engine.begin() as conn:
             finalized = await conn.execute(
@@ -604,8 +599,16 @@ async def publish_replacement_paused(
             dict(result.ad_ids),
             result.ads_manager_url,
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        await _stop_heartbeat(heartbeat)
+        try:
+            await _stop_heartbeat(heartbeat)
+        except BaseException:
+            if primary_error is None:
+                raise
+            log.exception("meta_pipeline.replacement_heartbeat_cleanup_failed")
 
 
 async def _refuse_terminal_replacement(
