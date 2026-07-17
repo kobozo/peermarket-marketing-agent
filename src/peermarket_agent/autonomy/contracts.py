@@ -30,6 +30,15 @@ class _ImmutableMapping(Mapping[str, Any]):
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Mapping) and dict(self.items()) == dict(other.items())
 
+    def __or__(self, other: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(self) | dict(other)
+
+    def __ror__(self, other: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(other) | dict(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_ImmutableMapping":
+        return self
+
     def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("frozen evidence cannot be mutated")
 
@@ -55,6 +64,9 @@ class _ImmutableSequence(Sequence[Any]):
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Sequence) and tuple(self) == tuple(other)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_ImmutableSequence":
+        return self
 
     def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("frozen evidence cannot be mutated")

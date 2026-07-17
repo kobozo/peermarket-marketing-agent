@@ -269,6 +269,7 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
             if not isinstance(inputs, dict) or inputs.get("schema") != "autonomy-inputs/v1":
                 inputs = _canonical_inputs(row, campaign_rows)
             experiment_id = str(_setting(settings, "meta_autonomy_experiment_id", "") or "")
+            validated_experiment_id = None
             if experiment_id:
                 experiment_variants = await _persisted_hook_variants(
                     engine, experiment_id, row, performance
@@ -276,6 +277,7 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                 if experiment_variants is not None:
                     inputs = dict(inputs)
                     inputs["variants"] = experiment_variants
+                    validated_experiment_id = experiment_id
             variants = inputs["variants"]
             source = inputs["replacement_source"]
             publications = [
@@ -339,6 +341,7 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                 now=now,
                 allow_replacement=source is not None,
                 reallocation=inputs["reallocation"],
+                experiment_id=validated_experiment_id,
             )
             eligible.append({"draft_id": row["draft_id"], "decision": decision})
         except Exception:
