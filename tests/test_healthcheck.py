@@ -42,7 +42,7 @@ async def test_healthz_remains_available_while_media_task_runs(monkeypatch):
         "files": [{"id": "F123", "name": "recording.mp4", "mimetype": "video/mp4"}],
     }
 
-    await bridge_app.handle_im(event=event, say=AsyncMock())
+    await bridge_app.handle_im(event=event, say=AsyncMock(), founder_user_id="U123")
     await started.wait()
     transport = httpx.ASGITransport(app=build_healthz_api())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

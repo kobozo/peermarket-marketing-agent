@@ -34,7 +34,7 @@ async def test_run_draft_tiktok_persists_high_score_draft(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats het nu"}',
+                text='{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", "body": "Verkoop veilig op PeerMarket.", "cta": "Plaats het nu", "script": "Verkoop lokaal en veilig via PeerMarket.", "shots": ["Toon het item", "Open PeerMarket"], "on_screen_text": ["Veilig lokaal verkopen"], "recording_notes": "Film verticaal bij daglicht."}',
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
@@ -80,7 +80,7 @@ async def test_run_draft_rejects_low_score_draft_does_not_persist(prepared_db):
     fake_claude.complete = AsyncMock(
         side_effect=[
             ClaudeResponse(
-                text='{"hook": "Buy everything today with this amazing sales offer", "body": "amazing offer!!!", "cta": "buy it now"}',
+                text='{"hook": "Buy everything today with this amazing sales offer", "body": "amazing offer!!!", "cta": "buy it now", "script": "Buy everything today with this amazing sales offer.", "shots": ["Show the item", "Open PeerMarket"], "on_screen_text": ["Amazing offer"], "recording_notes": "Film vertically in daylight."}',
                 input_tokens=200,
                 output_tokens=40,
                 model="claude-sonnet-4-6",
