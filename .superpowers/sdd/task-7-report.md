@@ -11,4 +11,6 @@ Rejection remediation makes blank `gh run list` polls true zero-match retries (c
 
 Final remediation aligns the gate with every recognized neutral and qualified hook-policy reason, rejects unknown reasons, projects only frozen `policy_limits`, and links the durable audit to the current decision through its decision ID/idempotency key plus matching experiment, ordered variants, and evidence window. Older campaign audits cannot satisfy the SQL lookup or workflow predicate.
 
+The policy-reason classifier now enumerates every OBSERVE reason emitted by `policy.py`, including validation/history/window, delivery diagnosis, cooldown, incomplete experiment, replacement/reallocation limits, and all scale headroom/budget/allocation guards. The non-emitted `technical_delivery_failure` label was removed; both real dynamic delivery diagnoses are covered explicitly.
+
 Verification: `uv run pytest -q tests/test_deploy_workflow.py` (6 passed), YAML loaded by the test suite, and `git diff --check` clean.

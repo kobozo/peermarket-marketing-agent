@@ -20,13 +20,29 @@ from peermarket_agent.meta_insights import fetch_meta_insights
 
 _CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 _NEUTRAL_EXPERIMENT_REASONS = {
+    "invalid_snapshot",
+    "invalid_history",
+    "incomplete_window",
     "insufficient_evidence",
     "neutral_tie",
     "maximum_test_duration_without_qualified_comparison",
     "stale_snapshot",
     "missing_attribution",
+    "no_delivery_grace_period",
+    "diagnose_no_delivery",
+    "diagnose_rejected_or_error",
+    "delivery_unavailable",
+    "mutation_cooldown",
+    "incomplete_hook_experiment",
     "not_comparable",
-    "technical_delivery_failure",
+    "invalid_reallocation",
+    "missing_replacement_source",
+    "replacement_limit",
+    "increase_limit",
+    "missing_budget_history",
+    "absolute_budget_ceiling",
+    "increase_headroom_exhausted",
+    "invalid_campaign_allocations",
 }
 _QUALIFIED_EXPERIMENT_REASONS = {
     "proven_loser_replace",
