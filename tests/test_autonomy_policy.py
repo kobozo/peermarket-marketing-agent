@@ -135,6 +135,54 @@ def test_exact_evidence_floors_are_eligible(limits):
     assert decision.evidence["source"] == _replacement_source()
 
 
+def _hook_experiment_snapshot(registrations=(10, 20, 15)):
+    experiment_id = "draft-156-hook-test"
+    return _snapshot(
+        experiment_id=experiment_id,
+        variants=[
+            _variant(str(number), value) | {"variant_id": f"{experiment_id}:{number:02}"}
+            for number, value in enumerate(registrations, 1)
+        ],
+    )
+
+
+def test_hook_experiment_waits_neutrally_until_every_variant_meets_floors(limits):
+    snapshot = _hook_experiment_snapshot()
+    snapshot["variants"][2]["registrations"] = 9
+    decision = evaluate_campaign(snapshot, (), limits, NOW)
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == "insufficient_evidence"
+    assert decision.evidence["experiment_id"] == "draft-156-hook-test"
+
+
+def test_hook_experiment_winner_and_loser_are_order_independent(limits):
+    snapshot = _hook_experiment_snapshot((10, 30, 20))
+    first = evaluate_campaign(snapshot, (), limits, NOW)
+    snapshot["variants"].reverse()
+    second = evaluate_campaign(snapshot, (), limits, NOW)
+    assert first == second
+    assert first.evidence["winner_variant_id"].endswith(":02")
+    assert first.evidence["loser_variant_id"].endswith(":01")
+
+
+def test_hook_experiment_tie_and_stale_attribution_remain_neutral(limits):
+    tie = evaluate_campaign(_hook_experiment_snapshot((10, 10, 10)), (), limits, NOW)
+    stale_snapshot = _hook_experiment_snapshot((10, 30, 20))
+    stale_snapshot["captured_at"] = NOW - timedelta(hours=3)
+    stale = evaluate_campaign(stale_snapshot, (), limits, NOW)
+    assert tie.kind is stale.kind is DecisionKind.OBSERVE
+    assert tie.reason == "neutral_tie"
+    assert stale.reason == "stale_snapshot"
+
+
+def test_hook_experiment_requires_exact_three_persisted_variant_ids(limits):
+    snapshot = _hook_experiment_snapshot()
+    snapshot["variants"].pop()
+    decision = evaluate_campaign(snapshot, (), limits, NOW)
+    assert decision.kind is DecisionKind.OBSERVE
+    assert decision.reason == "incomplete_hook_experiment"
+
+
 def test_qualified_replacement_without_frozen_source_observes(limits):
     assert (
         evaluate_campaign(_snapshot(replacement_source=None), (), limits, NOW).reason

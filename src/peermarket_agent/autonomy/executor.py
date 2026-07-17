@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
@@ -14,11 +14,17 @@ from typing import Any
 
 from sqlalchemy import text
 
-from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind
+from peermarket_agent.autonomy.contracts import (
+    ActionStatus,
+    DecisionKind,
+    HookExperiment,
+    HookVariant,
+)
 from peermarket_agent.autonomy.replacements import (
     LocaleCreative,
     ReplacementSource,
     build_replacement,
+    hook_experiment_meta_matrix,
 )
 from peermarket_agent.autonomy.snapshot import build_autonomy_snapshot
 from peermarket_agent.autonomy.store import (
@@ -26,6 +32,7 @@ from peermarket_agent.autonomy.store import (
     block_campaign_for_reconciliation,
     campaign_history,
     finish_action,
+    list_experiment_variants,
     release_action,
 )
 from peermarket_agent.config import Settings
@@ -33,13 +40,16 @@ from peermarket_agent.meta_ads import (
     MetaBundleLocale,
     MetaConfig,
     activate_meta_ad,
+    create_meta_hook_experiment_bundles_paused,
     get_meta_ad_statuses,
     get_meta_allocation_state,
     get_meta_budget_state,
     get_meta_replacement_bundle_statuses,
+    hook_variant_locale_urls,
     pause_meta_replacement_bundle,
     set_meta_ad_status,
     set_meta_adset_daily_budget,
+    set_meta_resource_status,
 )
 from peermarket_agent.meta_pipeline import publish_replacement_paused
 
@@ -107,6 +117,9 @@ class MetaExecutionAdapter:
         )
         self._drafts: dict[str, Any] = {}
         self._identities: dict[str, dict[str, Any]] = {}
+        self._hook_results: dict[str, Any] = {}
+        self._hook_identities: dict[str, Any] = {}
+        self._hook_landings: dict[str, str] = {}
 
     async def read_source(self, campaign_id: str, *, ids: Mapping[str, str]) -> dict[str, Any]:
         statuses = await get_meta_ad_statuses(self.config, dict(ids))
@@ -178,6 +191,232 @@ class MetaExecutionAdapter:
             },
         }
         return publication
+
+    async def create_hook_experiment_paused(
+        self,
+        *,
+        experiment: Any,
+        engine: Any,
+        claim: Any,
+        draft: Any,
+        daily_budget_eur: int,
+        audience_profile_key: str,
+        image_bytes: bytes | None = None,
+    ) -> Any:
+        """Bridge a frozen hook experiment to the guarded Meta matrix adapter."""
+        if _setting(self.settings, "meta_autonomy_shadow", True):
+            raise RuntimeError("shadow_mode")
+        async with engine.begin() as conn:
+            acquired = await conn.execute(
+                text(
+                    "INSERT INTO autonomous_replacement_publications "
+                    "(action_id,replacement_draft_id,source_draft_id,state,frozen_budget_cents,"
+                    "source_campaign_id,changed_dimension,landing_page_url,lease_owner,lease_token,lease_expires_at) "
+                    "VALUES (:action,:draft,:source,'creating',:budget,:campaign,'hook',:url,:owner,:token,NOW()+INTERVAL '5 minutes') "
+                    "ON CONFLICT (action_id) DO UPDATE SET lease_owner=EXCLUDED.lease_owner,"
+                    "lease_token=EXCLUDED.lease_token,lease_expires_at=EXCLUDED.lease_expires_at "
+                    "WHERE autonomous_replacement_publications.lease_expires_at<=NOW() OR "
+                    "autonomous_replacement_publications.lease_token=EXCLUDED.lease_token"
+                ),
+                {
+                    "action": claim.id,
+                    "draft": draft.id,
+                    "source": draft.source_draft_id,
+                    "budget": daily_budget_eur * 100,
+                    "campaign": draft.source_campaign_id,
+                    "url": experiment.landing_page_url,
+                    "owner": claim.lease_owner,
+                    "token": claim.lease_token,
+                },
+            )
+            if acquired.rowcount != 1:
+                raise RuntimeError("replacement publication is owned by another worker")
+            stored = await conn.scalar(
+                text(
+                    "SELECT progress FROM autonomous_replacement_publications "
+                    "WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token "
+                    "AND lease_expires_at>NOW() FOR UPDATE"
+                ),
+                {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
+            )
+            if stored is None:
+                raise RuntimeError("replacement publication lease ownership was lost")
+        progress = dict(stored)
+
+        async def persist(key: str, value: str) -> None:
+            await _renew_action(engine, claim)
+            async with engine.begin() as conn:
+                updated = await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications SET progress=jsonb_set(progress,ARRAY[:key],to_jsonb(CAST(:value AS TEXT)),TRUE),updated_at=NOW() WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW()"
+                    ),
+                    {
+                        "key": key,
+                        "value": value,
+                        "id": claim.id,
+                        "owner": claim.lease_owner,
+                        "token": claim.lease_token,
+                    },
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("replacement publication ownership was lost")
+
+        matrix = hook_experiment_meta_matrix(experiment, image_bytes=image_bytes)
+        self._hook_identities[experiment.experiment_id] = matrix
+        self._hook_landings[experiment.experiment_id] = experiment.landing_page_url
+        result = await create_meta_hook_experiment_bundles_paused(
+            config=self.config,
+            experiment_id=experiment.experiment_id,
+            variants=matrix,
+            landing_page_url=experiment.landing_page_url,
+            audience_profile_key=audience_profile_key,
+            daily_budget_eur=daily_budget_eur,
+            progress=progress,
+            persist_progress=persist,
+        )
+        self._hook_results[experiment.experiment_id] = result
+        return result
+
+    async def read_hook_experiment(self, experiment_id: str) -> dict[str, Any]:
+        result = self._hook_results[experiment_id]
+        return {
+            variant_id: await get_meta_replacement_bundle_statuses(
+                self.config,
+                bundle.campaign_id,
+                bundle.ad_set_id,
+                bundle.ad_ids,
+                creative_ids=bundle.creative_ids,
+                landing_page_url=hook_variant_locale_urls(
+                    self._hook_landings[experiment_id], variant_id
+                ),
+                locales=self._hook_identities[experiment_id][variant_id],
+                image_hashes=bundle.image_hashes,
+            )
+            for variant_id, bundle in result.variants.items()
+        }
+
+    async def activate_hook_experiment(
+        self, experiment_id: str, *, engine: Any, claim: Any
+    ) -> None:
+        result = self._hook_results[experiment_id]
+        first = next(iter(result.variants.values()))
+
+        async def fence() -> dict[str, Any]:
+            await _renew_hook_publication_lease(engine, claim)
+            return await self.read_hook_experiment(experiment_id)
+
+        before = await fence()
+        if any(
+            state[f"ad:{locale}"].get("status") != "PAUSED"
+            for state in before.values()
+            for locale in ("NL", "FR", "EN")
+        ):
+            raise RuntimeError("hook_experiment_activation_precondition_changed")
+        await set_meta_resource_status(self.config, "campaign", first.campaign_id, "ACTIVE")
+        adset_state = await fence()
+        if any(state["ad_set"].get("status") != "PAUSED" for state in adset_state.values()):
+            raise RuntimeError("hook_experiment_activation_precondition_changed")
+        await set_meta_resource_status(self.config, "ad_set", first.ad_set_id, "ACTIVE")
+        first_ad_state = await fence()
+        if first_ad_state[next(iter(first_ad_state))]["ad:NL"].get("status") != "PAUSED":
+            raise RuntimeError("hook_experiment_activation_precondition_changed")
+        await set_meta_ad_status(self.config, first.ad_ids["NL"], "ACTIVE")
+        for bundle in result.variants.values():
+            for _locale, ad_id in bundle.ad_ids.items():
+                if ad_id != first.ad_ids["NL"]:
+                    observed = await fence()
+                    target = next(
+                        state[f"ad:{locale}"]
+                        for variant_id, state in observed.items()
+                        for locale, candidate in result.variants[variant_id].ad_ids.items()
+                        if candidate == ad_id
+                    )
+                    if target.get("status") != "PAUSED":
+                        raise RuntimeError("hook_experiment_activation_precondition_changed")
+                    await set_meta_ad_status(self.config, ad_id, "ACTIVE")
+
+    async def pause_hook_experiment(self, experiment_id: str) -> dict[str, Any]:
+        result = self._hook_results[experiment_id]
+        return {
+            variant_id: await pause_meta_replacement_bundle(
+                self.config, bundle.campaign_id, bundle.ad_set_id, bundle.ad_ids
+            )
+            for variant_id, bundle in reversed(tuple(result.variants.items()))
+        }
+
+    async def pause_persisted_hook_experiment(self, *, engine: Any, claim: Any) -> dict[str, Any]:
+        await _renew_action(engine, claim)
+        async with engine.connect() as conn:
+            stored = await conn.scalar(
+                text(
+                    "SELECT progress FROM autonomous_replacement_publications "
+                    "WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token "
+                    "AND lease_expires_at>NOW()"
+                ),
+                {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
+            )
+        if stored is None:
+            raise RuntimeError("replacement publication lease ownership was lost")
+        progress = dict(stored)
+        campaign, ad_set = progress.get("campaign_id"), progress.get("ad_set_id")
+        if not campaign or not ad_set:
+            return {"verified": True, "mutations": {}}
+        mutations = {}
+        verified_results = []
+        prefixes = sorted(
+            {key.rsplit(":ad_id:", 1)[0] for key in progress if ":ad_id:" in key}, reverse=True
+        )
+        for prefix in prefixes:
+            await _renew_hook_publication_lease(engine, claim)
+            ad_ids = {
+                locale: progress[f"{prefix}:ad_id:{locale}"]
+                for locale in ("NL", "FR", "EN")
+                if progress.get(f"{prefix}:ad_id:{locale}")
+            }
+            variant_id = prefix.removeprefix("variant:")
+            creative_ids = {
+                locale: progress[f"{prefix}:creative_id:{locale}"]
+                for locale in ("NL", "FR", "EN")
+                if progress.get(f"{prefix}:creative_id:{locale}")
+            }
+            if set(ad_ids) != {"NL", "FR", "EN"} or set(creative_ids) != {
+                "NL",
+                "FR",
+                "EN",
+            }:
+                raise RuntimeError("partial hook bundle identity cannot be proven")
+            await get_meta_replacement_bundle_statuses(
+                self.config,
+                campaign,
+                ad_set,
+                ad_ids,
+                creative_ids=creative_ids,
+                landing_page_url=hook_variant_locale_urls(
+                    self._hook_landings[claim.decision.evidence["source"]["experiment_id"]],
+                    variant_id,
+                ),
+                locales=self._hook_identities[claim.decision.evidence["source"]["experiment_id"]][
+                    variant_id
+                ],
+            )
+            mutation = await pause_meta_replacement_bundle(self.config, campaign, ad_set, ad_ids)
+            mutations[prefix] = mutation
+            observed = mutation.get("observed") if isinstance(mutation, Mapping) else None
+            errors = mutation.get("pause_errors") if isinstance(mutation, Mapping) else None
+            statuses = observed.values() if isinstance(observed, Mapping) else ()
+            verified_results.append(
+                errors == {}
+                and bool(observed)
+                and all(
+                    item.get("status") == "PAUSED"
+                    and item.get("effective_status") in _PAUSED_EFFECTIVE
+                    for item in statuses
+                )
+            )
+        return {
+            "verified": all(verified_results),
+            "mutations": mutations,
+        }
 
     async def read_replacement(
         self,
@@ -300,6 +539,38 @@ def _replacement_source(decision: Any) -> ReplacementSource:
     )
 
 
+async def _persisted_hook_experiment(engine: Any, experiment_id: str) -> HookExperiment:
+    rows = await list_experiment_variants(engine, experiment_id)
+    if len(rows) != 9:
+        raise ValueError("persisted hook experiment is incomplete")
+    variants = []
+    for variant_id in dict.fromkeys(row.variant_id for row in rows):
+        selected = [row for row in rows if row.variant_id == variant_id]
+        first = selected[0]
+        variants.append(
+            HookVariant(
+                variant_id=variant_id,
+                experiment_id=experiment_id,
+                campaign_id=first.campaign_id,
+                ad_set_id=first.ad_set_id,
+                landing_page_url=first.landing_page_url,
+                changed_dimension=first.changed_dimension,
+                fixed_identity=first.fixed_identity,
+                language_bundles={row.language: row.language_bundle for row in selected},
+            )
+        )
+    first = variants[0]
+    return HookExperiment(
+        experiment_id=experiment_id,
+        campaign_id=first.campaign_id,
+        ad_set_id=first.ad_set_id,
+        landing_page_url=first.landing_page_url,
+        changed_dimension=first.changed_dimension,
+        fixed_identity=first.fixed_identity,
+        variants=tuple(variants),
+    )
+
+
 def _setting(settings: object, name: str, default: Any = None) -> Any:
     return getattr(settings, name, default)
 
@@ -399,6 +670,21 @@ async def _renew_action(engine: Any, claim: Any, seconds: int = 300) -> None:
             raise RuntimeError("execution lease ownership was lost")
 
 
+async def _renew_hook_publication_lease(engine: Any, claim: Any) -> None:
+    await _renew_action(engine, claim)
+    async with engine.connect() as conn:
+        owned = await conn.scalar(
+            text(
+                "SELECT 1 FROM autonomous_replacement_publications "
+                "WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token "
+                "AND lease_expires_at>NOW()"
+            ),
+            {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
+        )
+    if owned != 1:
+        raise RuntimeError("replacement publication lease ownership was lost")
+
+
 async def _external(
     db_engine: Any, execution_claim: Any, target: object, name: str, *args: Any, **kwargs: Any
 ) -> Any:
@@ -450,7 +736,7 @@ async def _publication(engine: Any, campaign_id: str) -> dict[str, Any] | None:
 async def _aggregate_publication(engine: Any, claim: Any) -> dict[str, Any] | None:
     frozen = claim.decision.evidence.get("frozen_basis") or {}
     expected = frozen.get("campaign_publications")
-    if not isinstance(expected, list) or not expected:
+    if not isinstance(expected, Sequence) or isinstance(expected, (str, bytes)) or not expected:
         return await _publication(engine, claim.campaign_id)
     async with engine.connect() as conn:
         rows = [
@@ -687,7 +973,7 @@ def _policy_reason(
         or snapshot.get("complete") is not True
         or snapshot.get("attribution_complete") is not True
         or snapshot.get("delivery_state") != decision.evidence.get("delivery_state")
-        or snapshot.get("variants") != decision.evidence.get("variants")
+        or _plain(snapshot.get("variants")) != _plain(decision.evidence.get("variants"))
     ):
         return "stale_snapshot"
     budget = publication.get("approved_budget_cents")
@@ -810,6 +1096,12 @@ async def _replace(
         frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
     ):
         raise _PreconditionChanged("live_state_changed")
+    configured_experiment = _setting(settings, "meta_autonomy_experiment_id", "")
+    if configured_experiment and configured_experiment == frozen_source.experiment_id:
+        experiment = await _persisted_hook_experiment(engine, configured_experiment)
+        return await _replace_hook_experiment(
+            engine, meta, claim, source, fresh_source, frozen_source, draft, experiment
+        )
     ids = None
     compensated = False
     rollback = None
@@ -920,6 +1212,95 @@ async def _replace(
         raise _SagaFailure(cause, rollback) from cause
 
 
+async def _replace_hook_experiment(
+    engine: Any,
+    meta: Any,
+    claim: Any,
+    source: Mapping[str, Any],
+    fresh_source: Mapping[str, Any],
+    frozen_source: ReplacementSource,
+    draft: Any,
+    experiment: HookExperiment,
+) -> tuple[Any, Any]:
+    budget = frozen_source.daily_budget_eur * 100
+    created = False
+    try:
+        await _write_external(
+            engine,
+            claim,
+            meta,
+            "create_hook_experiment_paused",
+            engine=engine,
+            claim=claim,
+            draft=draft,
+            experiment=experiment,
+            daily_budget_eur=frozen_source.daily_budget_eur,
+            audience_profile_key=frozen_source.audience_profile_key,
+        )
+        created = True
+        paused = await _external(
+            engine, claim, meta, "read_hook_experiment", experiment.experiment_id
+        )
+        if set(paused) != {variant.variant_id for variant in experiment.variants} or any(
+            not _bundle_verified(state, False, budget) for state in paused.values()
+        ):
+            raise RuntimeError("hook_experiment_not_paused")
+        await _write_external(
+            engine,
+            claim,
+            meta,
+            "activate_hook_experiment",
+            experiment.experiment_id,
+            engine=engine,
+            claim=claim,
+        )
+        active = await _external(
+            engine, claim, meta, "read_hook_experiment", experiment.experiment_id
+        )
+        if any(not _bundle_verified(state, True, budget) for state in active.values()):
+            raise RuntimeError("hook_experiment_not_active")
+        frozen_basis = claim.decision.evidence.get("frozen_basis") or {}
+        fresh_source = await _external(
+            engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
+        )
+        if not _source_ok(
+            fresh_source,
+            claim.campaign_id,
+            frozen_basis.get("external_ids") or _source_ids(source),
+            frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
+        ):
+            raise RuntimeError("hook_experiment_source_precondition_changed")
+        await _write_external(engine, claim, meta, "pause_source", source=source)
+        source_after = await _external(
+            engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
+        )
+        if not _paused_source_ok(
+            source_after,
+            frozen_basis.get("external_ids") or _source_ids(source),
+            frozen_basis.get("approved_budget_cents") or source.get("budget_cents"),
+        ):
+            raise RuntimeError("source_not_paused")
+        return {"hook_experiment": active, "source": source_after}, None
+    except BaseException as cause:
+        rollback = None
+        if created or _WRITE_STARTED.get():
+            try:
+                rollback = await _write_external(
+                    engine,
+                    claim,
+                    meta,
+                    "pause_persisted_hook_experiment",
+                    engine=engine,
+                    claim=claim,
+                )
+                if rollback.get("verified") is not True:
+                    raise RuntimeError("hook_experiment_cleanup_unproven")
+                rollback = {"mutation": rollback, "verified": True}
+            except Exception as cleanup_error:
+                rollback = {"verified": False, "error": type(cleanup_error).__name__}
+        raise _SagaFailure(cause, rollback) from cause
+
+
 async def execute_claim(
     engine: Any, settings: Any, meta: Any, replacement_builder: Any, claim: Any, now: datetime
 ) -> ExecutionResult:
@@ -986,7 +1367,8 @@ async def execute_claim(
             DecisionKind.REALLOCATE,
             DecisionKind.SCALE,
         } and isinstance(
-            (claim.decision.evidence.get("frozen_basis") or {}).get("campaign_publications"), list
+            (claim.decision.evidence.get("frozen_basis") or {}).get("campaign_publications"),
+            Sequence,
         )
         if aggregate_budget:
             active = {"status": "ACTIVE", "effective_status": "ACTIVE"}

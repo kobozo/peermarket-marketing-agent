@@ -1,44 +1,78 @@
 """Immutable values shared by autonomous lifecycle policy and execution."""
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlsplit
 
 
-def _immutable(*args: object, **kwargs: object) -> None:
-    raise TypeError("frozen evidence cannot be mutated")
+class _ImmutableMapping(Mapping[str, Any]):
+    """Composition-based immutable mapping; it is intentionally not a dict subclass."""
+
+    __slots__ = ("__values",)
+
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        if hasattr(self, "_ImmutableMapping__values"):
+            raise TypeError("frozen evidence cannot be reinitialized")
+        object.__setattr__(self, "_ImmutableMapping__values", dict(values))
+
+    def __getitem__(self, key: str) -> Any:
+        return self.__values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.__values)
+
+    def __len__(self) -> int:
+        return len(self.__values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Mapping) and dict(self.items()) == dict(other.items())
+
+    def __or__(self, other: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(self) | dict(other)
+
+    def __ror__(self, other: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(other) | dict(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_ImmutableMapping":
+        return self
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
+
+    def __setitem__(self, key: str, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
 
 
-class _FrozenDict(dict[str, Any]):
-    """A JSON-serializable dict whose mutation API is disabled."""
+class _ImmutableSequence(Sequence[Any]):
+    """Composition-based immutable sequence; it is intentionally not a list subclass."""
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
+    __slots__ = ("__values",)
 
+    def __init__(self, values: Sequence[Any]) -> None:
+        if hasattr(self, "_ImmutableSequence__values"):
+            raise TypeError("frozen evidence cannot be reinitialized")
+        object.__setattr__(self, "_ImmutableSequence__values", tuple(values))
 
-class _FrozenList(list[Any]):
-    """A JSON-serializable list whose mutation API is disabled."""
+    def __getitem__(self, index: int | slice) -> Any:
+        return self.__values[index]
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
+    def __len__(self) -> int:
+        return len(self.__values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Sequence) and tuple(self) == tuple(other)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_ImmutableSequence":
+        return self
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
+
+    def append(self, value: object) -> None:
+        raise TypeError("frozen evidence cannot be mutated")
 
 
 def _freeze_json(value: Any) -> Any:
@@ -46,15 +80,24 @@ def _freeze_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("evidence mapping keys must be strings")
-        return _FrozenDict((key, _freeze_json(item)) for key, item in value.items())
-    if isinstance(value, (list, tuple)):
-        return _FrozenList(_freeze_json(item) for item in value)
+        return _ImmutableMapping({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return _ImmutableSequence(tuple(_freeze_json(item) for item in value))
     if isinstance(value, (set, frozenset)):
         frozen = (_freeze_json(item) for item in value)
-        return _FrozenList(sorted(frozen, key=repr))
+        return _ImmutableSequence(tuple(sorted(frozen, key=repr)))
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise TypeError(f"evidence values must be JSON-like, got {type(value).__name__}")
+
+
+def thaw_json(value: Any) -> Any:
+    """Project frozen contract values to plain JSON-native dicts and lists."""
+    if isinstance(value, Mapping):
+        return {str(key): thaw_json(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [thaw_json(item) for item in value]
+    return value
 
 
 class DecisionKind(StrEnum):
@@ -73,6 +116,140 @@ class ActionStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     RECONCILIATION_REQUIRED = "reconciliation_required"
+
+
+def _stable_text_id(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not value.isascii()
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(f"{name} must be a stable non-whitespace ASCII ID")
+    return value
+
+
+def _numeric_meta_id(value: object, name: str) -> str:
+    value = _stable_text_id(value, name)
+    if not value.isdecimal():
+        raise ValueError(f"{name} must be an exact numeric Meta ID")
+    return value
+
+
+def _landing_page(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("landing_page_url must be an exact absolute HTTPS URL")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("landing_page_url must be an exact absolute HTTPS URL")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class HookVariant:
+    """One stable hook variant containing an exact multilingual creative bundle."""
+
+    variant_id: str
+    experiment_id: str
+    campaign_id: str
+    ad_set_id: str
+    landing_page_url: str
+    changed_dimension: str
+    fixed_identity: Mapping[str, Any]
+    language_bundles: Mapping[str, Mapping[str, Any]]
+
+    def __post_init__(self) -> None:
+        _stable_text_id(self.variant_id, "variant_id")
+        _stable_text_id(self.experiment_id, "experiment_id")
+        _numeric_meta_id(self.campaign_id, "campaign_id")
+        _numeric_meta_id(self.ad_set_id, "ad_set_id")
+        _landing_page(self.landing_page_url)
+        if self.changed_dimension != "hook":
+            raise ValueError("changed_dimension must be exactly hook")
+        required_identity = {"audience", "optimization", "format", "visual", "delivery"}
+        if not isinstance(self.fixed_identity, Mapping) or not required_identity <= set(
+            self.fixed_identity
+        ):
+            raise ValueError("fixed identity requires audience/optimization/format/visual/delivery")
+        if not isinstance(self.language_bundles, Mapping) or set(self.language_bundles) != {
+            "NL",
+            "FR",
+            "EN",
+        }:
+            raise ValueError("language bundles require exact NL/FR/EN completeness")
+        if any(
+            not isinstance(bundle, Mapping) or not bundle
+            for bundle in self.language_bundles.values()
+        ):
+            raise ValueError("each NL/FR/EN language bundle must be non-empty")
+        bundle_fields = {"hook", "body", "headline", "description", "cta_label"}
+        if any(
+            set(bundle) != bundle_fields
+            or any(not isinstance(value, str) or not value.strip() for value in bundle.values())
+            for bundle in self.language_bundles.values()
+        ):
+            raise ValueError("language bundles require exact complete creative fields")
+        object.__setattr__(self, "fixed_identity", _freeze_json(self.fixed_identity))
+        object.__setattr__(self, "language_bundles", _freeze_json(self.language_bundles))
+
+
+@dataclass(frozen=True, slots=True)
+class HookExperiment:
+    """Exactly three hook variants sharing one frozen delivery identity."""
+
+    experiment_id: str
+    campaign_id: str
+    ad_set_id: str
+    landing_page_url: str
+    changed_dimension: str
+    fixed_identity: Mapping[str, Any]
+    variants: tuple[HookVariant, ...]
+
+    def __post_init__(self) -> None:
+        _stable_text_id(self.experiment_id, "experiment_id")
+        _numeric_meta_id(self.campaign_id, "campaign_id")
+        _numeric_meta_id(self.ad_set_id, "ad_set_id")
+        _landing_page(self.landing_page_url)
+        if self.changed_dimension != "hook":
+            raise ValueError("changed_dimension must be exactly hook")
+        if not isinstance(self.fixed_identity, Mapping) or not self.fixed_identity:
+            raise ValueError("fixed identity must be a non-empty mapping")
+        variants = tuple(self.variants)
+        if len(variants) != 3 or any(not isinstance(item, HookVariant) for item in variants):
+            raise ValueError("hook experiment requires exactly three variants")
+        if len({item.variant_id for item in variants}) != 3:
+            raise ValueError("hook experiment variant IDs must be unique")
+        identity = _freeze_json(self.fixed_identity)
+        if any(
+            item.experiment_id != self.experiment_id
+            or item.campaign_id != self.campaign_id
+            or item.ad_set_id != self.ad_set_id
+            or item.landing_page_url != self.landing_page_url
+            or item.changed_dimension != self.changed_dimension
+            or item.fixed_identity != identity
+            for item in variants
+        ):
+            raise ValueError("variant fixed identity must match its hook experiment")
+        non_hook_fields = ("body", "headline", "description", "cta_label")
+        baseline = variants[0]
+        if any(
+            any(
+                item.language_bundles[locale][field] != baseline.language_bundles[locale][field]
+                for locale in ("NL", "FR", "EN")
+                for field in non_hook_fields
+            )
+            for item in variants[1:]
+        ):
+            raise ValueError("only hook text may differ across hook variants")
+        hook_signatures = {
+            tuple(item.language_bundles[locale]["hook"] for locale in ("NL", "FR", "EN"))
+            for item in variants
+        }
+        if len(hook_signatures) != 3:
+            raise ValueError("hook experiment requires three distinct hook values")
+        object.__setattr__(self, "fixed_identity", identity)
+        object.__setattr__(self, "variants", variants)
 
 
 @dataclass(frozen=True, slots=True)

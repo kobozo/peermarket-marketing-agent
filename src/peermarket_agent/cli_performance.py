@@ -12,12 +12,51 @@ import click
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from peermarket_agent.agent.loops.autonomy import prepare_hook_experiment
 from peermarket_agent.config import get_settings
 from peermarket_agent.mcp_servers.peermarket_readonly import PeermarketReadonly
 from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
 
 _CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+_NEUTRAL_EXPERIMENT_REASONS = {
+    "invalid_snapshot",
+    "invalid_history",
+    "incomplete_window",
+    "insufficient_evidence",
+    "neutral_tie",
+    "maximum_test_duration_without_qualified_comparison",
+    "stale_snapshot",
+    "missing_attribution",
+    "no_delivery_grace_period",
+    "diagnose_no_delivery",
+    "diagnose_rejected_or_error",
+    "delivery_unavailable",
+    "mutation_cooldown",
+    "incomplete_hook_experiment",
+    "not_comparable",
+    "invalid_reallocation",
+    "missing_replacement_source",
+    "replacement_limit",
+    "increase_limit",
+    "missing_budget_history",
+    "absolute_budget_ceiling",
+    "increase_headroom_exhausted",
+    "invalid_campaign_allocations",
+}
+_QUALIFIED_EXPERIMENT_REASONS = {
+    "proven_loser_replace",
+    "proven_winner_reallocate",
+    "proven_winner_scale",
+}
+
+
+def classify_experiment_reason(reason: str) -> str:
+    if reason in _NEUTRAL_EXPERIMENT_REASONS:
+        return "neutral"
+    if reason in _QUALIFIED_EXPERIMENT_REASONS:
+        return "qualified"
+    raise ValueError("unknown experiment policy reason")
 
 
 @asynccontextmanager
@@ -237,6 +276,52 @@ def _safe_autonomy_evidence(value: object) -> dict[str, Any]:
     return {key: value[key] for key in sorted(allowed & value.keys())}
 
 
+def _safe_experiment_evidence(value: object, reason: str | None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    result = {"reason": reason}
+    for key in ("experiment_id", "variant_ids", "delivery_state", "attribution_complete"):
+        if key in value:
+            result[key] = value[key]
+    result["samples"] = [
+        {
+            key: item[key]
+            for key in ("variant_id", "impressions", "landing_page_views", "registrations")
+            if key in item
+        }
+        for item in value.get("variants", [])
+        if isinstance(item, dict)
+    ]
+    if "variant_ids" not in result:
+        result["variant_ids"] = [
+            item["variant_id"] for item in result["samples"] if "variant_id" in item
+        ]
+    result["thresholds"] = {
+        key: value["policy_limits"][key]
+        for key in (
+            "min_impressions",
+            "min_landing_page_views",
+            "min_registrations",
+            "cooldown_hours",
+            "max_test_days",
+            "max_increase_percent",
+            "max_daily_budget_cents",
+            "max_replacements_24h",
+            "snapshot_age_hours",
+            "no_delivery_grace_hours",
+            "complete_window_required",
+            "account_timezone",
+        )
+        if isinstance(value.get("policy_limits"), dict) and key in value["policy_limits"]
+    }
+    result["window"] = {
+        key: value["evidence_window"][key]
+        for key in ("start", "end", "window_start", "window_end", "captured_at")
+        if isinstance(value.get("evidence_window"), dict) and key in value["evidence_window"]
+    }
+    return result
+
+
 async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
     """Return a fixed, sanitized autonomous-lifecycle projection for one draft."""
     settings = get_settings()
@@ -249,10 +334,27 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                         text(
                             "SELECT p.draft_id,p.state AS publication_state,p.approved_budget_cents,"
                             "p.external_ids->>'campaign_id' AS campaign_id,d.id AS decision_id,"
+                            "p.external_ids->>'ad_set_id' AS publication_ad_set_id,dr.metadata AS draft_metadata,"
                             "d.kind,d.reason,d.window_start,d.window_end,d.evidence,"
                             "d.old_budget_cents,d.new_budget_cents,a.id AS action_id,a.status AS action_status,"
-                            "a.failure_category,a.next_evaluation_at,a.audit "
-                            "FROM publications p LEFT JOIN LATERAL (SELECT * FROM autonomous_decisions "
+                            "a.failure_category,a.next_evaluation_at,a.audit,"
+                            "(SELECT count(*) FROM autonomous_actions aa WHERE aa.campaign_id="
+                            "p.external_ids->>'campaign_id' AND aa.status NOT IN "
+                            "('succeeded','failed','cancelled')) AS active_action_count,"
+                            "(SELECT COALESCE(jsonb_agg(DISTINCT aa.status),'[]'::jsonb) "
+                            "FROM autonomous_actions aa WHERE aa.campaign_id="
+                            "p.external_ids->>'campaign_id' AND aa.status NOT IN "
+                            "('succeeded','failed','cancelled')) AS active_action_statuses,"
+                            "(SELECT jsonb_build_object('id',o.id,'status',o.status,"
+                            "'idempotency_key',o.idempotency_key,'decision_id',d.id,"
+                            "'experiment_id',o.payload->'experiment_id','variant_ids',"
+                            "o.payload->'variant_ids','evidence_window',o.payload->'evidence_window') "
+                            "FROM slack_outbox o WHERE o.autonomy_campaign_id="
+                            "p.external_ids->>'campaign_id' AND o.message_kind='autonomy_audit' "
+                            "AND o.idempotency_key LIKE 'autonomy:'||d.decision_key||':%' "
+                            "ORDER BY o.id DESC LIMIT 1) AS slack_audit "
+                            "FROM publications p JOIN drafts dr ON dr.id=p.draft_id "
+                            "LEFT JOIN LATERAL (SELECT * FROM autonomous_decisions "
                             "WHERE campaign_id=p.external_ids->>'campaign_id' ORDER BY id DESC LIMIT 1) d "
                             "ON TRUE LEFT JOIN LATERAL (SELECT * FROM autonomous_actions "
                             "WHERE decision_id=d.id ORDER BY id DESC LIMIT 1) a ON TRUE "
@@ -264,6 +366,23 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                 .mappings()
                 .one_or_none()
             )
+            experiment_id = settings.meta_autonomy_experiment_id
+            experiment_rows = []
+            if experiment_id:
+                experiment_rows = [
+                    dict(item)
+                    for item in (
+                        await connection.execute(
+                            text(
+                                "SELECT experiment_id,variant_id,language,campaign_id,ad_set_id,"
+                                "landing_page_url,changed_dimension,fixed_identity "
+                                "FROM autonomous_hook_experiment_variants "
+                                "WHERE experiment_id=:experiment_id ORDER BY variant_id,language"
+                            ),
+                            {"experiment_id": experiment_id},
+                        )
+                    ).mappings()
+                ]
         report: dict[str, Any] = {
             "draft_id": draft_id,
             "feature_flags": {
@@ -272,6 +391,21 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                 "allowlisted": False,
             },
             "publication_exists": row is not None,
+            "hook_experiment": _hook_experiment_status(
+                experiment_rows,
+                settings=settings,
+                draft_id=draft_id,
+                expected=(
+                    {
+                        "campaign_id": row["campaign_id"],
+                        "ad_set_id": row["publication_ad_set_id"],
+                        "landing_page_url": (row["draft_metadata"] or {}).get("landing_page_url"),
+                        "fixed_identity": (row["draft_metadata"] or {}).get("fixed_identity"),
+                    }
+                    if row is not None
+                    else None
+                ),
+            ),
         }
         if row is None:
             return report
@@ -298,6 +432,10 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
             if row["decision_id"] is not None
             else None
         )
+        report["experiment_evidence"] = _safe_experiment_evidence(row["evidence"], row["reason"])
+        report["active_action_count"] = int(row["active_action_count"] or 0)
+        report["active_action_statuses"] = list(row["active_action_statuses"] or [])
+        report["slack_audit"] = dict(row["slack_audit"]) if row["slack_audit"] else None
         audit = row["audit"] if isinstance(row["audit"], dict) else {}
         report["action"] = (
             {
@@ -312,6 +450,122 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
         )
         report["reconciliation_blocked"] = row["action_status"] == "reconciliation_required"
         return report
+    finally:
+        await engine.dispose()
+
+
+def _hook_experiment_status(
+    rows: list[dict[str, Any]], *, settings: Any, draft_id: int, expected: dict | None
+) -> dict:
+    """Build a copy-free, identifier-only readiness projection."""
+    experiment_id = str(getattr(settings, "meta_autonomy_experiment_id", "") or "")
+    grouped: dict[str, set[str]] = {}
+    identities = set()
+    campaigns = set()
+    for row in rows:
+        grouped.setdefault(str(row["variant_id"]), set()).add(str(row["language"]))
+        identities.add(
+            json.dumps(
+                [
+                    row["campaign_id"],
+                    row["ad_set_id"],
+                    row["landing_page_url"],
+                    row["changed_dimension"],
+                    row["fixed_identity"],
+                ],
+                sort_keys=True,
+                default=str,
+            )
+        )
+        campaigns.add(str(row["campaign_id"]))
+    exact_bundle = len(grouped) == 3 and all(v == {"NL", "FR", "EN"} for v in grouped.values())
+    expected_variant_ids = {f"{experiment_id}:{number:02}" for number in (1, 2, 3)}
+    variant_ids_match = set(grouped) == expected_variant_ids
+    fixed_identity_match = exact_bundle and len(identities) == 1
+    allowlisted = campaigns == {"120249125021520342"} and campaigns <= set(
+        getattr(settings, "meta_autonomy_campaign_ids", ())
+    )
+    persisted_identity_match = bool(expected) and all(
+        row["experiment_id"] == experiment_id
+        and row["campaign_id"] == expected.get("campaign_id")
+        and row["ad_set_id"] == expected.get("ad_set_id")
+        and row["landing_page_url"] == expected.get("landing_page_url")
+        and row["changed_dimension"] == "hook"
+        and row["fixed_identity"] == expected.get("fixed_identity")
+        for row in rows
+    )
+    blocked = None
+    if draft_id != 156:
+        blocked = "draft_not_156"
+    elif not experiment_id:
+        blocked = "experiment_not_configured"
+    elif not getattr(settings, "meta_autonomy_shadow", True):
+        blocked = "shadow_mode_required"
+    elif not variant_ids_match:
+        blocked = "variant_ids_mismatch"
+    elif not exact_bundle:
+        blocked = "experiment_incomplete"
+    elif not persisted_identity_match:
+        blocked = "persisted_identity_mismatch"
+    elif not fixed_identity_match:
+        blocked = "fixed_identity_mismatch"
+    elif not allowlisted:
+        blocked = "campaign_not_allowlisted"
+    return {
+        "experiment_id": experiment_id or None,
+        "variant_count": len(grouped),
+        "variants": [
+            {"variant_id": key, "languages": sorted(value)}
+            for key, value in sorted(grouped.items())
+        ],
+        "fixed_identity_match": fixed_identity_match,
+        "ready": blocked is None,
+        "blocked_reason": blocked,
+    }
+
+
+async def prepare_hook_experiment_command(draft_id: int, seed: str) -> dict[str, Any]:
+    """Load the fixed draft inputs and persist its local shadow experiment."""
+    settings = get_settings()
+    engine = create_async_engine(settings.agent_db_url, future=True, pool_pre_ping=True)
+    try:
+        async with engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT d.id,d.metadata,p.external_ids,b.voice_rules_md FROM drafts d "
+                            "JOIN publications p ON p.draft_id=d.id AND p.channel='meta' "
+                            "JOIN brand_voice b ON b.id=1 WHERE d.id=:draft_id"
+                        ),
+                        {"draft_id": draft_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            raise ValueError("Draft 156 publication or brand voice is unavailable")
+        metadata = dict(row["metadata"] or {})
+        external_ids = dict(row["external_ids"] or {})
+        draft = {
+            "id": row["id"],
+            "campaign_id": external_ids.get("campaign_id"),
+            "ad_set_id": external_ids.get("ad_set_id"),
+            "landing_page_url": metadata.get("landing_page_url"),
+            "fixed_identity": metadata.get("fixed_identity"),
+            "language_bundles": metadata.get("language_bundles"),
+        }
+        experiment = await prepare_hook_experiment(
+            engine, settings, draft, str(row["voice_rules_md"]), seed
+        )
+        return {
+            "draft_id": draft_id,
+            "experiment_id": experiment.experiment_id,
+            "variant_ids": [variant.variant_id for variant in experiment.variants],
+            "languages": ["NL", "FR", "EN"],
+            "shadow": True,
+        }
     finally:
         await engine.dispose()
 
@@ -337,6 +591,18 @@ def verify(draft_id: int) -> None:
 def autonomy(draft_id: int) -> None:
     """Inspect persisted autonomy state without permitting a database write."""
     click.echo(json.dumps(asyncio.run(inspect_autonomy(draft_id)), sort_keys=True, default=str))
+
+
+@cli.command("prepare-hook-experiment")
+@click.option("--draft-id", required=True, type=click.IntRange(min=1))
+@click.option("--seed", default="draft-156-shadow-v1", show_default=True)
+def prepare_hook_experiment_cli(draft_id: int, seed: str) -> None:
+    """Persist the fixed shadow experiment locally; never mutate Meta."""
+    try:
+        report = asyncio.run(prepare_hook_experiment_command(draft_id, seed))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":

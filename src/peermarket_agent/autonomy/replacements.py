@@ -16,11 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.agent.cli_draft import recent_relevant_learnings
-from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision, HookExperiment
 from peermarket_agent.autonomy.store import ClaimedAction, renew_replacement_generation_leases
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
 from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.claude import ClaudeClient
+from peermarket_agent.meta_ads import MetaBundleLocale
 from peermarket_agent.prompts.brand_voice import load_brand_voice
 from peermarket_agent.prompts.meta_ad_creative import (
     AUDIENCE_PROFILES,
@@ -33,6 +34,61 @@ LOCALES = ("NL", "FR", "EN")
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 DIMENSIONS = {"hook", "copy", "visual", "audience"}
 _LOCALE_MARKER = re.compile(r"(^|\s)(?:\[(?:NL|FR|EN)\]|(?:NL|FR|EN):)(?:\s|$)", re.I)
+_HOOK_LANGUAGE_SIGNALS = {
+    "NL": {"je", "jouw", "spullen", "verkoop", "kopers", "veilig"},
+    "FR": {"vous", "vos", "vendez", "objets", "acheteurs", "sécurité"},
+    "EN": {"you", "your", "sell", "items", "buyers", "safely"},
+}
+
+
+def hook_experiment_meta_matrix(
+    experiment: HookExperiment, *, image_bytes: bytes | None = None
+) -> dict[str, dict[str, MetaBundleLocale]]:
+    """Translate the frozen hook contract to the narrow Meta 3x3 adapter payload."""
+    ctas = {
+        "Learn More": "LEARN_MORE",
+        "Sign Up": "SIGN_UP",
+        "Shop Now": "SHOP_NOW",
+        "Get Started": "GET_STARTED",
+    }
+    expected_ids = [f"{experiment.experiment_id}:{number:02}" for number in (1, 2, 3)]
+    if [variant.variant_id for variant in experiment.variants] != expected_ids:
+        raise ValueError("hook experiment variant order or identity changed")
+    matrix = {}
+    for variant in experiment.variants:
+        locales = {}
+        for locale in LOCALES:
+            bundle = variant.language_bundles[locale]
+            try:
+                cta = ctas[bundle["cta_label"]]
+            except KeyError as exc:
+                raise ValueError("hook experiment CTA is unsupported by Meta") from exc
+            locales[locale] = MetaBundleLocale(
+                f"{bundle['hook']}\n\n{bundle['body']}",
+                bundle["headline"],
+                bundle["description"],
+                cta,
+                image_bytes,
+            )
+        matrix[variant.variant_id] = locales
+    return matrix
+
+
+def validate_native_hook_bundle(hooks: Mapping[str, str]) -> None:
+    """Reject missing, copied, labelled, or non-native hook text without performing I/O."""
+    if set(hooks) != set(LOCALES):
+        raise ValueError("hook bundle requires exact NL/FR/EN language coverage")
+    normalized = {}
+    for locale in LOCALES:
+        hook = hooks[locale]
+        if not isinstance(hook, str) or not hook.strip() or _LOCALE_MARKER.search(hook):
+            raise ValueError("hook bundle contains missing or labelled language text")
+        words = set(re.findall(r"[^\W\d_]+", hook.casefold(), flags=re.UNICODE))
+        if not words & _HOOK_LANGUAGE_SIGNALS[locale]:
+            raise ValueError(f"{locale} hook lacks native language evidence")
+        normalized[locale] = " ".join(hook.casefold().split())
+    if len(set(normalized.values())) != len(LOCALES):
+        raise ValueError("literal cross-language hook copy is not allowed")
 
 
 @dataclass(frozen=True, slots=True)

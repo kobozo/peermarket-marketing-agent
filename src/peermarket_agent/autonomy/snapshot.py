@@ -17,6 +17,14 @@ def _aware(value: object, name: str) -> datetime:
     return value
 
 
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
 def build_autonomy_snapshot(
     publication: Mapping[str, Any],
     variants: Sequence[Mapping[str, Any]],
@@ -24,6 +32,7 @@ def build_autonomy_snapshot(
     replacement_source: Mapping[str, Any] | None,
     allow_replacement: bool = True,
     reallocation: Mapping[str, Any] | None = None,
+    experiment_id: str | None = None,
 ) -> dict[str, Any]:
     """Build policy/executor evidence from persisted hourly namespaces only."""
     performance = publication.get("performance")
@@ -56,9 +65,9 @@ def build_autonomy_snapshot(
         "captured_at": captured_at.isoformat(),
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
-        "variants": list(variants),
-        "source": replacement_source,
-        "frozen_basis": basis,
+        "variants": _plain_json(variants),
+        "source": _plain_json(replacement_source),
+        "frozen_basis": _plain_json(basis),
     }
     snapshot = {
         "snapshot_id": "autonomy:"
@@ -86,6 +95,11 @@ def build_autonomy_snapshot(
         "replacement_source": replacement_source,
         "frozen_basis": dict(basis),
     }
+    source_experiment = experiment_id
+    if isinstance(source_experiment, str) and {item.get("variant_id") for item in variants} == {
+        f"{source_experiment}:{number:02}" for number in (1, 2, 3)
+    }:
+        snapshot["experiment_id"] = source_experiment
     if reallocation is not None:
         snapshot["reallocation"] = dict(reallocation)
     return snapshot
@@ -101,6 +115,7 @@ def build_policy_decision(
     now: datetime,
     allow_replacement: bool = True,
     reallocation: Mapping[str, Any] | None = None,
+    experiment_id: str | None = None,
 ):
     """Public Task 7 seam from persisted collector evidence to a frozen decision."""
     from peermarket_agent.autonomy.policy import evaluate_campaign
@@ -112,6 +127,7 @@ def build_policy_decision(
             replacement_source=replacement_source,
             allow_replacement=allow_replacement,
             reallocation=reallocation,
+            experiment_id=experiment_id,
         ),
         history,
         limits,

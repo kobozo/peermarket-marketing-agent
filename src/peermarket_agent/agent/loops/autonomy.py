@@ -11,8 +11,12 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision, HookExperiment
 from peermarket_agent.autonomy.executor import execute_production_claim
+from peermarket_agent.autonomy.hook_experiments import (
+    build_hook_experiment,
+    validate_hook_experiment,
+)
 from peermarket_agent.autonomy.snapshot import build_policy_decision
 from peermarket_agent.autonomy.store import (
     _sanitize_audit_value,
@@ -20,6 +24,7 @@ from peermarket_agent.autonomy.store import (
     claim_next_action,
     enqueue_action,
     record_decision,
+    record_experiment,
 )
 from peermarket_agent.slack_outbox import deliver_pending_outbox
 
@@ -30,6 +35,35 @@ _EXECUTABLE = {
     DecisionKind.REALLOCATE,
     DecisionKind.SCALE,
 }
+_HOOK_DRAFT_ID = 156
+_HOOK_CAMPAIGN_ID = "120249125021520342"
+
+
+async def prepare_hook_experiment(
+    engine: AsyncEngine, settings: Any, draft: Any, brand_voice: str, seed: Any
+) -> HookExperiment:
+    """Freeze and persist Draft 156's hook-only experiment without touching Meta."""
+    if not _setting(settings, "meta_autonomy_shadow", True):
+        raise ValueError("hook experiment preparation is shadow-only")
+    draft_id = draft.get("id") if isinstance(draft, dict) else getattr(draft, "id", None)
+    campaign_id = (
+        draft.get("campaign_id") if isinstance(draft, dict) else getattr(draft, "campaign_id", None)
+    )
+    if draft_id != _HOOK_DRAFT_ID:
+        raise ValueError("hook experiment is restricted to Draft 156")
+    if str(campaign_id) != _HOOK_CAMPAIGN_ID:
+        raise ValueError("Draft 156 campaign identity does not match the fixed canary")
+    if _HOOK_CAMPAIGN_ID not in tuple(_setting(settings, "meta_autonomy_campaign_ids", ())):
+        raise ValueError("Draft 156 campaign is not allowlisted")
+    if _setting(settings, "meta_autonomy_variant_count", 3) != 3:
+        raise ValueError("hook experiment requires exactly three variants")
+    experiment = build_hook_experiment(draft, brand_voice, seed)
+    validate_hook_experiment(experiment, draft, brand_voice, seed)
+    configured_id = _setting(settings, "meta_autonomy_experiment_id", "")
+    if configured_id and configured_id != experiment.experiment_id:
+        raise ValueError("configured hook experiment ID does not match the frozen experiment")
+    await record_experiment(engine, experiment)
+    return experiment
 
 
 def _registrations(performance: dict) -> int:
@@ -234,6 +268,16 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
             inputs = performance.get("autonomy_inputs")
             if not isinstance(inputs, dict) or inputs.get("schema") != "autonomy-inputs/v1":
                 inputs = _canonical_inputs(row, campaign_rows)
+            experiment_id = str(_setting(settings, "meta_autonomy_experiment_id", "") or "")
+            validated_experiment_id = None
+            if experiment_id:
+                experiment_variants = await _persisted_hook_variants(
+                    engine, experiment_id, row, performance
+                )
+                if experiment_variants is not None:
+                    inputs = dict(inputs)
+                    inputs["variants"] = experiment_variants
+                    validated_experiment_id = experiment_id
             variants = inputs["variants"]
             source = inputs["replacement_source"]
             publications = [
@@ -297,6 +341,7 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                 now=now,
                 allow_replacement=source is not None,
                 reallocation=inputs["reallocation"],
+                experiment_id=validated_experiment_id,
             )
             eligible.append({"draft_id": row["draft_id"], "decision": decision})
         except Exception:
@@ -321,6 +366,113 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                     }
                 )
     return eligible
+
+
+async def _persisted_hook_variants(
+    engine: AsyncEngine, experiment_id: str, row: dict, performance: dict
+) -> list[dict] | None:
+    """Aggregate nine persisted locale identities into three policy variants."""
+    async with engine.connect() as conn:
+        records = [
+            dict(item)
+            for item in (
+                await conn.execute(
+                    text(
+                        "SELECT variant_id,language,campaign_id,ad_set_id,landing_page_url,"
+                        "changed_dimension,fixed_identity "
+                        "FROM autonomous_hook_experiment_variants WHERE experiment_id=:id "
+                        "ORDER BY variant_id,CASE language WHEN 'NL' THEN 1 WHEN 'FR' THEN 2 ELSE 3 END"
+                    ),
+                    {"id": experiment_id},
+                )
+            ).mappings()
+        ]
+        progress = await conn.scalar(
+            text(
+                "SELECT r.progress FROM autonomous_replacement_publications r "
+                "JOIN autonomous_hook_experiment_variants v ON v.experiment_id=:id "
+                "AND v.campaign_id=r.source_campaign_id WHERE r.changed_dimension='hook' "
+                "ORDER BY r.id DESC LIMIT 1"
+            ),
+            {"id": experiment_id},
+        )
+    expected_ids = [f"{experiment_id}:{number:02}" for number in (1, 2, 3)]
+    if len(records) != 9 or sorted({item["variant_id"] for item in records}) != expected_ids:
+        return None
+    controls = {
+        (
+            item["campaign_id"],
+            item["ad_set_id"],
+            item["landing_page_url"],
+            item["changed_dimension"],
+            json.dumps(item["fixed_identity"], sort_keys=True),
+        )
+        for item in records
+    }
+    current_campaign = str((row.get("external_ids") or {}).get("campaign_id") or "")
+    if (
+        len(controls) != 1
+        or records[0]["campaign_id"] != current_campaign
+        or records[0]["changed_dimension"] != "hook"
+    ):
+        return None
+    samples = performance.get("hook_experiment_variants")
+    samples = samples if isinstance(samples, dict) else {}
+    basis = performance.get("autonomy_basis")
+    if isinstance(basis, dict):
+        expected_window = {
+            "window_start": basis.get("window_start"),
+            "window_stop": basis.get("window_end"),
+            "captured_at": basis.get("captured_at"),
+        }
+        for variant_id in expected_ids:
+            variant_samples = samples.get(variant_id)
+            if not isinstance(variant_samples, dict):
+                return None
+            for locale in ("NL", "FR", "EN"):
+                sample = variant_samples.get(locale)
+                if not isinstance(sample, dict) or any(
+                    sample.get(field) != value for field, value in expected_window.items()
+                ):
+                    return None
+                if isinstance(progress, dict) and str(sample.get("ad_id") or "") != str(
+                    progress.get(f"variant:{variant_id}:ad_id:{locale}") or ""
+                ):
+                    return None
+    result = []
+    for index, variant_id in enumerate(expected_ids, 1):
+        locales = [item for item in records if item["variant_id"] == variant_id]
+        if {item["language"] for item in locales} != {"NL", "FR", "EN"}:
+            return None
+        locale_samples = (
+            samples.get(variant_id) if isinstance(samples.get(variant_id), dict) else {}
+        )
+
+        totals = {
+            field: sum(
+                int((locale_samples.get(locale) or {}).get(field, 0))
+                for locale in ("NL", "FR", "EN")
+            )
+            for field in ("impressions", "landing_page_views", "registrations")
+        }
+
+        identity = locales[0]["fixed_identity"]
+        result.append(
+            {
+                "variant_id": variant_id,
+                "publication_id": int(row["publication_id"]) * 10 + index,
+                "channel": "meta",
+                "objective": str(identity.get("optimization") or "LINK_CLICKS"),
+                "language": "MULTI",
+                "audience": str(identity.get("audience") or "unknown"),
+                "creative_dimension": "hook",
+                "window_definition": "hook_experiment_window",
+                "impressions": totals["impressions"],
+                "landing_page_views": totals["landing_page_views"],
+                "registrations": totals["registrations"],
+            }
+        )
+    return result
 
 
 async def persist_autonomy_inputs(engine: AsyncEngine) -> int:
@@ -439,6 +591,13 @@ async def _audit(
         "outcome": outcome,
         "decision": decision.kind.value,
         "reason": decision.reason,
+        "experiment_id": decision.evidence.get("experiment_id"),
+        "variant_ids": sorted(
+            str(item.get("variant_id")) for item in decision.evidence.get("variants", ())
+        ),
+        "evidence_window": _sanitize_audit_value(
+            dict(decision.evidence.get("evidence_window") or {})
+        ),
         "thresholds": thresholds,
         "evidence": evidence,
         "affected_ads": affected_ads,
@@ -452,6 +611,8 @@ async def _audit(
         "text": (
             f"Autonomy {outcome}: campaign {decision.campaign_id}; "
             f"decision {decision.kind.value}; reason {decision.reason}; "
+            f"experiment {decision.evidence.get('experiment_id') or 'none'}; "
+            f"evidence window {json.dumps(dict(decision.evidence.get('evidence_window') or {}), sort_keys=True)}; "
             f"thresholds {json.dumps(thresholds, sort_keys=True)}; "
             f"samples {json.dumps(evidence, sort_keys=True)}; "
             f"affected ads {json.dumps(affected_ads, sort_keys=True)}; "

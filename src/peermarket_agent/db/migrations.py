@@ -468,6 +468,33 @@ _STEPS: list[str] = [
     "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_token TEXT",
     "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_replacement_one_per_action ON autonomous_replacement_publications(action_id)",
+    """CREATE TABLE IF NOT EXISTS autonomous_hook_experiment_variants (
+        id BIGSERIAL PRIMARY KEY,
+        experiment_id TEXT NOT NULL,
+        variant_id TEXT NOT NULL,
+        language TEXT NOT NULL CHECK (language IN ('NL','FR','EN')),
+        campaign_id TEXT NOT NULL,
+        ad_set_id TEXT NOT NULL,
+        landing_page_url TEXT NOT NULL,
+        changed_dimension TEXT NOT NULL CHECK (changed_dimension = 'hook'),
+        fixed_identity JSONB NOT NULL,
+        language_bundle JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (experiment_id, variant_id, language)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_hook_experiment_variants_experiment "
+    "ON autonomous_hook_experiment_variants(experiment_id, id)",
+    """CREATE OR REPLACE FUNCTION reject_hook_experiment_variant_mutation()
+       RETURNS TRIGGER AS $$
+       BEGIN
+         RAISE EXCEPTION 'autonomous_hook_experiment_variants is append-only';
+       END;
+       $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS hook_experiment_variants_append_only "
+    "ON autonomous_hook_experiment_variants",
+    """CREATE TRIGGER hook_experiment_variants_append_only
+       BEFORE UPDATE OR DELETE ON autonomous_hook_experiment_variants
+       FOR EACH ROW EXECUTE FUNCTION reject_hook_experiment_variant_mutation()""",
     """CREATE TABLE IF NOT EXISTS autonomous_replacement_generations (
         action_id BIGINT PRIMARY KEY REFERENCES autonomous_actions(id),
         state TEXT NOT NULL DEFAULT 'generating'

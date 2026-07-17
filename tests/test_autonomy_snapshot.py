@@ -13,6 +13,86 @@ from peermarket_agent.autonomy.snapshot import (
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
 
 
+def _executable_inputs():
+    variants = [
+        {
+            "variant_id": str(index),
+            "publication_id": index,
+            "channel": "meta",
+            "objective": "OUTCOME_TRAFFIC",
+            "language": "MULTI",
+            "audience": "declutterers",
+            "creative_dimension": "hook",
+            "window_definition": "rolling-1-inclusive-calendar-days",
+            "impressions": 1000,
+            "landing_page_views": 30,
+            "registrations": registrations,
+        }
+        for index, registrations in ((1, 20), (2, 10))
+    ]
+    source = {
+        "draft_id": 1,
+        "publication_id": 1,
+        "campaign_id": "10",
+        "experiment_id": "experiment-1",
+        "changed_dimension": "hook",
+        "locales": {
+            locale: {
+                "locale": locale,
+                "hook": "hook",
+                "body": "body",
+                "headline": "headline",
+                "description": "description",
+                "cta_label": "Learn More",
+            }
+            for locale in ("NL", "FR", "EN")
+        },
+        "audience_profile_key": "declutterers",
+        "image_prompt": "real screenshot",
+        "asset_path": "/tmp/source.png",
+        "daily_budget_eur": 10,
+        "landing_page_url": "https://peermarket.eu/",
+        "objective": "OUTCOME_TRAFFIC",
+        "current_meta_ids": {
+            "campaign_id": "10",
+            "ad_set_id": "20",
+            "ad_ids": {"NL": "31", "FR": "32", "EN": "33"},
+            "creative_ids": {"NL": "41", "FR": "42", "EN": "43"},
+        },
+    }
+    publication = {
+        "external_ids": {"campaign_id": "10", "ad_set_id": "20", "ad_id": "31"},
+        "approved_budget_cents": 1000,
+        "performance": {
+            "autonomy_basis": {
+                "campaign_id": "10",
+                "external_ids": {"campaign_id": "10", "ad_set_id": "20", "ad_id": "31"},
+                "approved_budget_cents": 1000,
+                "captured_at": NOW.isoformat(),
+                "window_start": "2026-07-16T12:00:00+00:00",
+                "window_end": NOW.isoformat(),
+                "delivery_state": "healthy",
+                "attribution_complete": True,
+                "complete": True,
+            }
+        },
+    }
+    limits = {
+        "performance_snapshot_max_age_hours": 2,
+        "learning_min_impressions": 1000,
+        "learning_min_landing_page_views": 30,
+        "learning_min_registrations": 10,
+        "meta_autonomy_cooldown_hours": 24,
+        "meta_autonomy_max_test_days": 7,
+        "meta_autonomy_max_replacements_24h": 1,
+        "meta_autonomy_max_increase_percent": 20,
+        "meta_autonomy_max_daily_budget_eur": 20,
+        "meta_no_delivery_grace_hours": 2,
+        "meta_account_timezone": "Europe/Brussels",
+    }
+    return publication, variants, source, limits
+
+
 def test_real_performance_namespaces_build_an_executable_policy_snapshot():
     variants = [
         {
@@ -108,6 +188,55 @@ def test_real_performance_namespaces_build_an_executable_policy_snapshot():
     parsed = _replacement_source(decision)
     assert parsed.current_meta_ids == source["current_meta_ids"]
     assert parsed.publication_id == 1
+
+
+def test_legacy_hook_shaped_variants_require_explicit_validated_experiment_identity():
+    publication, variants, source, limits = _executable_inputs()
+    variants = [
+        item | {"variant_id": f"experiment-1:{index:02}"}
+        for index, item in enumerate((*variants, variants[0]), 1)
+    ]
+
+    legacy = build_policy_decision(
+        publication,
+        variants,
+        replacement_source=source,
+        history=(),
+        limits=limits,
+        now=NOW,
+    )
+    validated = build_policy_decision(
+        publication,
+        variants,
+        replacement_source=source,
+        history=(),
+        limits=limits,
+        now=NOW,
+        experiment_id="experiment-1",
+    )
+
+    assert "experiment_id" not in legacy.evidence
+    assert validated.evidence["experiment_id"] == "experiment-1"
+
+
+def test_frozen_decision_evidence_rebuilds_the_same_snapshot_digest():
+    publication, variants, source, limits = _executable_inputs()
+    decision = build_policy_decision(
+        publication,
+        variants,
+        replacement_source=source,
+        history=(),
+        limits=limits,
+        now=NOW,
+    )
+
+    rebuilt = build_autonomy_snapshot(
+        publication,
+        decision.evidence["variants"],
+        replacement_source=decision.evidence["source"],
+    )
+
+    assert rebuilt["snapshot_id"] == decision.evidence["snapshot_id"]
 
 
 def test_canonical_digest_freezes_persisted_full_ids_and_budget_not_mutable_publication():

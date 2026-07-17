@@ -11,7 +11,13 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import (
+    ActionStatus,
+    DecisionKind,
+    FrozenDecision,
+    HookExperiment,
+    HookVariant,
+)
 from peermarket_agent.autonomy.store import (
     ClaimedAction,
     begin_execution,
@@ -20,8 +26,11 @@ from peermarket_agent.autonomy.store import (
     claim_next_action,
     enqueue_action,
     finish_action,
+    list_experiment_variants,
     record_budget_event,
     record_decision,
+    record_experiment,
+    record_experiment_variant,
     release_action,
     require_reconciliation,
 )
@@ -53,6 +62,76 @@ def decision(
         old_budget_cents=1000 if kind in {DecisionKind.SCALE, DecisionKind.REALLOCATE} else None,
         new_budget_cents=1200 if kind in {DecisionKind.SCALE, DecisionKind.REALLOCATE} else None,
     )
+
+
+def hook_experiment() -> HookExperiment:
+    identity = {
+        "audience": "declutterers",
+        "optimization": "LANDING_PAGE_VIEWS",
+        "format": "single_image",
+        "visual": "asset-1",
+        "delivery": "lowest_cost",
+    }
+    variants = tuple(
+        HookVariant(
+            variant_id=f"hook-{number}",
+            experiment_id="draft-156-hooks-v1",
+            campaign_id="120249125021520342",
+            ad_set_id="120249125021520343",
+            landing_page_url="https://peermarket.eu/signup",
+            changed_dimension="hook",
+            fixed_identity=identity,
+            language_bundles={
+                locale: {
+                    "hook": f"{locale} hook {number}",
+                    "body": f"{locale} body",
+                    "headline": f"{locale} headline",
+                    "description": f"{locale} description",
+                    "cta_label": "Learn More",
+                }
+                for locale in ("NL", "FR", "EN")
+            },
+        )
+        for number in range(1, 4)
+    )
+    return HookExperiment(
+        experiment_id="draft-156-hooks-v1",
+        campaign_id="120249125021520342",
+        ad_set_id="120249125021520343",
+        landing_page_url="https://peermarket.eu/signup",
+        changed_dimension="hook",
+        fixed_identity=identity,
+        variants=variants,
+    )
+
+
+async def test_record_experiment_persists_exact_nine_identity_rows_idempotently(engine):
+    experiment = hook_experiment()
+    first = await record_experiment(engine, experiment)
+    second = await record_experiment(engine, experiment)
+    listed = await list_experiment_variants(engine, experiment.experiment_id)
+    assert len(first) == len(second) == len(listed) == 9
+    assert [(row.variant_id, row.language) for row in listed] == [
+        (f"hook-{number}", locale) for number in range(1, 4) for locale in ("NL", "FR", "EN")
+    ]
+    assert all(row.fixed_identity == experiment.fixed_identity for row in listed)
+
+
+async def test_partial_experiment_bundle_recovers_without_duplicate_rows(engine):
+    experiment = hook_experiment()
+    await record_experiment_variant(engine, experiment, experiment.variants[0], "NL")
+    assert len(await list_experiment_variants(engine, experiment.experiment_id)) == 1
+    recovered = await record_experiment(engine, experiment)
+    assert len(recovered) == 9
+
+
+async def test_experiment_identity_drift_is_rejected_instead_of_overwritten(engine):
+    experiment = hook_experiment()
+    await record_experiment_variant(engine, experiment, experiment.variants[0], "NL")
+    drifted = hook_experiment()
+    object.__setattr__(drifted, "landing_page_url", "https://peermarket.eu/other")
+    with pytest.raises(ValueError, match="identity drift"):
+        await record_experiment_variant(engine, drifted, drifted.variants[0], "FR")
 
 
 async def test_record_decision_is_idempotent_and_never_overwrites_evidence(engine):

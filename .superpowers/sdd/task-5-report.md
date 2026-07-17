@@ -1,200 +1,111 @@
-# Task 5 Report: CI Configuration and Activation Guard
+# Task 5 report — guarded three-variant Meta bundles
 
-## Implemented
+## Outcome
 
-- Added `Settings.meta_auto_activate` with the safe default `False` and standard
-  Pydantic environment boolean parsing.
-- Added an early pipeline refusal for approved Meta drafts while automatic
-  activation is disabled. The guard runs before screenshots, resource creation,
-  publication persistence, or activation, and alerts the founder.
-- Updated direct pipeline tests to opt into activation intentionally.
-- Added deployment workflow propagation from the non-secret GitHub repository
-  variable, falling back to `false`, without printing the environment file.
-- Added a disposable `pgvector/pgvector:pg15` test job. Deployment now depends on
-  the full pytest suite succeeding in that job.
+- Added a production adapter matrix for exactly three ordered hook variants (`:01`, `:02`, `:03`), each with exact NL/FR/EN children.
+- All variants share one campaign and one ad set; the matrix requires nine unique creative IDs and nine unique ad IDs.
+- Durable progress is namespaced per variant while campaign/ad-set IDs remain shared. Complete retries perform zero Meta SDK writes, and conflicting durable identity fails closed.
+- Added a frozen `HookExperiment` to `MetaBundleLocale` translator, preserving landing page, non-hook copy, locale, CTA, and variant identity.
+- Added the executor bridge with an explicit shadow-mode refusal before the matrix adapter can be called.
+- Existing replacement publication leases, fenced progress callback, paused verification, compensation, and executor transient/rate-limit classification remain the controlling production path.
 
-## TDD Evidence
+## RED evidence
 
-- RED: focused tests reported five configuration failures because the field was
-  absent; the database-backed pipeline test proceeded into Meta creation while
-  disabled.
-- GREEN: the same focused slice passed: `10 passed`.
+The new tests initially had no three-variant adapter. After the first implementation pass, the executor shadow test failed before reaching its assertion because its settings fixture omitted Meta connector fields. The fixture was completed and the test then proved the external matrix boundary was not awaited.
 
-## Verification
+## GREEN evidence
 
-- Full suite with disposable local pgvector endpoint: `188 passed in 13.34s`.
-- `uv run ruff check src tests`: passed.
-- Ruff format check for all Task 5 touched Python files: passed.
-- Workflow YAML syntax checks for `ci.yml` and `deploy.yml`: passed.
-- `git diff --check`: passed.
+- `uv run ruff check ...` — all Task 5 files passed.
+- `uv run pytest -q tests/test_meta_ads.py -k hook_experiment_matrix` — `4 passed, 85 deselected`.
+- `uv run pytest -q tests/test_autonomy_executor.py -k 'hook_experiment_adapter_shadow or shadow_mode_is_impossible'` — `2 passed, 85 deselected`.
+- `git diff --check` — clean.
 
-## Existing Concern
+The matrix tests exercise the production async adapter while faking only `_sync_create_bundle_resource`, the external SDK boundary. They verify one parent hierarchy, all nine children, duplicate-free durable retry, immediate rate-limit propagation, and cross-variant resource-reuse drift rejection. The broader three-file clean-DB run progressed through all Meta adapter tests but encountered failures in the existing database-backed executor section; the focused Task 5 paths are green.
 
-The repository-wide `uv run ruff format --check src tests` still reports three
-pre-existing files from earlier feature tasks (`publications.py`,
-`test_migrations.py`, and `test_publications.py`). Task 5 did not modify those
-unrelated files; all Python files changed by Task 5 satisfy the formatter.
+No Meta call, deployment, workflow dispatch, or GitHub variable change was performed.
 
-No repository variable was changed, no branch was pushed, and no deployment or
-production reconciliation was attempted.
+## Saga-integration remediation
 
-## Review Blocker Follow-up
+Following review rejection, the production replacement path now recognizes the configured frozen experiment ID, reconstructs the exact `HookExperiment` from all nine append-only database rows, and dispatches the matrix through `_replace` rather than exposing only a low-level adapter.
 
-The three previously reported formatter failures were resolved by running Ruff
-format only on `src/peermarket_agent/publications.py`,
-`tests/test_migrations.py`, and `tests/test_publications.py`. Diff inspection
-confirmed mechanical wrapping, method-chain layout, and equivalent string quote
-changes only; behavior and SQL content are unchanged.
+The production adapter first enters the established `publish_replacement_paused` path, thereby acquiring/reusing the durable replacement-publication record and its leases. Variant `:01` adopts the already-created NL/FR/EN children. Variants `:02` and `:03` persist namespaced progress through a SQL callback fenced by action ID, lease owner, lease token, and unexpired lease. Retries reconstruct variant `:01` from its durable base IDs and adopt namespaced IDs for later variants.
 
-Fresh post-format verification:
+The saga verifies all three paused bundles, performs guarded activation across all nine ads, verifies all three active bundles, and only then pauses the source. Failure after an external write enters reverse variant cleanup and requires all three bundles to reread paused; unproven cleanup is returned through `_SagaFailure`, causing the existing executor reconciliation block rather than a clean retry. Shadow mode still refuses before publication or Meta mutation.
 
-- `uv run ruff format --check src tests`: `70 files already formatted`.
-- `uv run ruff check src tests`: passed.
-- Full suite with the local disposable pgvector DSN: `188 passed in 13.84s`.
-- Both workflow YAML files parsed successfully and deployment contract
-  assertions passed.
-- `git diff --check`: passed.
+Remediation checks:
 
-## Meta attribution-learning Task 5 review follow-up (2026-07-16)
+- `ruff check` passed for executor, replacement, Meta adapter, and focused tests.
+- Hook matrix tests: `4 passed`.
+- Executor shadow-boundary tests: `2 passed`.
+- No external Meta boundary, deployment, dispatch, or GitHub variable was used.
 
-The daily attribution implementation was hardened in a strict review-driven
-TDD pass. No Meta resource, budget ledger, deployment, production database, or
-external configuration was mutated.
+## Critical identity and recovery fixwave
 
-### Root causes and RED evidence
+- Removed generic `publish_replacement_paused` resource adoption from the hook path. It now initializes only the fenced replacement-publication database intention; every creative/ad, including variant `:01`, is created from its persisted HookExperiment language bundle.
+- Live matrix reads now supply creative IDs, exact landing page, exact locale payloads, and image hashes to the existing Meta identity verifier before activation. Ordinary replacement copy therefore cannot pass as hook variant `:01`.
+- Every matrix progress key is persisted immediately through the action/replacement lease owner, token, and expiry fence. Partial cleanup reconstructs IDs from the database instead of relying on an in-memory completed result, preventing the previous partial-result `KeyError` class.
+- Activation renews the action lease and rereads exact creative/parent/ad identity before the first write and every subsequent ad write. Drift or lease loss enters compensation.
+- Success now requires a post-mutation live source reread satisfying the exact paused-source contract; otherwise the matrix is compensated and reconciliation remains fail-closed.
 
-- The initial evaluator covered only impressions, Meta landing-page views, and
-  a legacy registration event name. It therefore omitted the designed funnel,
-  costs, and denominator guards. The expanded regressions failed across the
-  exact metric map and every missing/zero denominator.
-- Comparison identity used fabricated objective, audience, and `utc-day`
-  defaults, and invalid source windows fell back to the current date. Missing
-  dimension and missing/invalid source-window regressions failed.
-- Learning evidence retained aggregate IDs and totals but not complete
-  per-variant values, dimensions, thresholds, or replayable decisions.
-  Evidence-shape, reinforcement, and concurrent replay regressions failed.
-- The hourly snapshot did not persist an explicit requested rolling-window
-  definition, and new Meta drafts did not persist their fixed traffic
-  objective. Both source-identity regressions failed.
-- The first review RED run reported `32 failed, 19 passed`; the secondary
-  evidence/source RED run reported `2 failed, 1 passed`.
+Fixwave verification: Ruff and Python compilation passed; hook matrix tests `4 passed`; executor shadow-boundary tests `2 passed`; `git diff --check` passed. No external or deployment mutation occurred.
 
-### Implemented review contract
+## PostgreSQL production-path coverage
 
-- `evaluate_publication` now returns the exact designed raw and derived metric
-  set: approved budget, spend, delivery, impressions, clicks/link clicks, Meta
-  and first-party landings, registrations, first listing created/published,
-  identity verification, and all seven guarded cost/conversion calculations.
-- Absent Meta values and suppressed/absent aggregate event groups remain
-  `None`; Slack renders them as `unavailable`. A missing or zero denominator
-  always yields `None`, never a fabricated zero conversion.
-- Daily summaries include every designed metric, explicit source window and
-  definition, sample sizes, and the Ads Manager link, under a descriptive-only
-  heading with no causal claim.
-- Completed immutable observations require valid explicit source
-  `window_start`, `window_stop`, and `window_definition`. Missing, malformed,
-  reversed, or incomplete source windows create no observation or learning and
-  are reported as unavailable. The hourly collector records the actual
-  requested rolling inclusive-calendar-day identity. Same-day start/stop
-  bounds remain a valid one-day inclusive window; only reversed bounds fail.
-- Reusable comparisons reject any missing or blank channel, objective, language,
-  audience, window definition, or bounds. They compare exact definitions and
-  bounds; persisted evidence also records inclusive window length.
-- New Meta drafts persist the connector's actual `OUTCOME_TRAFFIC` objective at
-  source. The daily layer does not infer missing objectives or audiences.
-- Each eligible learning evidence run records a deterministic decision ID,
-  eligible/reason result, dimensions, exact window, thresholds, aggregate
-  sample, and per-variant publication ID, immutable evidence ID, complete
-  compared metric values, and threshold sample sizes.
-- Replays of the same decision are idempotent. A genuinely new comparable
-  window reinforces once while retaining all prior replayable evidence runs.
-  Publication row locks serialize concurrent daily replays.
+Added a real PostgreSQL `execute_claim` test with a canonical persisted REPLACE decision, claimed action lease, all nine append-only experiment rows, a real `MetaExecutionAdapter`, a generated replacement draft row, and the real `_replace` hook branch. Only Meta SDK-facing functions are replaced.
 
-### Review verification
+The test proves that:
 
-- Focused RED-to-GREEN suite:
-  `tests/test_performance_daily.py tests/test_learnings.py tests/test_agent_hourly_loop.py tests/test_cli_draft.py`
-  -> `60 passed`.
-- Focused plus adjacent database suite:
-  `tests/test_performance_daily.py tests/test_learnings.py tests/test_agent_hourly_loop.py tests/test_cli_draft.py tests/test_agent_main.py tests/test_migrations.py tests/test_publications.py tests/test_performance.py tests/test_meta_insights.py`
-  -> `121 passed in 13.98s` against local PostgreSQL on port 55432.
-- `uv run ruff check src tests` -> all checks passed.
-- `uv run ruff format --check src tests` -> 98 files already formatted.
-- `git diff --check` -> clean.
+- all nine creative payloads originate from persisted `exp:01`/`:02`/`:03` NL/FR/EN bundles and never from the ordinary replacement draft copy;
+- exactly nine unique ads activate and the source pauses;
+- every creative/ad ID is immediately present in fenced `autonomous_replacement_publications.progress`;
+- the action finishes `succeeded` with all three variants in persisted `after_state`.
 
-## Durable daily-summary delivery follow-up (2026-07-16)
+Exact focused command:
 
-### RED evidence
+`AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
 
-The durable-delivery regressions initially reported `7 failed, 36 passed`:
+Result: `3 passed, 85 deselected`. Ruff and `git diff --check` also passed. Existing adapter-level PostgreSQL-independent tests continue to cover durable complete retry without duplicate SDK calls, rate-limit interruption, and child-resource drift; the saga uses the same fenced progress representation exercised by the new PostgreSQL success path.
 
-- no daily summary outbox table existed;
-- a false notifier result was discarded rather than retained for retry;
-- notifier exceptions escaped and could expose their raw message;
-- a newer daily window superseded an older failed send;
-- concurrent runs sent the same summary twice;
-- successful replays sent again; and
-- stale claims had no durable retry mechanism.
+## Replacement-publication lease fencing
 
-A separate recovery regression then failed because an immutable observation
-created before the outbox migration was not backfilled into a pending summary.
+Creation now checks the intention UPSERT rowcount and then locks/selects the replacement publication only when action ID, lease owner, lease token, and unexpired lease all match. Cleanup independently renews the action and selects progress with the same replacement-lease predicate. A transferred publication lease therefore causes zero matrix-create and zero reverse-pause SDK calls.
 
-### Implemented delivery contract
+PostgreSQL coverage creates a future-dated replacement lease owned by another worker and proves both creation and cleanup refuse before their SDK boundaries.
 
-- Added the idempotent `daily_performance_summary_outbox` migration with a
-  unique immutable summary key, exact source-window identity, publication and
-  evidence references, sanitized message, pending/sent status, attempt and sent
-  timestamps, claim token/lease, and bounded failure category.
-- Summary rows are inserted in the same transaction as immutable observations
-  and learnings, before any Slack call. Existing observations are also
-  idempotently reconstructed into missing outbox rows during rollout/recovery.
-- The drain claims only the oldest pending window under a row lock. An active
-  oldest lease prevents a concurrent worker from overtaking it; an expired
-  lease is reclaimed. Newer windows drain only after all older sends are
-  confirmed.
-- Slack delivery occurs outside the database transaction. A truthy result marks
-  the token-matched row sent atomically. False or exception releases the claim,
-  leaves the row pending, records only `notification_not_confirmed` or
-  `notification_exception`, and stops the drain so immediate retries cannot
-  loop or reorder windows.
-- Sent summaries and concurrent runs are idempotent. No Meta resource, budget,
-  production system, PII, credential, or raw exception text is read or mutated
-  by this path.
+Exact clean-database focused command:
 
-### Focused GREEN
+`AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
 
-`tests/test_performance_daily.py tests/test_learnings.py tests/test_migrations.py tests/test_agent_main.py`
-reported `54 passed in 6.97s` against local PostgreSQL on port 55432.
+Result: `4 passed, 85 deselected in 3.08s`. Ruff passed and the diff was whitespace-clean.
 
-Final focused-plus-adjacent verification reported `128 passed in 16.33s`;
-repository-wide Ruff check passed, all 98 Python files were already formatted,
-and `git diff --check` was clean.
+## PostgreSQL failure and resume matrix
 
-## Missing-source-window diagnostic follow-up (2026-07-16)
+The production-path test is now parameterized across success and four injected SDK failures while retaining the real claimed action, real persisted nine-row experiment, real replacement-publication progress, real `MetaExecutionAdapter`, real `_replace`, and real executor finalization:
 
-The final regression pass prevents eligible Meta publications with incomplete
-source-window metadata from disappearing silently.
+- rate limit after variant `:01` progress: reverse cleanup runs, action reconciles, then the same durable action/publication is re-leased to a new worker and a fresh adapter; retry succeeds with exactly nine unique creative SDK payloads total, proving variant `:01` adoption without duplicate creation;
+- persisted payload versus live creative drift: the verifier receives and asserts exact creative IDs, landing URL, and NL/FR/EN locale payloads, then drift causes cleanup and reconciliation before activation;
+- action lease loss during activation: the next fenced write stops and stale-worker cleanup cannot mutate;
+- reverse-pause failure: cleanup is unproven and the action persists reconciliation-required rather than success or retry;
+- success: all nine activate, source pauses, every ID remains in fenced DB progress, and the final action audit state succeeds.
 
-### TDD evidence and behavior
+Combined clean-DB command:
 
-- RED: five diagnostic regressions failed because no durable diagnostic was
-  enqueued and the outbox lacked diagnostic identity columns.
-- GREEN: the focused daily, migration, main-loop, and learning slice reported
-  `56 passed in 7.93s`.
-- Each invalid/missing source-window publication now enqueues the exact
-  sanitized message `Publication #<id> — source window unavailable`.
-- Diagnostic identity is deterministic by publication ID, UTC run day, and
-  unavailable kind. Same-day runs are idempotent; a still-unavailable
-  publication may report again on the next UTC day.
-- Diagnostics use `summary_kind` and `run_day`; source `window_start`,
-  `window_stop`, and `window_definition` remain null, and `evidence_ids` is an
-  empty array. No metrics, observation, comparison, or learning is fabricated.
-- Diagnostics use the same persist-before-send pending row, oldest-ID claim,
-  lease, sanitized false/exception failure, retry, and atomic sent transition
-  as evidence summaries. Older pending rows cannot be overtaken.
-- The migration is upgrade-safe: it adds diagnostic columns idempotently and
-  relaxes only the source-window nullability needed for explicitly unavailable
-  diagnostics.
-- Final focused-plus-adjacent verification reported `130 passed in 17.17s`;
-  repository-wide Ruff check passed, all 98 Python files were formatted, and
-  `git diff --check` was clean.
+`AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
+
+Result: `8 passed, 85 deselected in 5.83s`. Ruff format/check and `git diff --check` passed.
+
+## Per-mutation activation and cleanup fences
+
+The former combined campaign/ad-set/first-ad activation was split into three single-resource SDK operations. Immediately before each, the adapter renews the action, verifies exact replacement-publication owner/token/expiry, and rereads the complete live creative/landing/locale hierarchy. Every remaining ad write uses the same fence. Reverse cleanup likewise renews and revalidates both leases before each variant pause.
+
+PostgreSQL fault injection now steals leases at the exact campaign→ad-set boundary, ad-set→first-ad boundary, a later-ad boundary, and between reverse variant pauses. Each case proves no later stale write occurs and finalization remains fail-closed.
+
+Combined command result: `11 passed, 85 deselected in 7.28s`. Ruff format/check and `git diff --check` passed.
+
+## Live-verified reverse cleanup
+
+Before every reverse pause, after both lease fences, cleanup reconstructs the persisted variant's exact creative/ad IDs and invokes the live verifier with the frozen landing page and NL/FR/EN payload matrix. Missing partial identity or any parent/creative/content drift prevents that pause entirely and leaves reconciliation required.
+
+Cleanup verification now consumes the real adapter shape: `pause_errors` must be empty, `observed` must be non-empty, and every observed configured/effective state must be paused or an accepted paused/review state. Tests cover verified real-shape success, explicit pause errors, and an ambiguous ACTIVE observation. Creative drift asserts zero pause SDK calls.
+
+Combined clean-DB result: `12 passed, 85 deselected in 17.32s`. Ruff format/check and `git diff --check` passed.

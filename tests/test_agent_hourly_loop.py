@@ -11,7 +11,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from peermarket_agent.agent.loops.hourly import collect_meta_performance, run_hourly_pulse
+from peermarket_agent.agent.loops.hourly import (
+    _collect_hook_experiment_metrics,
+    collect_meta_performance,
+    run_hourly_pulse,
+)
 from peermarket_agent.autonomy.contracts import DecisionKind
 from peermarket_agent.autonomy.snapshot import build_policy_decision
 from peermarket_agent.config import Settings
@@ -151,6 +155,113 @@ ACTIVE = {
     "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE"},
     "ad": {"status": "ACTIVE", "effective_status": "ACTIVE"},
 }
+
+
+async def test_hook_experiment_collector_persists_real_nine_ad_metrics(engine, monkeypatch):
+    experiment = "exp-hook"
+    await _publication(
+        engine,
+        156,
+        "source-ad",
+        external_ids={"campaign_id": "10", "ad_set_id": "20", "ad_id": "source-ad"},
+        budget=1000,
+    )
+    progress = {"campaign_id": "50", "ad_set_id": "60"}
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status) VALUES (157,1,'meta','MULTI','approved')"
+            )
+        )
+        decision = await conn.scalar(
+            text(
+                "INSERT INTO autonomous_decisions(decision_key,kind,campaign_id,window_start,window_end,evidence,reason) VALUES ('hook-collect','replace','10',NOW()-INTERVAL '1 day',NOW(),'{}','test') RETURNING id"
+            )
+        )
+        action = await conn.scalar(
+            text(
+                "INSERT INTO autonomous_actions(decision_id,campaign_id,status) VALUES (:decision,'10','executing') RETURNING id"
+            ),
+            {"decision": decision},
+        )
+        for number in (1, 2, 3):
+            variant = f"{experiment}:{number:02}"
+            for locale in ("NL", "FR", "EN"):
+                ad_id = f"ad-{number}-{locale}"
+                progress[f"variant:{variant}:ad_id:{locale}"] = ad_id
+                await conn.execute(
+                    text(
+                        "INSERT INTO autonomous_hook_experiment_variants(experiment_id,variant_id,language,campaign_id,ad_set_id,landing_page_url,changed_dimension,fixed_identity,language_bundle) VALUES (:experiment,:variant,:locale,'10','60','https://peermarket.eu/','hook',CAST(:identity AS JSONB),CAST(:bundle AS JSONB))"
+                    ),
+                    {
+                        "experiment": experiment,
+                        "variant": variant,
+                        "locale": locale,
+                        "identity": json.dumps(
+                            {
+                                "audience": "declutterers",
+                                "optimization": "LINK_CLICKS",
+                                "format": "single_image",
+                                "visual": "asset",
+                                "delivery": "lowest_cost",
+                            }
+                        ),
+                        "bundle": json.dumps(
+                            {
+                                "hook": "h",
+                                "body": "b",
+                                "headline": "x",
+                                "description": "d",
+                                "cta_label": "Learn More",
+                            }
+                        ),
+                    },
+                )
+        await conn.execute(
+            text(
+                "INSERT INTO autonomous_replacement_publications(action_id,replacement_draft_id,source_draft_id,state,frozen_budget_cents,source_campaign_id,changed_dimension,landing_page_url,progress) VALUES (:action,157,156,'paused',1000,'10','hook','https://peermarket.eu/',CAST(:progress AS JSONB))"
+            ),
+            {"action": action, "progress": json.dumps(progress)},
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(side_effect=lambda config, ad_id, start, stop: _snapshot(ad_id, impressions=100)),
+    )
+    await _collect_hook_experiment_metrics(
+        engine,
+        SimpleNamespace(meta_autonomy_experiment_id=experiment),
+        object(),
+        NOW.date(),
+        NOW.date(),
+        NOW - timedelta(days=1),
+        NOW,
+        tuple(
+            SimpleNamespace(
+                utm_content=f"{experiment}:{number:02}:{locale}",
+                event_type="registration",
+                event_count=number,
+            )
+            for number in (1, 2, 3)
+            for locale in ("NL", "FR", "EN")
+        ),
+        NOW,
+    )
+    async with engine.connect() as conn:
+        performance = await conn.scalar(
+            text("SELECT performance FROM publications WHERE draft_id=156")
+        )
+    persisted = performance["hook_experiment_variants"]
+    assert len(persisted) == 3
+    assert (
+        sum(item["impressions"] for variant in persisted.values() for item in variant.values())
+        == 900
+    )
+    assert all(item["window_start"] for variant in persisted.values() for item in variant.values())
+    assert [
+        sum(item["registrations"] for item in persisted[f"{experiment}:{number:02}"].values())
+        for number in (1, 2, 3)
+    ] == [3, 6, 9]
 
 
 async def test_one_meta_failure_does_not_block_other_publications(engine, monkeypatch):

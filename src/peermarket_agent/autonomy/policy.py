@@ -103,6 +103,16 @@ def evaluate_campaign(
         return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "mutation_cooldown")
 
     variants = normalized["variants"]
+    experiment_id = normalized.get("experiment_id")
+    if experiment_id is not None:
+        expected_ids = {f"{experiment_id}:{number:02}" for number in (1, 2, 3)}
+        if len(variants) != 3 or {item["variant_id"] for item in variants} != expected_ids:
+            return _decision(
+                DecisionKind.OBSERVE,
+                normalized,
+                ordered_history,
+                "incomplete_hook_experiment",
+            )
     if not _comparable(variants):
         return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "not_comparable")
     if not _evidence_floors(variants, policy):
@@ -222,6 +232,8 @@ def _normalize_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "allow_replacement": allow_replacement,
         "variants": variants,
     }
+    if snapshot.get("experiment_id") is not None:
+        normalized["experiment_id"] = _stable_id(snapshot.get("experiment_id"), "experiment_id")
     frozen_basis = snapshot.get("frozen_basis")
     if frozen_basis is not None:
         if not isinstance(frozen_basis, Mapping):
@@ -579,6 +591,14 @@ def _decision(
         "attribution_complete": snapshot["attribution_complete"],
         "variants": [_json_variant(item) for item in snapshot["variants"]],
     }
+    if "captured_at" in snapshot:
+        evidence["evidence_window"] = {
+            "start": snapshot["window_start"].isoformat(),
+            "end": snapshot["window_end"].isoformat(),
+            "captured_at": snapshot["captured_at"].isoformat(),
+        }
+    if "experiment_id" in snapshot:
+        evidence["experiment_id"] = snapshot["experiment_id"]
     if "configured_active_since" in snapshot:
         evidence["configured_active_since"] = snapshot["configured_active_since"].isoformat()
     if outcome:

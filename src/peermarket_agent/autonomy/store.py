@@ -13,7 +13,14 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import (
+    ActionStatus,
+    DecisionKind,
+    FrozenDecision,
+    HookExperiment,
+    HookVariant,
+    thaw_json,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +61,196 @@ class BudgetEvent:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ExperimentVariantRecord:
+    id: int
+    experiment_id: str
+    variant_id: str
+    language: str
+    campaign_id: str
+    ad_set_id: str
+    landing_page_url: str
+    changed_dimension: str
+    fixed_identity: dict[str, Any]
+    language_bundle: dict[str, Any]
+    created_at: datetime
+    created: bool = False
+
+
+def _experiment_variant_record(row: Any, *, created: bool = False) -> ExperimentVariantRecord:
+    return ExperimentVariantRecord(
+        id=int(row["id"]),
+        experiment_id=row["experiment_id"],
+        variant_id=row["variant_id"],
+        language=row["language"],
+        campaign_id=row["campaign_id"],
+        ad_set_id=row["ad_set_id"],
+        landing_page_url=row["landing_page_url"],
+        changed_dimension=row["changed_dimension"],
+        fixed_identity=dict(row["fixed_identity"]),
+        language_bundle=dict(row["language_bundle"]),
+        created_at=row["created_at"],
+        created=created,
+    )
+
+
+def _variant_payload(
+    experiment: HookExperiment, variant: HookVariant, language: str
+) -> dict[str, Any]:
+    if language not in {"NL", "FR", "EN"}:
+        raise ValueError("language must be one of NL/FR/EN")
+    if variant not in experiment.variants:
+        raise ValueError("variant does not belong to the frozen experiment")
+    return {
+        "experiment_id": experiment.experiment_id,
+        "variant_id": variant.variant_id,
+        "language": language,
+        "campaign_id": experiment.campaign_id,
+        "ad_set_id": experiment.ad_set_id,
+        "landing_page_url": experiment.landing_page_url,
+        "changed_dimension": experiment.changed_dimension,
+        "fixed_identity": thaw_json(experiment.fixed_identity),
+        "language_bundle": thaw_json(variant.language_bundles[language]),
+    }
+
+
+def _same_experiment_identity(row: Any, payload: dict[str, Any]) -> bool:
+    return all(
+        row[key] == payload[key]
+        for key in (
+            "experiment_id",
+            "campaign_id",
+            "ad_set_id",
+            "landing_page_url",
+            "changed_dimension",
+            "fixed_identity",
+        )
+    )
+
+
+async def _record_experiment_variant(
+    conn: AsyncConnection,
+    experiment: HookExperiment,
+    variant: HookVariant,
+    language: str,
+) -> ExperimentVariantRecord:
+    payload = _variant_payload(experiment, variant, language)
+    existing_identity = (
+        (
+            await conn.execute(
+                text(
+                    "SELECT experiment_id,campaign_id,ad_set_id,landing_page_url,"
+                    "changed_dimension,fixed_identity FROM autonomous_hook_experiment_variants "
+                    "WHERE experiment_id=:experiment_id ORDER BY id LIMIT 1"
+                ),
+                payload,
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if existing_identity is not None and not _same_experiment_identity(existing_identity, payload):
+        raise ValueError("hook experiment identity drift")
+    inserted = (
+        (
+            await conn.execute(
+                text(
+                    "INSERT INTO autonomous_hook_experiment_variants "
+                    "(experiment_id,variant_id,language,campaign_id,ad_set_id,landing_page_url,"
+                    "changed_dimension,fixed_identity,language_bundle) VALUES "
+                    "(:experiment_id,:variant_id,:language,:campaign_id,:ad_set_id,"
+                    ":landing_page_url,:changed_dimension,CAST(:fixed_identity AS JSONB),"
+                    "CAST(:language_bundle AS JSONB)) ON CONFLICT "
+                    "(experiment_id,variant_id,language) DO NOTHING RETURNING *"
+                ),
+                {
+                    **payload,
+                    "fixed_identity": _json(payload["fixed_identity"]),
+                    "language_bundle": _json(payload["language_bundle"]),
+                },
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if inserted is not None:
+        return _experiment_variant_record(inserted, created=True)
+    existing = (
+        (
+            await conn.execute(
+                text(
+                    "SELECT * FROM autonomous_hook_experiment_variants WHERE "
+                    "experiment_id=:experiment_id AND variant_id=:variant_id AND language=:language"
+                ),
+                payload,
+            )
+        )
+        .mappings()
+        .one()
+    )
+    if (
+        not _same_experiment_identity(existing, payload)
+        or existing["language_bundle"] != payload["language_bundle"]
+    ):
+        raise ValueError("hook experiment variant identity drift")
+    return _experiment_variant_record(existing)
+
+
+async def record_experiment_variant(
+    engine: AsyncEngine,
+    experiment: HookExperiment,
+    variant: HookVariant,
+    language: str,
+) -> ExperimentVariantRecord:
+    """Append or replay one frozen language publication under an experiment lock."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:experiment_id, 11))"),
+            {"experiment_id": experiment.experiment_id},
+        )
+        return await _record_experiment_variant(conn, experiment, variant, language)
+
+
+async def record_experiment(
+    engine: AsyncEngine, experiment: HookExperiment
+) -> tuple[ExperimentVariantRecord, ...]:
+    """Atomically append/replay all nine frozen hook experiment publications."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:experiment_id, 11))"),
+            {"experiment_id": experiment.experiment_id},
+        )
+        return tuple(
+            [
+                await _record_experiment_variant(conn, experiment, variant, language)
+                for variant in experiment.variants
+                for language in ("NL", "FR", "EN")
+            ]
+        )
+
+
+async def list_experiment_variants(
+    engine: AsyncEngine, experiment_id: str
+) -> tuple[ExperimentVariantRecord, ...]:
+    """Read frozen experiment publication identities in deterministic contract order."""
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT * FROM autonomous_hook_experiment_variants "
+                        "WHERE experiment_id=:experiment_id ORDER BY variant_id,"
+                        "CASE language WHEN 'NL' THEN 1 WHEN 'FR' THEN 2 ELSE 3 END,id"
+                    ),
+                    {"experiment_id": experiment_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return tuple(_experiment_variant_record(row) for row in rows)
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, default=_json_default, sort_keys=True, separators=(",", ":"))
 
@@ -67,9 +264,9 @@ def _json_default(value: Any) -> str:
 
 
 async def _record_decision(conn: AsyncConnection, decision: FrozenDecision) -> RecordedDecision:
-    evidence = dict(decision.evidence)
+    evidence = thaw_json(decision.evidence)
     if decision.allocations is not None:
-        evidence["allocations"] = decision.allocations
+        evidence["allocations"] = thaw_json(decision.allocations)
     inserted = await conn.scalar(
         text(
             "INSERT INTO autonomous_decisions "

@@ -31,6 +31,7 @@ REQUIRED_TABLES = {
     "autonomous_actions",
     "autonomous_budget_events",
     "autonomous_replacement_publications",
+    "autonomous_hook_experiment_variants",
 }
 
 
@@ -43,6 +44,9 @@ def test_autonomy_migration_has_durable_constraints_and_audit_fields():
     assert "create table if not exists autonomous_actions" in migration_sql
     assert "references autonomous_decisions(id)" in migration_sql
     assert "lease_owner text" in migration_sql
+    assert "create table if not exists autonomous_hook_experiment_variants" in migration_sql
+    assert "unique (experiment_id, variant_id, language)" in migration_sql
+    assert "hook_experiment_variants_append_only" in migration_sql
     assert "lease_token text" in migration_sql
     assert "lease_expires_at timestamptz" in migration_sql
     assert "before_state jsonb" in migration_sql
@@ -62,6 +66,27 @@ def test_autonomy_migration_has_durable_constraints_and_audit_fields():
     assert "create table if not exists autonomous_replacement_publications" in migration_sql
     assert "unique (action_id)" in migration_sql
     assert "lease_owner text" in migration_sql
+
+
+async def test_hook_experiment_variant_identity_is_append_only_at_database_level(engine):
+    await run_migrations(engine)
+    async with engine.begin() as conn:
+        row_id = await conn.scalar(
+            text(
+                "INSERT INTO autonomous_hook_experiment_variants "
+                "(experiment_id,variant_id,language,campaign_id,ad_set_id,landing_page_url,"
+                "changed_dimension,fixed_identity,language_bundle) VALUES "
+                "('exp-1','hook-1','NL','120249125021520342','2','https://peermarket.eu',"
+                "'hook','{}'::jsonb,'{\"hook\":\"h\"}'::jsonb) RETURNING id"
+            )
+        )
+    for statement in (
+        "UPDATE autonomous_hook_experiment_variants SET variant_id='changed' WHERE id=:id",
+        "DELETE FROM autonomous_hook_experiment_variants WHERE id=:id",
+    ):
+        with pytest.raises(Exception, match="append-only"):
+            async with engine.begin() as conn:
+                await conn.execute(text(statement), {"id": row_id})
 
 
 def test_publications_migration_adds_reconciliation_columns_and_unique_draft_index():

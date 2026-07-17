@@ -342,3 +342,177 @@ def test_autonomy_command_accepts_draft_id_and_emits_sanitized_json(monkeypatch)
     assert json.loads(result.output) == report
     assert "token" not in result.output.casefold()
     inspect.assert_awaited_once_with(156)
+
+
+def test_hook_experiment_projection_is_sanitized_and_ready():
+    from types import SimpleNamespace
+
+    from peermarket_agent.cli_performance import _hook_experiment_status
+
+    identity = {"audience": "sensitive-audience-value"}
+    rows = [
+        {
+            "experiment_id": "exp",
+            "variant_id": f"exp:{variant:02}",
+            "language": language,
+            "campaign_id": "120249125021520342",
+            "ad_set_id": "2",
+            "landing_page_url": "https://peermarket.eu/signup",
+            "changed_dimension": "hook",
+            "fixed_identity": identity,
+        }
+        for variant in (1, 2, 3)
+        for language in ("NL", "FR", "EN")
+    ]
+    settings = SimpleNamespace(
+        meta_autonomy_experiment_id="exp",
+        meta_autonomy_shadow=True,
+        meta_autonomy_campaign_ids=("120249125021520342",),
+    )
+    expected = {
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "2",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": identity,
+    }
+    status = _hook_experiment_status(rows, settings=settings, draft_id=156, expected=expected)
+    assert status["ready"] is True
+    assert status["variant_count"] == 3
+    assert all(item["languages"] == ["EN", "FR", "NL"] for item in status["variants"])
+    assert "sensitive-audience-value" not in json.dumps(status)
+
+
+def test_experiment_evidence_projection_whitelists_samples_window_and_qualification():
+    from peermarket_agent.cli_performance import _safe_experiment_evidence
+
+    projected = _safe_experiment_evidence(
+        {
+            "experiment_id": "exp",
+            "delivery_state": "healthy",
+            "attribution_complete": True,
+            "variants": [
+                {
+                    "variant_id": "exp:01",
+                    "impressions": 1000,
+                    "landing_page_views": 30,
+                    "registrations": 10,
+                    "hook": "raw-hook-secret",
+                    "token": "raw-token-secret",
+                }
+            ],
+            "evidence_window": {
+                "start": "2026-07-16T12:00:00Z",
+                "end": "2026-07-17T12:00:00Z",
+                "captured_at": "2026-07-17T12:00:00Z",
+                "secret": "raw-window-secret",
+            },
+            "policy_limits": {
+                "min_impressions": 1000,
+                "min_landing_page_views": 30,
+                "min_registrations": 10,
+                "cooldown_hours": 24,
+                "secret": "raw-limit-secret",
+            },
+        },
+        "insufficient_evidence",
+    )
+    serialized = json.dumps(projected)
+    assert projected["reason"] == "insufficient_evidence"
+    assert projected["variant_ids"] == ["exp:01"]
+    assert projected["samples"][0]["registrations"] == 10
+    assert projected["window"]["captured_at"] == "2026-07-17T12:00:00Z"
+    assert projected["thresholds"] == {
+        "min_impressions": 1000,
+        "min_landing_page_views": 30,
+        "min_registrations": 10,
+        "cooldown_hours": 24,
+    }
+    assert "raw-" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("reason", "classification"),
+    [
+        ("invalid_snapshot", "neutral"),
+        ("invalid_history", "neutral"),
+        ("incomplete_window", "neutral"),
+        ("insufficient_evidence", "neutral"),
+        ("neutral_tie", "neutral"),
+        ("maximum_test_duration_without_qualified_comparison", "neutral"),
+        ("stale_snapshot", "neutral"),
+        ("missing_attribution", "neutral"),
+        ("not_comparable", "neutral"),
+        ("no_delivery_grace_period", "neutral"),
+        ("diagnose_no_delivery", "neutral"),
+        ("diagnose_rejected_or_error", "neutral"),
+        ("delivery_unavailable", "neutral"),
+        ("mutation_cooldown", "neutral"),
+        ("incomplete_hook_experiment", "neutral"),
+        ("invalid_reallocation", "neutral"),
+        ("missing_replacement_source", "neutral"),
+        ("replacement_limit", "neutral"),
+        ("increase_limit", "neutral"),
+        ("missing_budget_history", "neutral"),
+        ("absolute_budget_ceiling", "neutral"),
+        ("increase_headroom_exhausted", "neutral"),
+        ("invalid_campaign_allocations", "neutral"),
+        ("proven_loser_replace", "qualified"),
+        ("proven_winner_reallocate", "qualified"),
+        ("proven_winner_scale", "qualified"),
+    ],
+)
+def test_experiment_reason_classifier_accepts_policy_outcomes(reason, classification):
+    from peermarket_agent.cli_performance import classify_experiment_reason
+
+    assert classify_experiment_reason(reason) == classification
+
+
+def test_experiment_reason_classifier_rejects_unknown():
+    from peermarket_agent.cli_performance import classify_experiment_reason
+
+    with pytest.raises(ValueError, match="unknown experiment policy reason"):
+        classify_experiment_reason("unknown_new_reason")
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("ad_set_id", "wrong", "persisted_identity_mismatch"),
+        ("landing_page_url", "https://wrong.example", "persisted_identity_mismatch"),
+        ("changed_dimension", "body", "persisted_identity_mismatch"),
+        ("variant_id", "exp:99", "variant_ids_mismatch"),
+    ],
+)
+def test_hook_experiment_projection_blocks_adversarial_persisted_identity(field, value, reason):
+    from peermarket_agent.cli_performance import _hook_experiment_status
+
+    identity = {"audience": "fixed"}
+    rows = [
+        {
+            "experiment_id": "exp",
+            "variant_id": f"exp:{variant:02}",
+            "language": language,
+            "campaign_id": "120249125021520342",
+            "ad_set_id": "2",
+            "landing_page_url": "https://peermarket.eu/signup",
+            "changed_dimension": "hook",
+            "fixed_identity": identity,
+        }
+        for variant in (1, 2, 3)
+        for language in ("NL", "FR", "EN")
+    ]
+    rows[-1][field] = value
+    settings = SimpleNamespace(
+        meta_autonomy_experiment_id="exp",
+        meta_autonomy_shadow=True,
+        meta_autonomy_campaign_ids=("120249125021520342",),
+    )
+    expected = {
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "2",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": identity,
+    }
+    status = _hook_experiment_status(rows, settings=settings, draft_id=156, expected=expected)
+    assert status["ready"] is False
+    assert status["blocked_reason"] == reason

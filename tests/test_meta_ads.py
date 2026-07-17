@@ -15,6 +15,7 @@ from peermarket_agent.meta_ads import (
     _sync_create_bundle_resource,
     activate_meta_ad,
     create_meta_ad_paused,
+    create_meta_hook_experiment_bundles_paused,
     create_meta_replacement_bundle_paused,
     get_meta_allocation_state,
     get_meta_budget_state,
@@ -23,6 +24,123 @@ from peermarket_agent.meta_ads import (
     set_meta_ad_status,
     set_meta_adset_daily_budget,
 )
+
+
+def _hook_matrix(experiment_id="exp"):
+    return {
+        f"{experiment_id}:{number:02}": {
+            locale: MetaBundleLocale(
+                f"{variant}-{locale} body", f"{locale} head", f"{locale} desc", "LEARN_MORE", None
+            )
+            for locale in ("NL", "FR", "EN")
+        }
+        for number, variant in enumerate(("one", "two", "three"), 1)
+    }
+
+
+async def test_hook_experiment_matrix_creates_one_parent_and_nine_unique_children(monkeypatch):
+    calls = []
+
+    def create_step(**kwargs):
+        progress, locale, name = kwargs["progress"], kwargs["locale"], kwargs["name"]
+        if "campaign_id" not in progress:
+            result = ("campaign_id", "campaign")
+        elif "ad_set_id" not in progress:
+            result = ("ad_set_id", "adset")
+        elif f"creative_id:{locale}" not in progress:
+            result = (f"creative_id:{locale}", f"creative-{name[-2:]}-{locale}")
+        else:
+            result = (f"ad_id:{locale}", f"ad-{name[-2:]}-{locale}")
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_step)
+    persisted = AsyncMock()
+    result = await create_meta_hook_experiment_bundles_paused(
+        config=_FULL_CONFIG,
+        experiment_id="exp",
+        variants=_hook_matrix(),
+        landing_page_url="https://peermarket.eu/",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        persist_progress=persisted,
+    )
+    assert [key for key, _ in calls].count("campaign_id") == 1
+    assert [key for key, _ in calls].count("ad_set_id") == 1
+    assert len({ad for bundle in result.variants.values() for ad in bundle.ad_ids.values()}) == 9
+    assert set(result.variants) == {"exp:01", "exp:02", "exp:03"}
+
+
+async def test_hook_experiment_matrix_retry_uses_durable_ids_without_duplicate_writes(monkeypatch):
+    meta = MagicMock(side_effect=AssertionError("complete durable matrix must not call Meta"))
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", meta)
+    progress = {"campaign_id": "campaign", "ad_set_id": "adset"}
+    for number in (1, 2, 3):
+        variant = f"exp:{number:02}"
+        for locale in ("NL", "FR", "EN"):
+            progress[f"variant:{variant}:creative_id:{locale}"] = f"cr-{number}-{locale}"
+            progress[f"variant:{variant}:ad_id:{locale}"] = f"ad-{number}-{locale}"
+    await create_meta_hook_experiment_bundles_paused(
+        config=_FULL_CONFIG,
+        experiment_id="exp",
+        variants=_hook_matrix(),
+        landing_page_url="https://peermarket.eu/",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        progress=progress,
+        persist_progress=AsyncMock(),
+    )
+    meta.assert_not_called()
+
+
+async def test_hook_experiment_matrix_propagates_rate_limit_without_starting_next_variant(
+    monkeypatch,
+):
+    calls = 0
+
+    def rate_limited(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise MetaAdsError("rate limited", phase="create_bundle", api_error_code=613)
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", rate_limited)
+    with pytest.raises(MetaAdsError) as caught:
+        await create_meta_hook_experiment_bundles_paused(
+            config=_FULL_CONFIG,
+            experiment_id="exp",
+            variants=_hook_matrix(),
+            landing_page_url="https://peermarket.eu/",
+            audience_profile_key="declutterers",
+            daily_budget_eur=10,
+            persist_progress=AsyncMock(),
+        )
+    assert caught.value.api_error_code == 613
+    assert calls == 1
+
+
+async def test_hook_experiment_matrix_rejects_child_resource_identity_reuse(monkeypatch):
+    def create_step(**kwargs):
+        progress, locale = kwargs["progress"], kwargs["locale"]
+        if "campaign_id" not in progress:
+            return "campaign_id", "campaign"
+        if "ad_set_id" not in progress:
+            return "ad_set_id", "adset"
+        if f"creative_id:{locale}" not in progress:
+            return f"creative_id:{locale}", f"creative-{locale}"
+        return f"ad_id:{locale}", f"ad-{locale}"
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_step)
+    with pytest.raises(MetaAdsError, match="reused child identity") as caught:
+        await create_meta_hook_experiment_bundles_paused(
+            config=_FULL_CONFIG,
+            experiment_id="exp",
+            variants=_hook_matrix(),
+            landing_page_url="https://peermarket.eu/",
+            audience_profile_key="declutterers",
+            daily_budget_eur=10,
+            persist_progress=AsyncMock(),
+        )
+    assert caught.value.phase == "verify_hook_bundle"
 
 
 async def test_pause_replacement_bundle_orders_all_children_before_parents_and_rereads(monkeypatch):
@@ -91,7 +209,7 @@ def _bundle_identity_kwargs(kind):
         name="PeerMarket autonomous action-7",
         audience_profile_key="declutterers",
         daily_budget_eur=10,
-        landing_page_url="https://peermarket.eu/?utm_content=frozen",
+        landing_page_url={"NL": "https://peermarket.eu/?utm_content=frozen"},
         locale=locale,
         creative=creative,
         progress=progress,
@@ -345,6 +463,17 @@ async def test_live_bundle_validation_reads_parent_links_and_frozen_creative_ide
     assert observed["ad_set"]["campaign_id"] == "c1"
     assert observed["ad:NL"]["creative"]["id"] == "cr-NL"
     assert observed["creative:NL"]["object_story_spec"]["link_data"]["message"] == "body"
+    with pytest.raises(MetaAdsError, match="frozen creative identity mismatch"):
+        await get_meta_replacement_bundle_statuses(
+            _FULL_CONFIG,
+            "c1",
+            "as1",
+            {"NL": "ad-NL"},
+            creative_ids={"NL": "cr-NL"},
+            landing_page_url={"NL": "https://peermarket.eu/?utm_content=wrong"},
+            locales={"NL": locale},
+            image_hashes={"NL": "ih"},
+        )
 
 
 @pytest.mark.parametrize(

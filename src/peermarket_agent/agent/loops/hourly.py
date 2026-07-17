@@ -477,7 +477,85 @@ async def collect_meta_performance(
         await _send_attribution_availability_alert(
             engine, notifier, unavailable=attribution_error, now=now
         )
+    await _collect_hook_experiment_metrics(
+        engine,
+        settings,
+        config,
+        start,
+        stop,
+        utc_start,
+        utc_stop_exclusive,
+        attribution or (),
+        now,
+    )
     return CollectionResult(updated=updated, failed=failed)
+
+
+async def _collect_hook_experiment_metrics(
+    engine: AsyncEngine,
+    settings,
+    config: MetaConfig,
+    start,
+    stop,
+    utc_start: datetime,
+    utc_stop_exclusive: datetime,
+    attribution,
+    now: datetime,
+) -> None:
+    experiment_id = str(getattr(settings, "meta_autonomy_experiment_id", "") or "")
+    if not experiment_id:
+        return
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT r.progress,p.draft_id,p.performance FROM autonomous_replacement_publications r "
+                        "JOIN publications p ON p.draft_id=r.source_draft_id "
+                        "JOIN autonomous_hook_experiment_variants v ON v.experiment_id=:experiment "
+                        "AND v.campaign_id=r.source_campaign_id WHERE r.changed_dimension='hook' "
+                        "ORDER BY r.id DESC LIMIT 1"
+                    ),
+                    {"experiment": experiment_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return
+    progress = dict(row["progress"] or {})
+    basis = dict((row["performance"] or {}).get("autonomy_basis") or {})
+    metrics: dict[str, dict] = {}
+    for number in (1, 2, 3):
+        variant_id = f"{experiment_id}:{number:02}"
+        metrics[variant_id] = {}
+        for locale in ("NL", "FR", "EN"):
+            ad_id = progress.get(f"variant:{variant_id}:ad_id:{locale}")
+            if not ad_id:
+                return
+            snapshot = await fetch_meta_insights(config, ad_id, start, stop)
+            registrations = sum(
+                int(getattr(item, "event_count", 0) or 0)
+                for item in attribution
+                if getattr(item, "utm_content", None) in {variant_id, f"{variant_id}:{locale}"}
+                and str(getattr(item, "event_type", "")).casefold()
+                in {"registration", "signup", "sign_up"}
+            )
+            metrics[variant_id][locale] = {
+                "ad_id": str(ad_id),
+                "impressions": int(snapshot.impressions),
+                "landing_page_views": int(snapshot.landing_page_views),
+                "registrations": registrations,
+                "window_start": basis.get("window_start", start.isoformat()),
+                "window_stop": basis.get("window_end", stop.isoformat()),
+                "utc_start": utc_start.isoformat(),
+                "utc_stop_exclusive": utc_stop_exclusive.isoformat(),
+                "captured_at": basis.get("captured_at", now.isoformat()),
+            }
+    await save_performance_snapshot(
+        engine, int(row["draft_id"]), {"hook_experiment_variants": metrics}
+    )
 
 
 async def run_hourly_pulse(

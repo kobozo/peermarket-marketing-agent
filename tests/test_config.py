@@ -38,6 +38,29 @@ def test_autonomy_defaults_are_safe(settings_payload):
     assert settings.meta_autonomy_max_test_days == 7
     assert settings.meta_autonomy_max_daily_budget_eur == 20
     assert settings.meta_autonomy_max_increase_percent == 20
+    assert settings.meta_autonomy_experiment_id == ""
+    assert settings.meta_autonomy_variant_count == 3
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 4, 99])
+def test_hook_experiment_variant_count_is_exactly_three(settings_payload, count):
+    with pytest.raises(ValidationError, match="3"):
+        Settings(**settings_payload, meta_autonomy_variant_count=count)
+
+
+def test_configured_first_hook_experiment_requires_exact_campaign_allowlist(settings_payload):
+    with pytest.raises(ValidationError, match="120249125021520342"):
+        Settings(
+            **settings_payload,
+            meta_autonomy_experiment_id="draft-156-hooks-v1",
+            meta_autonomy_campaign_ids_csv="999",
+        )
+    configured = Settings(
+        **settings_payload,
+        meta_autonomy_experiment_id="draft-156-hooks-v1",
+        meta_autonomy_campaign_ids_csv="120249125021520342",
+    )
+    assert configured.meta_autonomy_experiment_id == "draft-156-hooks-v1"
 
 
 def test_autonomy_campaign_allowlist_is_trimmed(settings_payload):

@@ -6,7 +6,7 @@ import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 from facebook_business.adobjects.ad import Ad
@@ -61,6 +61,14 @@ class MetaReplacementBundleResult:
     status: str = "PAUSED"
     image_hashes: Mapping[str, str] = field(default_factory=dict)
     local_image_sha256s: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MetaHookExperimentResult:
+    campaign_id: str
+    ad_set_id: str
+    variants: Mapping[str, MetaReplacementBundleResult]
+    status: str = "PAUSED"
 
 
 @dataclass(frozen=True)
@@ -648,7 +656,7 @@ async def create_meta_replacement_bundle_paused(
     config: MetaConfig,
     name: str,
     locales: Mapping[str, MetaBundleLocale],
-    landing_page_url: str,
+    landing_page_url: str | Mapping[str, str],
     audience_profile_key: str,
     daily_budget_eur: int,
     progress: Mapping[str, str] | None = None,
@@ -706,7 +714,13 @@ async def create_meta_replacement_bundle_paused(
                     name=name,
                     audience_profile_key=audience_profile_key,
                     daily_budget_eur=daily_budget_eur,
-                    landing_page_url=landing_page_url,
+                    landing_page_url=(
+                        landing_page_url[locale]
+                        if locale is not None and isinstance(landing_page_url, Mapping)
+                        else next(iter(landing_page_url.values()))
+                        if isinstance(landing_page_url, Mapping)
+                        else landing_page_url
+                    ),
                     locale=locale,
                     creative=child,
                     progress=current,
@@ -743,6 +757,87 @@ async def create_meta_replacement_bundle_paused(
     )
 
 
+async def create_meta_hook_experiment_bundles_paused(
+    *,
+    config: MetaConfig,
+    experiment_id: str,
+    variants: Mapping[str, Mapping[str, MetaBundleLocale]],
+    landing_page_url: str,
+    audience_profile_key: str,
+    daily_budget_eur: int,
+    progress: Mapping[str, str] | None = None,
+    persist_progress: Callable[[str, str], Awaitable[None]],
+) -> MetaHookExperimentResult:
+    """Create three paused hook variants under one fenced campaign/ad set."""
+    expected = tuple(f"{experiment_id}:{number:02}" for number in (1, 2, 3))
+    if tuple(variants) != expected or any(
+        set(bundle) != {"NL", "FR", "EN"} for bundle in variants.values()
+    ):
+        raise ValueError(
+            "hook experiment requires ordered :01/:02/:03 variants with exact NL/FR/EN"
+        )
+    durable = dict(progress or {})
+    results: dict[str, MetaReplacementBundleResult] = {}
+    shared = {key: durable[key] for key in ("campaign_id", "ad_set_id") if key in durable}
+    for variant_id in expected:
+        prefix = f"variant:{variant_id}:"
+        local = dict(shared)
+        local.update(
+            {
+                key.removeprefix(prefix): value
+                for key, value in durable.items()
+                if key.startswith(prefix)
+            }
+        )
+
+        async def persist(key: str, value: str, *, _prefix: str = prefix) -> None:
+            durable_key = key if key in {"campaign_id", "ad_set_id"} else _prefix + key
+            existing = durable.get(durable_key)
+            if existing is not None and existing != value:
+                raise MetaAdsError(
+                    "durable hook experiment identity drift", phase="persist_hook_bundle"
+                )
+            durable[durable_key] = value
+            await persist_progress(durable_key, value)
+
+        result = await create_meta_replacement_bundle_paused(
+            config=config,
+            name=f"{experiment_id} {variant_id}",
+            locales=variants[variant_id],
+            landing_page_url=hook_variant_locale_urls(landing_page_url, variant_id),
+            audience_profile_key=audience_profile_key,
+            daily_budget_eur=daily_budget_eur,
+            progress=local,
+            persist_progress=persist,
+        )
+        if shared and (
+            result.campaign_id != shared["campaign_id"] or result.ad_set_id != shared["ad_set_id"]
+        ):
+            raise MetaAdsError("hook variant parent identity drift", phase="verify_hook_bundle")
+        shared = {"campaign_id": result.campaign_id, "ad_set_id": result.ad_set_id}
+        results[variant_id] = result
+    ad_ids = [item for result in results.values() for item in result.ad_ids.values()]
+    creative_ids = [item for result in results.values() for item in result.creative_ids.values()]
+    if len(set(ad_ids)) != 9 or len(set(creative_ids)) != 9:
+        raise MetaAdsError("hook variants reused child identity", phase="verify_hook_bundle")
+    return MetaHookExperimentResult(shared["campaign_id"], shared["ad_set_id"], results)
+
+
+def _with_utm_content(url: str, identity: str) -> str:
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "utm_content"]
+    query.append(("utm_content", identity))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def hook_variant_locale_urls(base_url: str, variant_id: str) -> dict[str, str]:
+    """Return the frozen destination identity for each locale ad."""
+    return {
+        locale: _with_utm_content(base_url, f"{variant_id}:{locale}")
+        for locale in ("NL", "FR", "EN")
+    }
+
+
 def _sync_get_replacement_bundle_statuses(
     config: MetaConfig,
     campaign_id: str,
@@ -750,7 +845,7 @@ def _sync_get_replacement_bundle_statuses(
     ad_ids: Mapping[str, str],
     *,
     creative_ids: Mapping[str, str] | None = None,
-    landing_page_url: str | None = None,
+    landing_page_url: str | Mapping[str, str] | None = None,
     locales: Mapping[str, MetaBundleLocale] | None = None,
     image_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, str | int]]:
@@ -793,7 +888,11 @@ def _sync_get_replacement_bundle_statuses(
             frozen = locales[locale]
             link_data: dict[str, object] = {
                 "message": frozen.primary_text,
-                "link": landing_page_url,
+                "link": (
+                    landing_page_url[locale]
+                    if isinstance(landing_page_url, Mapping)
+                    else landing_page_url
+                ),
                 "name": frozen.headline,
                 "description": frozen.description,
                 "call_to_action": {"type": frozen.cta_type},
@@ -1058,6 +1157,31 @@ async def set_meta_ad_status(config: MetaConfig, ad_id: str, status: str) -> dic
     if not isinstance(status, str) or status not in _MUTABLE_AD_STATUSES:
         raise ValueError("status must be ACTIVE or PAUSED")
     return await asyncio.to_thread(_sync_set_ad_status, config, validated_id, status)
+
+
+def _sync_set_meta_resource_status(
+    config: MetaConfig, resource_kind: str, resource_id: str, status: str
+) -> dict[str, str]:
+    _ensure_enabled(config)
+    api = _init_api(config)
+    resource_type = {"campaign": Campaign, "ad_set": AdSet}[resource_kind]
+    resource = resource_type(resource_id, api=api)
+    resource.api_update(params={"status": status})
+    return dict(resource.api_get(fields=["status", "effective_status"]))
+
+
+async def set_meta_resource_status(
+    config: MetaConfig, resource_kind: str, resource_id: str, status: str
+) -> dict[str, str]:
+    """Set one campaign or ad-set status through one SDK mutation."""
+    if resource_kind not in {"campaign", "ad_set"}:
+        raise ValueError("resource_kind must be campaign or ad_set")
+    validated_id = _validate_resource_id(resource_id, f"{resource_kind}_id")
+    if status not in {"ACTIVE", "PAUSED"}:
+        raise ValueError("status must be ACTIVE or PAUSED")
+    return await asyncio.to_thread(
+        _sync_set_meta_resource_status, config, resource_kind, validated_id, status
+    )
 
 
 def _normalized_daily_budget(observed: dict) -> dict[str, int]:
