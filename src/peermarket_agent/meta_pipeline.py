@@ -261,6 +261,18 @@ async def publish_replacement_paused(
     await _require_live_replacement_claim(engine, claim, draft)
     if set(draft.locales) != {"NL", "FR", "EN"}:
         raise ValueError("replacement must contain exact NL/FR/EN locales")
+    ctas = {
+        "Learn More": "LEARN_MORE",
+        "Sign Up": "SIGN_UP",
+        "Shop Now": "SHOP_NOW",
+        "Get Started": "GET_STARTED",
+    }
+    frozen_locales = {
+        language: MetaBundleLocale(
+            item.primary_text, item.headline, item.description, ctas[item.cta_label], None
+        )
+        for language, item in draft.locales.items()
+    }
     attempt_token = uuid.uuid4().hex
     async with engine.begin() as conn:
         action = (
@@ -372,6 +384,16 @@ async def publish_replacement_paused(
                 progress["campaign_id"],
                 progress["ad_set_id"],
                 ad_ids,
+                creative_ids={
+                    language: progress[f"creative_id:{language}"] for language in ("NL", "FR", "EN")
+                },
+                landing_page_url=draft.landing_page_url,
+                locales=frozen_locales,
+                image_hashes={
+                    language: progress[f"image_hash:{language}"]
+                    for language in ("NL", "FR", "EN")
+                    if f"image_hash:{language}" in progress
+                },
             )
             valid = set(ad_ids) == {"NL", "FR", "EN"} and _is_verified_paused_bundle(
                 observed, draft.daily_budget_eur * 100
@@ -437,12 +459,6 @@ async def publish_replacement_paused(
             )
         except (ImageEditDisabled, ImageEditError):
             image = screenshot
-        ctas = {
-            "Learn More": "LEARN_MORE",
-            "Sign Up": "SIGN_UP",
-            "Shop Now": "SHOP_NOW",
-            "Get Started": "GET_STARTED",
-        }
 
         async def persist_progress(key: str, value: str) -> None:
             if ownership_lost.is_set():
@@ -517,7 +533,14 @@ async def publish_replacement_paused(
             if ownership_lost.is_set():
                 raise RuntimeError("replacement lease ownership was lost")
             observed = await get_meta_replacement_bundle_statuses(
-                _meta_config(settings), result.campaign_id, result.ad_set_id, result.ad_ids
+                _meta_config(settings),
+                result.campaign_id,
+                result.ad_set_id,
+                result.ad_ids,
+                creative_ids=result.creative_ids,
+                landing_page_url=draft.landing_page_url,
+                locales=frozen_locales,
+                image_hashes=result.image_hashes,
             )
             valid = _is_verified_paused_bundle(observed, draft.daily_budget_eur * 100)
             if result.status != "PAUSED" or not valid:

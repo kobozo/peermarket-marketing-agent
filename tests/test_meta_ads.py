@@ -16,9 +16,265 @@ from peermarket_agent.meta_ads import (
     create_meta_ad_paused,
     create_meta_replacement_bundle_paused,
     get_meta_budget_state,
+    get_meta_replacement_bundle_statuses,
     set_meta_ad_status,
     set_meta_adset_daily_budget,
 )
+
+
+def _identity_account(kind, candidates):
+    account = MagicMock()
+    for getter in ("get_campaigns", "get_ad_sets", "get_ad_images", "get_ad_creatives", "get_ads"):
+        getattr(account, getter).return_value = (
+            candidates
+            if getter
+            == {
+                "campaign": "get_campaigns",
+                "ad_set": "get_ad_sets",
+                "image": "get_ad_images",
+                "creative": "get_ad_creatives",
+                "ad": "get_ads",
+            }[kind]
+            else []
+        )
+    return account
+
+
+def _bundle_identity_kwargs(kind):
+    progress = {}
+    locale = "NL"
+    creative = MetaBundleLocale("body", "head", "desc", "LEARN_MORE", b"same-image")
+    if kind != "campaign":
+        progress["campaign_id"] = "campaign-1"
+    if kind not in {"campaign", "ad_set"}:
+        progress["ad_set_id"] = "adset-1"
+    if kind in {"creative", "ad"}:
+        progress["image_hash:NL"] = "image-hash"
+    if kind == "ad":
+        progress["creative_id:NL"] = "creative-1"
+    return dict(
+        config=_FULL_CONFIG,
+        name="PeerMarket autonomous action-7",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        landing_page_url="https://peermarket.eu/?utm_content=frozen",
+        locale=locale,
+        creative=creative,
+        progress=progress,
+    )
+
+
+@pytest.mark.parametrize("kind", ["campaign", "ad_set", "image", "creative", "ad"])
+def test_bundle_retry_rejects_same_name_with_wrong_immutable_identity(monkeypatch, kind):
+    kwargs = _bundle_identity_kwargs(kind)
+    names = {
+        "campaign": f"{kwargs['name']} — campaign",
+        "ad_set": f"{kwargs['name']} — adset",
+        "image": f"{kwargs['name']} NL image {__import__('hashlib').sha256(b'same-image').hexdigest()[:20]}",
+        "creative": f"{kwargs['name']} NL — creative",
+        "ad": f"{kwargs['name']} NL",
+    }
+    expected = {
+        "campaign": {
+            "id": "bad",
+            "name": names[kind],
+            "objective": "OUTCOME_SALES",
+            "special_ad_categories": [],
+            "account_id": "999",
+        },
+        "ad_set": {
+            "id": "bad",
+            "name": names[kind],
+            "campaign_id": "wrong-parent",
+            "daily_budget": "1000",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "LINK_CLICKS",
+            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+            "targeting": {},
+        },
+        "image": {"hash": "", "name": names[kind]},
+        "creative": {
+            "id": "bad",
+            "name": names[kind],
+            "object_story_spec": {
+                "page_id": _FULL_CONFIG.page_id,
+                "link_data": {
+                    "message": "wrong",
+                    "link": kwargs["landing_page_url"],
+                    "name": "head",
+                    "description": "desc",
+                    "call_to_action": {"type": "LEARN_MORE"},
+                    "image_hash": "image-hash",
+                },
+            },
+        },
+        "ad": {
+            "id": "bad",
+            "name": names[kind],
+            "adset_id": "wrong-parent",
+            "creative": {"id": "creative-1"},
+        },
+    }[kind]
+    account = _identity_account(kind, [expected])
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *a, **k: account)
+
+    with pytest.raises(MetaAdsError, match="identity") as caught:
+        _sync_create_bundle_resource(**kwargs)
+
+    assert caught.value.phase == "reconcile_bundle_identity"
+    assert not any(
+        getattr(account, method).called
+        for method in (
+            "create_campaign",
+            "create_ad_set",
+            "create_ad_image",
+            "create_ad_creative",
+            "create_ad",
+        )
+    )
+    assert _FULL_CONFIG.system_user_token not in str(caught.value)
+
+
+def test_bundle_retry_rejects_ambiguous_exact_campaign_matches(monkeypatch):
+    name = "PeerMarket autonomous action-7 — campaign"
+    exact = {
+        "name": name,
+        "objective": "OUTCOME_TRAFFIC",
+        "special_ad_categories": [],
+        "account_id": "999",
+    }
+    account = _identity_account("campaign", [{"id": "one", **exact}, {"id": "two", **exact}])
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *a, **k: account)
+    with pytest.raises(MetaAdsError, match="ambiguous"):
+        _sync_create_bundle_resource(**_bundle_identity_kwargs("campaign"))
+
+
+async def test_live_bundle_validation_reads_parent_links_and_frozen_creative_identity(monkeypatch):
+    states = {
+        ("campaign", "c1"): {"status": "PAUSED", "effective_status": "PAUSED"},
+        ("ad_set", "as1"): {
+            "status": "PAUSED",
+            "effective_status": "PAUSED",
+            "daily_budget": "1000",
+            "campaign_id": "c1",
+        },
+        ("creative", "cr-NL"): {
+            "object_story_spec": {
+                "page_id": _FULL_CONFIG.page_id,
+                "link_data": {
+                    "message": "body",
+                    "link": "https://peermarket.eu/?utm_content=frozen",
+                    "name": "head",
+                    "description": "desc",
+                    "call_to_action": {"type": "LEARN_MORE"},
+                    "image_hash": "ih",
+                },
+            }
+        },
+        ("ad", "ad-NL"): {
+            "status": "PAUSED",
+            "effective_status": "PAUSED",
+            "adset_id": "as1",
+            "creative": {"id": "cr-NL"},
+        },
+    }
+
+    class Resource:
+        def __init__(self, kind, rid):
+            self.kind, self.rid = kind, rid
+
+        def api_get(self, fields):
+            return states[(self.kind, self.rid)]
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: None)
+    monkeypatch.setattr("peermarket_agent.meta_ads.Campaign", lambda rid: Resource("campaign", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdSet", lambda rid: Resource("ad_set", rid))
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.AdCreative", lambda rid: Resource("creative", rid)
+    )
+    monkeypatch.setattr("peermarket_agent.meta_ads.Ad", lambda rid: Resource("ad", rid))
+    locale = MetaBundleLocale("body", "head", "desc", "LEARN_MORE", None)
+    observed = await get_meta_replacement_bundle_statuses(
+        _FULL_CONFIG,
+        "c1",
+        "as1",
+        {"NL": "ad-NL"},
+        creative_ids={"NL": "cr-NL"},
+        landing_page_url="https://peermarket.eu/?utm_content=frozen",
+        locales={"NL": locale},
+        image_hashes={"NL": "ih"},
+    )
+    assert observed["ad_set"]["campaign_id"] == "c1"
+    assert observed["ad:NL"]["creative"]["id"] == "cr-NL"
+    assert observed["creative:NL"]["object_story_spec"]["link_data"]["message"] == "body"
+
+
+@pytest.mark.parametrize("collision", ["adset_parent", "ad_parent", "ad_creative", "creative_copy"])
+async def test_live_bundle_validation_rejects_identity_collision(monkeypatch, collision):
+    story = {
+        "page_id": _FULL_CONFIG.page_id,
+        "link_data": {
+            "message": "body",
+            "link": "https://peermarket.eu/?utm_content=frozen",
+            "name": "head",
+            "description": "desc",
+            "call_to_action": {"type": "LEARN_MORE"},
+            "image_hash": "ih",
+        },
+    }
+    states = {
+        ("campaign", "c1"): {"status": "PAUSED", "effective_status": "PAUSED"},
+        ("ad_set", "as1"): {
+            "status": "PAUSED",
+            "effective_status": "PAUSED",
+            "daily_budget": "1000",
+            "campaign_id": "c1",
+        },
+        ("creative", "cr1"): {"object_story_spec": story},
+        ("ad", "ad1"): {
+            "status": "PAUSED",
+            "effective_status": "PAUSED",
+            "adset_id": "as1",
+            "creative": {"id": "cr1"},
+        },
+    }
+    if collision == "adset_parent":
+        states[("ad_set", "as1")]["campaign_id"] = "other"
+    elif collision == "ad_parent":
+        states[("ad", "ad1")]["adset_id"] = "other"
+    elif collision == "ad_creative":
+        states[("ad", "ad1")]["creative"] = {"id": "other"}
+    else:
+        story["link_data"]["message"] = "other"
+
+    class Resource:
+        def __init__(self, kind, rid):
+            self.kind, self.rid = kind, rid
+
+        def api_get(self, fields):
+            return states[(self.kind, self.rid)]
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: None)
+    monkeypatch.setattr("peermarket_agent.meta_ads.Campaign", lambda rid: Resource("campaign", rid))
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdSet", lambda rid: Resource("ad_set", rid))
+    monkeypatch.setattr(
+        "peermarket_agent.meta_ads.AdCreative", lambda rid: Resource("creative", rid)
+    )
+    monkeypatch.setattr("peermarket_agent.meta_ads.Ad", lambda rid: Resource("ad", rid))
+    with pytest.raises(MetaAdsError, match="identity") as caught:
+        await get_meta_replacement_bundle_statuses(
+            _FULL_CONFIG,
+            "c1",
+            "as1",
+            {"NL": "ad1"},
+            creative_ids={"NL": "cr1"},
+            landing_page_url="https://peermarket.eu/?utm_content=frozen",
+            locales={"NL": MetaBundleLocale("body", "head", "desc", "LEARN_MORE", None)},
+            image_hashes={"NL": "ih"},
+        )
+    assert caught.value.phase == "verify_bundle"
 
 
 async def test_replacement_bundle_creates_one_budget_hierarchy_and_three_locale_ads(monkeypatch):
@@ -74,6 +330,7 @@ def test_bundle_retry_looks_up_resource_created_before_id_persistence(
     monkeypatch, progress, expected_key
 ):
     """A process death after Meta create but before DB persistence cannot duplicate resources."""
+
     class FakeAccount:
         def __init__(self):
             self.resources = {"campaign": [], "ad_set": [], "creative": [], "ad": []}
@@ -96,7 +353,13 @@ def test_bundle_retry_looks_up_resource_created_before_id_persistence(
 
         def _create(self, kind, params):
             self.creates += 1
-            item = {"id": f"{kind}-id", "name": params["name"]}
+            item = {"id": f"{kind}-id", **params}
+            if kind == "campaign":
+                item["account_id"] = "999"
+            if kind == "ad_set":
+                item["daily_budget"] = str(item["daily_budget"])
+            if kind == "ad":
+                item["creative"] = {"id": item["creative"]["creative_id"]}
             self.resources[kind].append(item)
             return item
 

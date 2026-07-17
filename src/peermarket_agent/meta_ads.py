@@ -5,7 +5,7 @@ import base64
 import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlencode
 
 import structlog
@@ -59,6 +59,7 @@ class MetaReplacementBundleResult:
     ad_ids: Mapping[str, str]
     ads_manager_url: str
     status: str = "PAUSED"
+    image_hashes: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -363,16 +364,55 @@ def _sync_create_bundle_resource(
         raise MetaAdsError("unknown audience profile", phase="validate_bundle")
     api = _init_api(config)
     account = AdAccount(config.ad_account_id, api=api)
-    def existing(getter_name: str, resource_name: str) -> str | None:
+
+    def existing(
+        getter_name: str,
+        resource_name: str,
+        *,
+        fields: list[str],
+        expected: Mapping[str, object],
+        id_field: str = "id",
+    ) -> str | None:
         getter = getattr(account, getter_name)
-        for candidate in getter(fields=["id", "name"]):
-            if candidate.get("name") == resource_name:
-                return str(candidate["id"])
-        return None
+        named = [
+            candidate
+            for candidate in getter(fields=fields)
+            if candidate.get("name") == resource_name
+        ]
+        if not named:
+            return None
+        if len(named) != 1:
+            raise MetaAdsError(
+                "ambiguous Meta bundle identity during reconciliation",
+                phase="reconcile_bundle_identity",
+            )
+        candidate = named[0]
+        if any(candidate.get(key) != value for key, value in expected.items()):
+            raise MetaAdsError(
+                "Meta bundle identity mismatch during reconciliation",
+                phase="reconcile_bundle_identity",
+            )
+        value = candidate.get(id_field)
+        if not isinstance(value, str) or not value:
+            raise MetaAdsError(
+                "Meta bundle identity is incomplete during reconciliation",
+                phase="reconcile_bundle_identity",
+            )
+        return value
 
     if "campaign_id" not in progress:
         resource_name = f"{name} — campaign"
-        if found := existing("get_campaigns", resource_name):
+        account_id = config.ad_account_id.removeprefix("act_")
+        if found := existing(
+            "get_campaigns",
+            resource_name,
+            fields=["id", "name", "objective", "special_ad_categories", "account_id"],
+            expected={
+                "objective": "OUTCOME_TRAFFIC",
+                "special_ad_categories": [],
+                "account_id": account_id,
+            },
+        ):
             return "campaign_id", found
         item = account.create_campaign(
             params={
@@ -387,7 +427,31 @@ def _sync_create_bundle_resource(
         return "campaign_id", item["id"]
     if "ad_set_id" not in progress:
         resource_name = f"{name} — adset"
-        if found := existing("get_ad_sets", resource_name):
+        expected_targeting = _TARGETING_TEMPLATES[audience_profile_key]
+        if found := existing(
+            "get_ad_sets",
+            resource_name,
+            fields=[
+                "id",
+                "name",
+                "campaign_id",
+                "daily_budget",
+                "billing_event",
+                "optimization_goal",
+                "bid_strategy",
+                "targeting",
+                "destination_type",
+            ],
+            expected={
+                "campaign_id": progress["campaign_id"],
+                "daily_budget": str(daily_budget_eur * 100),
+                "billing_event": "IMPRESSIONS",
+                "optimization_goal": "LINK_CLICKS",
+                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+                "targeting": expected_targeting,
+                "destination_type": "WEBSITE",
+            },
+        ):
             return "ad_set_id", found
         item = account.create_ad_set(
             params={
@@ -398,6 +462,7 @@ def _sync_create_bundle_resource(
                 AdSet.Field.optimization_goal: "LINK_CLICKS",
                 AdSet.Field.bid_strategy: "LOWEST_COST_WITHOUT_CAP",
                 AdSet.Field.targeting: _TARGETING_TEMPLATES[audience_profile_key],
+                AdSet.Field.destination_type: "WEBSITE",
                 AdSet.Field.status: AdSet.Status.paused,
             },
             fields=[AdSet.Field.id],
@@ -410,12 +475,12 @@ def _sync_create_bundle_resource(
     ad_key = f"ad_id:{locale}"
     if creative.image_bytes and image_key not in progress:
         image_name = (
-            f"{name} {locale} image "
-            f"{hashlib.sha256(creative.image_bytes).hexdigest()[:20]}"
+            f"{name} {locale} image {hashlib.sha256(creative.image_bytes).hexdigest()[:20]}"
         )
-        for candidate in account.get_ad_images(fields=["hash", "name"]):
-            if candidate.get("name") == image_name:
-                return image_key, str(candidate["hash"])
+        if found := existing(
+            "get_ad_images", image_name, fields=["hash", "name"], expected={}, id_field="hash"
+        ):
+            return image_key, found
         image = account.create_ad_image(
             params={
                 "bytes": base64.b64encode(creative.image_bytes).decode("ascii"),
@@ -437,7 +502,13 @@ def _sync_create_bundle_resource(
         if image_key in progress:
             link_data["image_hash"] = progress[image_key]
         resource_name = f"{name} {locale} — creative"
-        if found := existing("get_ad_creatives", resource_name):
+        story_spec = {"page_id": config.page_id, "link_data": link_data}
+        if found := existing(
+            "get_ad_creatives",
+            resource_name,
+            fields=["id", "name", "object_story_spec"],
+            expected={"object_story_spec": story_spec},
+        ):
             return creative_key, found
         item = account.create_ad_creative(
             params={
@@ -451,7 +522,12 @@ def _sync_create_bundle_resource(
         )
         return creative_key, item["id"]
     resource_name = f"{name} {locale}"
-    if found := existing("get_ads", resource_name):
+    if found := existing(
+        "get_ads",
+        resource_name,
+        fields=["id", "name", "adset_id", "creative"],
+        expected={"adset_id": progress["ad_set_id"], "creative": {"id": progress[creative_key]}},
+    ):
         return ad_key, found
     item = account.create_ad(
         params={
@@ -492,7 +568,8 @@ async def create_meta_replacement_bundle_paused(
                     request_key, request_name = "request_name:ad_set", f"{name} — adset"
                 elif locale is not None and f"creative_id:{locale}" not in current:
                     request_key, request_name = (
-                        f"request_name:creative:{locale}", f"{name} {locale} — creative"
+                        f"request_name:creative:{locale}",
+                        f"{name} {locale} — creative",
                     )
                 else:
                     request_key, request_name = f"request_name:ad:{locale}", f"{name} {locale}"
@@ -529,36 +606,94 @@ async def create_meta_replacement_bundle_paused(
         creative_ids={locale: current[f"creative_id:{locale}"] for locale in ("NL", "FR", "EN")},
         ad_ids=ad_ids,
         ads_manager_url=_build_ads_manager_url(config.ad_account_id, ad_ids["NL"]),
+        image_hashes={
+            locale: current[f"image_hash:{locale}"]
+            for locale in ("NL", "FR", "EN")
+            if f"image_hash:{locale}" in current
+        },
     )
 
 
 def _sync_get_replacement_bundle_statuses(
-    config: MetaConfig, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+    config: MetaConfig,
+    campaign_id: str,
+    ad_set_id: str,
+    ad_ids: Mapping[str, str],
+    *,
+    creative_ids: Mapping[str, str] | None = None,
+    landing_page_url: str | None = None,
+    locales: Mapping[str, MetaBundleLocale] | None = None,
+    image_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, str | int]]:
     _ensure_enabled(config)
     _init_api(config)
-    if set(ad_ids) != {"NL", "FR", "EN"}:
+    locale_keys = set(ad_ids)
+    if locale_keys != {"NL", "FR", "EN"} and creative_ids is None:
         raise MetaAdsError("exact NL/FR/EN ad IDs required", phase="verify_bundle")
+    if creative_ids is not None and (
+        set(creative_ids) != locale_keys
+        or locales is None
+        or set(locales) != locale_keys
+        or landing_page_url is None
+    ):
+        raise MetaAdsError("complete frozen creative identity required", phase="verify_bundle")
     result: dict[str, dict[str, str | int]] = {
         "campaign": dict(Campaign(campaign_id).api_get(fields=["status", "effective_status"])),
         "ad_set": dict(
-            AdSet(ad_set_id).api_get(fields=["status", "effective_status", "daily_budget"])
+            AdSet(ad_set_id).api_get(
+                fields=["status", "effective_status", "daily_budget", "campaign_id"]
+            )
         ),
     }
     result["ad_set"] = {**result["ad_set"], **_normalized_daily_budget(result["ad_set"])}
+    if creative_ids is not None and str(result["ad_set"].get("campaign_id")) != campaign_id:
+        raise MetaAdsError("Meta bundle parent identity mismatch", phase="verify_bundle")
     for locale, ad_id in ad_ids.items():
-        result[f"ad:{locale}"] = dict(
-            Ad(ad_id).api_get(fields=["status", "effective_status"])
-        )
+        ad = dict(Ad(ad_id).api_get(fields=["status", "effective_status", "adset_id", "creative"]))
+        result[f"ad:{locale}"] = ad
+        if creative_ids is not None and str(ad.get("adset_id")) != ad_set_id:
+            raise MetaAdsError("Meta bundle ad parent identity mismatch", phase="verify_bundle")
+        if creative_ids is not None:
+            creative_id = creative_ids[locale]
+            if ad.get("creative") != {"id": creative_id}:
+                raise MetaAdsError(
+                    "Meta bundle ad creative identity mismatch", phase="verify_bundle"
+                )
+            observed = dict(AdCreative(creative_id).api_get(fields=["object_story_spec"]))
+            result[f"creative:{locale}"] = observed
+            frozen = locales[locale]
+            link_data: dict[str, object] = {
+                "message": frozen.primary_text,
+                "link": landing_page_url,
+                "name": frozen.headline,
+                "description": frozen.description,
+                "call_to_action": {"type": frozen.cta_type},
+            }
+            if image_hashes and locale in image_hashes:
+                link_data["image_hash"] = image_hashes[locale]
+            expected_story = {"page_id": config.page_id, "link_data": link_data}
+            if observed.get("object_story_spec") != expected_story:
+                raise MetaAdsError(
+                    "Meta bundle frozen creative identity mismatch", phase="verify_bundle"
+                )
     return result
 
 
 async def get_meta_replacement_bundle_statuses(
-    config: MetaConfig, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+    config: MetaConfig,
+    campaign_id: str,
+    ad_set_id: str,
+    ad_ids: Mapping[str, str],
+    **identity: object,
 ) -> dict[str, dict[str, str | int]]:
     """Live-read the complete replacement hierarchy and exact ad-set budget."""
     return await asyncio.to_thread(
-        _sync_get_replacement_bundle_statuses, config, campaign_id, ad_set_id, ad_ids
+        _sync_get_replacement_bundle_statuses,
+        config,
+        campaign_id,
+        ad_set_id,
+        ad_ids,
+        **identity,
     )
 
 
