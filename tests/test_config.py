@@ -6,6 +6,72 @@ from pydantic import ValidationError
 from peermarket_agent.config import Settings, get_settings
 
 
+@pytest.fixture
+def settings_payload():
+    return {
+        "anthropic_api_key": "sk-ant-test",
+        "slack_bot_token": "xoxb-test",
+        "slack_app_token": "xapp-test",
+        "agent_db_url": "postgresql+asyncpg://x:y@localhost/z",
+        "peermarket_prod_db_readonly_url": "postgresql+asyncpg://r:o@host/peer",
+        "github_app_id": 1,
+        "github_app_private_key": (
+            "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----"
+        ),
+        "github_app_installation_id": 1,
+        "recraft_api_key": "rk",
+        "resend_api_key": "re",
+        "backblaze_b2_key_id": "kid",
+        "backblaze_b2_app_key": "akey",
+        "backblaze_b2_bucket": "bucket",
+        "backblaze_b2_endpoint": "endpoint",
+    }
+
+
+def test_autonomy_defaults_are_safe(settings_payload):
+    settings = Settings(**settings_payload)
+    assert settings.meta_autonomy_enabled is False
+    assert settings.meta_autonomy_shadow is True
+    assert settings.meta_autonomy_campaign_ids == ()
+    assert settings.meta_autonomy_max_replacements_24h == 1
+    assert settings.meta_autonomy_cooldown_hours == 24
+    assert settings.meta_autonomy_max_test_days == 7
+    assert settings.meta_autonomy_max_daily_budget_eur == 20
+    assert settings.meta_autonomy_max_increase_percent == 20
+
+
+def test_autonomy_campaign_allowlist_is_trimmed(settings_payload):
+    settings = Settings(
+        **settings_payload,
+        meta_autonomy_campaign_ids_csv=" 123,456,  ,789 ",
+    )
+    assert settings.meta_autonomy_campaign_ids == ("123", "456", "789")
+
+
+@pytest.mark.parametrize("campaign_ids", ["abc", "123,act_456", "123, 45x", "١٢٣"])
+def test_autonomy_campaign_allowlist_rejects_invalid_ids(settings_payload, campaign_ids):
+    with pytest.raises(ValidationError):
+        Settings(**settings_payload, meta_autonomy_campaign_ids_csv=campaign_ids)
+
+
+def test_execution_requires_a_nonempty_allowlist(settings_payload):
+    with pytest.raises(ValidationError, match="allowlist"):
+        Settings(
+            **settings_payload,
+            meta_autonomy_enabled=True,
+            meta_autonomy_shadow=False,
+        )
+
+
+def test_shadow_mode_can_run_without_an_allowlist(settings_payload):
+    settings = Settings(
+        **settings_payload,
+        meta_autonomy_enabled=True,
+        meta_autonomy_shadow=True,
+    )
+    assert settings.meta_autonomy_campaign_ids == ()
+
+
 def test_settings_required_fields_missing_raises(monkeypatch):
     for var in [
         "ANTHROPIC_API_KEY",

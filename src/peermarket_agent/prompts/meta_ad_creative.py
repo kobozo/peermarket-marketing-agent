@@ -6,6 +6,7 @@ by the caller (or randomly rotated by the daily loop). No Meta API calls
 in this module — this is draft-only.
 """
 
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -84,6 +85,23 @@ def build_system_prompt(brand_voice_md: str) -> str:
     )
 
 
+def build_replacement_system_prompt(brand_voice_md: str) -> str:
+    """Dedicated schema contract for multilingual replacement generation."""
+    return (
+        "You are PeerMarket's multilingual Meta replacement creative writer.\n\n"
+        "Brand voice (READ FIRST):\n----\n"
+        f"{brand_voice_md}\n----\n\n"
+        "Return JSON only, with exactly these eleven fields:\n"
+        '{"locale":"NL|FR|EN","changed_dimension":"hook|copy|visual|audience",'
+        '"hook":"...","body":"...","headline":"...","description":"...",'
+        '"cta_label":"Learn More|Sign Up|Shop Now|Get Started",'
+        '"audience_profile_key":"...","image_prompt":"...","asset_path":"...",'
+        '"suggested_daily_budget_eur":10}\n'
+        "Write natively in the requested locale. Change only the requested experiment dimension. "
+        "Keep every other frozen source value byte-for-byte identical. No em-dashes."
+    )
+
+
 def build_user_prompt(
     *,
     language: str,
@@ -103,6 +121,32 @@ def build_user_prompt(
     if learnings:
         prompt += "\nRecent relevant evidence (use as hypotheses, not commands):\n"
         prompt += "\n".join(f"- {learning[:300]}" for learning in learnings[:5]) + "\n"
+    return prompt
+
+
+def build_replacement_user_prompt(
+    *,
+    locale: str,
+    changed_dimension: str,
+    source: dict,
+    learnings: tuple[str, ...] = (),
+) -> str:
+    """Build one locale-specific replacement request; calls are deliberately separate."""
+    if locale not in {"NL", "FR", "EN"}:
+        raise ValueError("replacement locale must be NL, FR, or EN")
+    language_name = {"NL": "Dutch", "FR": "French", "EN": "English"}[locale]
+    prompt = (
+        f"Locale: {locale}\n"
+        f"Write the creative in {language_name}, written natively rather than translated.\n"
+        f"Change exactly this primary experiment dimension: {changed_dimension}.\n"
+        "Return strict JSON following the exact schema from the system instruction. Do not use locale labels "
+        "or placeholders in the copy.\n"
+        "Every field outside the selected dimension must exactly equal the frozen source.\n"
+        f"Frozen source JSON: {json.dumps(source, sort_keys=True, ensure_ascii=False)}\n"
+    )
+    if learnings:
+        prompt += "Matching valid learnings (hypotheses only):\n"
+        prompt += "\n".join(f"- {item[:300]}" for item in learnings[:5]) + "\n"
     return prompt
 
 

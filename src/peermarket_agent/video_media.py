@@ -195,5 +195,7 @@ async def normalize_video(source: Path, destination: Path) -> MediaMetadata:
     )
     _stdout, stderr = await process.communicate()
     if process.returncode != 0:
-        raise RuntimeError(f"ffmpeg normalization failed: {stderr.decode(errors='replace').strip()}")
+        raise RuntimeError(
+            f"ffmpeg normalization failed: {stderr.decode(errors='replace').strip()}"
+        )
     return await inspect_video(destination)

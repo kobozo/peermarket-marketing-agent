@@ -194,7 +194,7 @@ _STEPS: list[str] = [
         draft_id BIGINT NOT NULL REFERENCES drafts(id),
         channel_id TEXT,
         root_ts TEXT,
-        message_kind TEXT NOT NULL CHECK (message_kind IN ('root_approval','thread_approval')),
+        message_kind TEXT NOT NULL CHECK (message_kind IN ('root_approval','thread_approval','autonomy_audit')),
         payload JSONB NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending'
             CHECK (status IN ('pending','delivered','failed')),
@@ -224,6 +224,9 @@ _STEPS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_owner TEXT",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS autonomy_campaign_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_slack_outbox_autonomy_campaign ON slack_outbox "
+    "(autonomy_campaign_id, id) WHERE message_kind='autonomy_audit'",
     """DO $$
        DECLARE constraint_name TEXT;
        BEGIN
@@ -236,6 +239,19 @@ _STEPS: list[str] = [
          END LOOP;
          ALTER TABLE slack_outbox ADD CONSTRAINT slack_outbox_status_check
            CHECK (status IN ('pending','delivered','failed','obsolete'));
+       END $$""",
+    """DO $$
+       DECLARE constraint_name TEXT;
+       BEGIN
+         FOR constraint_name IN
+           SELECT conname FROM pg_constraint
+           WHERE conrelid = 'slack_outbox'::regclass AND contype = 'c'
+             AND pg_get_constraintdef(oid) LIKE '%message_kind%'
+         LOOP
+           EXECUTE format('ALTER TABLE slack_outbox DROP CONSTRAINT %I', constraint_name);
+         END LOOP;
+         ALTER TABLE slack_outbox ADD CONSTRAINT slack_outbox_message_kind_check
+           CHECK (message_kind IN ('root_approval','thread_approval','autonomy_audit'));
        END $$""",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS state TEXT",
     "ALTER TABLE publications ADD COLUMN IF NOT EXISTS external_ids JSONB",
@@ -367,6 +383,114 @@ _STEPS: list[str] = [
     "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_start DROP NOT NULL",
     "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_stop DROP NOT NULL",
     "ALTER TABLE daily_performance_summary_outbox ALTER COLUMN window_definition DROP NOT NULL",
+    """CREATE TABLE IF NOT EXISTS autonomous_decisions (
+        id BIGSERIAL PRIMARY KEY,
+        decision_key TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('observe','pause','replace','reallocate','scale')),
+        campaign_id TEXT NOT NULL,
+        window_start TIMESTAMPTZ NOT NULL,
+        window_end TIMESTAMPTZ NOT NULL,
+        evidence JSONB NOT NULL,
+        reason TEXT NOT NULL,
+        old_budget_cents INT,
+        new_budget_cents INT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    """CREATE OR REPLACE FUNCTION reject_autonomous_decision_mutation()
+       RETURNS TRIGGER AS $$
+       BEGIN
+         RAISE EXCEPTION 'autonomous_decisions is append-only';
+       END;
+       $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS autonomous_decisions_append_only ON autonomous_decisions",
+    """CREATE TRIGGER autonomous_decisions_append_only
+       BEFORE UPDATE OR DELETE ON autonomous_decisions
+       FOR EACH ROW EXECUTE FUNCTION reject_autonomous_decision_mutation()""",
+    """CREATE TABLE IF NOT EXISTS autonomous_actions (
+        id BIGSERIAL PRIMARY KEY,
+        decision_id BIGINT NOT NULL REFERENCES autonomous_decisions(id),
+        campaign_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','leased','executing','succeeded','failed','cancelled',
+                              'reconciliation_required')),
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        before_state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        after_state JSONB NOT NULL DEFAULT '{}'::JSONB,
+        audit JSONB NOT NULL DEFAULT '{}'::JSONB,
+        failure_category TEXT,
+        failure_message TEXT,
+        next_evaluation_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_actions_campaign_nonterminal "
+    "ON autonomous_actions (campaign_id) "
+    "WHERE status IN ('pending','leased','executing')",
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_actions_claimable "
+    "ON autonomous_actions (status, lease_expires_at, id)",
+    """CREATE TABLE IF NOT EXISTS autonomous_budget_events (
+        id BIGSERIAL PRIMARY KEY,
+        action_id BIGINT NOT NULL REFERENCES autonomous_actions(id),
+        campaign_id TEXT NOT NULL,
+        old_budget_cents INT NOT NULL CHECK (old_budget_cents > 0),
+        new_budget_cents INT NOT NULL CHECK (new_budget_cents > 0),
+        amount_cents INT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_autonomous_budget_events_campaign_created "
+    "ON autonomous_budget_events (campaign_id, created_at DESC)",
+    """CREATE TABLE IF NOT EXISTS autonomous_replacement_publications (
+        id BIGSERIAL PRIMARY KEY,
+        action_id BIGINT NOT NULL REFERENCES autonomous_actions(id),
+        replacement_draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        source_draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        state TEXT NOT NULL DEFAULT 'creating'
+            CHECK (state IN ('creating','paused','reconciliation_required')),
+        frozen_budget_cents INT NOT NULL CHECK (frozen_budget_cents > 0),
+        source_campaign_id TEXT NOT NULL,
+        changed_dimension TEXT NOT NULL,
+        landing_page_url TEXT NOT NULL,
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        progress JSONB NOT NULL DEFAULT '{}'::JSONB,
+        failure_category TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (action_id)
+    )""",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS source_campaign_id TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS changed_dimension TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS landing_page_url TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_owner TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_token TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_replacement_one_per_action ON autonomous_replacement_publications(action_id)",
+    """CREATE TABLE IF NOT EXISTS autonomous_replacement_generations (
+        action_id BIGINT PRIMARY KEY REFERENCES autonomous_actions(id),
+        state TEXT NOT NULL DEFAULT 'generating'
+            CHECK (state IN ('generating','completed')),
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        replacement_draft_id BIGINT UNIQUE REFERENCES drafts(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS autonomous_action_id BIGINT REFERENCES autonomous_actions(id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_one_autonomous_action ON drafts(autonomous_action_id) WHERE autonomous_action_id IS NOT NULL",
+    """CREATE OR REPLACE FUNCTION reject_autonomous_budget_event_mutation()
+       RETURNS TRIGGER AS $$
+       BEGIN
+         RAISE EXCEPTION 'autonomous_budget_events is append-only';
+       END;
+       $$ LANGUAGE plpgsql""",
+    "DROP TRIGGER IF EXISTS autonomous_budget_events_append_only ON autonomous_budget_events",
+    """CREATE TRIGGER autonomous_budget_events_append_only
+       BEFORE UPDATE OR DELETE ON autonomous_budget_events
+       FOR EACH ROW EXECUTE FUNCTION reject_autonomous_budget_event_mutation()""",
 ]
 
 

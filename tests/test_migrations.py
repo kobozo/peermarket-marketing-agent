@@ -27,7 +27,41 @@ REQUIRED_TABLES = {
     "slack_outbox",
     "operational_alert_state",
     "daily_performance_summary_outbox",
+    "autonomous_decisions",
+    "autonomous_actions",
+    "autonomous_budget_events",
+    "autonomous_replacement_publications",
 }
+
+
+def test_autonomy_migration_has_durable_constraints_and_audit_fields():
+    migration_sql = "\n".join(_STEPS).lower()
+
+    assert "create table if not exists autonomous_decisions" in migration_sql
+    assert "decision_key text not null unique" in migration_sql
+    assert "evidence jsonb not null" in migration_sql
+    assert "create table if not exists autonomous_actions" in migration_sql
+    assert "references autonomous_decisions(id)" in migration_sql
+    assert "lease_owner text" in migration_sql
+    assert "lease_token text" in migration_sql
+    assert "lease_expires_at timestamptz" in migration_sql
+    assert "before_state jsonb" in migration_sql
+    assert "after_state jsonb" in migration_sql
+    assert "audit jsonb" in migration_sql
+    assert "check (status in" in migration_sql
+    assert (
+        "create unique index if not exists idx_autonomous_actions_campaign_nonterminal"
+        in migration_sql
+    )
+    assert "where status in ('pending','leased','executing')" in migration_sql
+    assert "create table if not exists autonomous_budget_events" in migration_sql
+    assert "amount_cents int not null" in migration_sql
+    assert "created_at timestamptz not null default now()" in migration_sql
+    assert "autonomous_decisions_append_only" in migration_sql
+    assert "autonomous_budget_events_append_only" in migration_sql
+    assert "create table if not exists autonomous_replacement_publications" in migration_sql
+    assert "unique (action_id)" in migration_sql
+    assert "lease_owner text" in migration_sql
 
 
 def test_publications_migration_adds_reconciliation_columns_and_unique_draft_index():
@@ -77,6 +111,36 @@ async def test_migrations_are_idempotent(engine):
         result = await conn.execute(text("SELECT count(*) FROM action_types"))
         # Schema-only — seed lives in T4. Count is 0 here.
         assert result.scalar() == 0
+
+
+async def test_autonomous_decisions_are_append_only_at_database_level(engine):
+    await run_migrations(engine)
+    async with engine.begin() as conn:
+        decision_id = (
+            await conn.execute(
+                text(
+                    "INSERT INTO autonomous_decisions "
+                    "(decision_key, kind, campaign_id, window_start, window_end, evidence, reason) "
+                    "VALUES ('decision-1', 'observe', '123', NOW() - INTERVAL '1 hour', NOW(), "
+                    "'{\"snapshot_id\": 42}'::jsonb, 'observe') RETURNING id"
+                )
+            )
+        ).scalar_one()
+
+    for statement in (
+        "UPDATE autonomous_decisions SET reason = 'changed' WHERE id = :decision_id",
+        "DELETE FROM autonomous_decisions WHERE id = :decision_id",
+    ):
+        with pytest.raises(Exception, match="append-only"):
+            async with engine.begin() as conn:
+                await conn.execute(text(statement), {"decision_id": decision_id})
+
+    async with engine.connect() as conn:
+        reason = await conn.scalar(
+            text("SELECT reason FROM autonomous_decisions WHERE id = :decision_id"),
+            {"decision_id": decision_id},
+        )
+    assert reason == "observe"
 
 
 async def test_revision_schema_has_lineage_bindings_and_superseded_status(engine):

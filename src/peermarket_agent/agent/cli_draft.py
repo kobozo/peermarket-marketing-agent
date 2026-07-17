@@ -55,6 +55,7 @@ async def recent_relevant_learnings(
     objective: str,
     language: str,
     audience: str,
+    creative_dimension: str | None = None,
 ) -> tuple[str, ...]:
     """Return only bounded, eligible, exact-dimension reusable learnings."""
     async with engine.connect() as conn:
@@ -68,6 +69,8 @@ async def recent_relevant_learnings(
                         "AND split_part(scope, ':', 3)=:objective "
                         "AND split_part(scope, ':', 4)=:language "
                         "AND split_part(scope, ':', 5)=:audience "
+                        "AND (CAST(:creative_dimension AS TEXT) IS NULL OR "
+                        "split_part(scope, ':', 6)=CAST(:creative_dimension AS TEXT)) "
                         "ORDER BY id DESC LIMIT 25"
                     ),
                     {
@@ -75,6 +78,7 @@ async def recent_relevant_learnings(
                         "objective": objective,
                         "language": language,
                         "audience": audience,
+                        "creative_dimension": creative_dimension,
                     },
                 )
             )

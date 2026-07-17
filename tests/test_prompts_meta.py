@@ -8,9 +8,36 @@ import pytest
 from peermarket_agent.claude import ClaudeResponse
 from peermarket_agent.prompts.meta_ad_creative import (
     AUDIENCE_PROFILES,
+    build_replacement_system_prompt,
+    build_replacement_user_prompt,
     generate_meta_ad_creative,
     pick_audience,
 )
+
+
+def test_replacement_prompt_has_one_exact_eleven_field_schema():
+    system = build_replacement_system_prompt("brand")
+    user = build_replacement_user_prompt(
+        locale="NL", changed_dimension="hook", source={}, learnings=()
+    )
+    assembled = system + "\n" + user
+    assert "exactly five fields" not in assembled
+    assert "primary_text" not in assembled
+    for field in (
+        "locale",
+        "changed_dimension",
+        "hook",
+        "body",
+        "headline",
+        "description",
+        "cta_label",
+        "audience_profile_key",
+        "image_prompt",
+        "asset_path",
+        "suggested_daily_budget_eur",
+    ):
+        assert assembled.count(f'"{field}"') == 1
+
 
 _GOOD_PAYLOAD = (
     "{"
@@ -155,3 +182,15 @@ async def test_generate_meta_ad_creative_rejects_budget_out_of_range():
             language="NL",
             audience_profile_key="declutterers",
         )
+
+
+def test_autonomous_replacement_prompt_requires_native_strict_locale_json():
+    from peermarket_agent.prompts.meta_ad_creative import build_replacement_user_prompt
+
+    prompt = build_replacement_user_prompt(
+        locale="FR", changed_dimension="copy", source={"headline": "Exact"}, learnings=("one",) * 7
+    )
+    assert "Locale: FR" in prompt
+    assert "written natively" in prompt
+    assert "strict JSON" in prompt
+    assert prompt.count("- one") == 5

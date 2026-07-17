@@ -35,11 +35,15 @@ async def _sleep_until_next_hour() -> None:
     await asyncio.sleep(secs)
 
 
-async def _hourly_forever(engine, peermarket, notifier: SlackNotifier, settings=None) -> None:
+async def _hourly_forever(
+    engine, peermarket, notifier: SlackNotifier, settings=None, claude: ClaudeClient | None = None
+) -> None:
     while True:
         await _sleep_until_next_hour()
         try:
-            await run_hourly_pulse(engine, peermarket, settings=settings, notifier=notifier)
+            await run_hourly_pulse(
+                engine, peermarket, settings=settings, notifier=notifier, claude=claude
+            )
         except Exception:
             log.exception("agent.hourly_pulse_failed")
         try:
@@ -82,7 +86,9 @@ async def _run_startup_jobs(
     except Exception:
         log.exception("agent.startup_slack_outbox_failed")
     try:
-        await run_hourly_pulse(engine, peermarket, settings=settings, notifier=notifier)
+        await run_hourly_pulse(
+            engine, peermarket, settings=settings, notifier=notifier, claude=claude
+        )
     except Exception:
         log.exception("agent.startup_hourly_pulse_failed")
     if claude is not None:
@@ -111,7 +117,7 @@ async def _run() -> None:
 
     # Hourly KPI pulse + daily 09:00 Brussels draft loop, both forever.
     await asyncio.gather(
-        _hourly_forever(engine, peermarket, notifier, settings),
+        _hourly_forever(engine, peermarket, notifier, settings, claude),
         _daily_forever(engine, claude, notifier, settings),
         _revisions_forever(engine, claude, notifier),
     )

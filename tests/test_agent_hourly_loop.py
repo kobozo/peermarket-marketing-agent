@@ -12,6 +12,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from peermarket_agent.agent.loops.hourly import collect_meta_performance, run_hourly_pulse
+from peermarket_agent.autonomy.contracts import DecisionKind
+from peermarket_agent.autonomy.snapshot import build_policy_decision
 from peermarket_agent.config import Settings
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
@@ -65,7 +67,9 @@ async def test_hourly_pulse_writes_heartbeat_when_peermarket_unavailable(engine)
 NOW = datetime(2026, 7, 16, 14, tzinfo=UTC)
 
 
-async def _publication(engine, draft_id, ad_id, *, published_at=None):
+async def _publication(
+    engine, draft_id, ad_id, *, published_at=None, external_ids=None, budget=None
+):
     published_at = published_at or datetime(2026, 7, 16, 10, tzinfo=UTC)
     async with engine.begin() as conn:
         await conn.execute(
@@ -78,10 +82,15 @@ async def _publication(engine, draft_id, ad_id, *, published_at=None):
         await conn.execute(
             text(
                 "INSERT INTO publications "
-                "(draft_id, channel, state, external_ids, published_at) "
-                "VALUES (:id, 'meta', 'active', CAST(:ids AS JSONB), :published_at)"
+                "(draft_id, channel, state, external_ids, approved_budget_cents, published_at) "
+                "VALUES (:id, 'meta', 'active', CAST(:ids AS JSONB), :budget, :published_at)"
             ),
-            {"id": draft_id, "ids": f'{{"ad_id":"{ad_id}"}}', "published_at": published_at},
+            {
+                "id": draft_id,
+                "ids": json.dumps(external_ids or {"ad_id": ad_id}),
+                "budget": budget,
+                "published_at": published_at,
+            },
         )
 
 
@@ -191,6 +200,105 @@ async def test_hourly_snapshot_persists_explicit_requested_window_definition(eng
     )
 
 
+async def test_collector_basis_flows_through_public_policy_builder(engine, monkeypatch):
+    ids = {
+        "campaign_id": "10",
+        "ad_set_id": "20",
+        "ad_id": "31",
+        "creative_ids": {"NL": "41", "FR": "42", "EN": "43"},
+    }
+    await _publication(engine, 155, "31", external_ids=ids, budget=1000)
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses",
+        AsyncMock(return_value=ACTIVE),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("31", impressions=2000)),
+    )
+    settings = _settings(peermarket_attribution_enabled=True)
+    peermarket = AsyncMock()
+    peermarket.fetch_attribution.return_value = []
+    await collect_meta_performance(engine, settings, peermarket, AsyncMock(), now=NOW)
+    async with engine.connect() as conn:
+        publication = dict(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT id AS publication_id,draft_id,external_ids,approved_budget_cents,performance FROM publications WHERE draft_id=155"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert publication["performance"]["autonomy_basis"]["external_ids"] == ids
+    variants = [
+        {
+            "variant_id": str(i),
+            "publication_id": i,
+            "channel": "meta",
+            "objective": "OUTCOME_TRAFFIC",
+            "language": "MULTI",
+            "audience": "declutterers",
+            "creative_dimension": "hook",
+            "window_definition": "rolling-3-inclusive-calendar-days",
+            "impressions": 1000,
+            "landing_page_views": 30,
+            "registrations": registrations,
+        }
+        for i, registrations in ((1, 20), (2, 10))
+    ]
+    source = {
+        "draft_id": 155,
+        "publication_id": publication["publication_id"],
+        "campaign_id": "10",
+        "experiment_id": "exp",
+        "changed_dimension": "hook",
+        "locales": {
+            locale: {
+                "locale": locale,
+                "hook": "hook",
+                "body": "body",
+                "headline": "headline",
+                "description": "description",
+                "cta_label": "Learn More",
+            }
+            for locale in ("NL", "FR", "EN")
+        },
+        "audience_profile_key": "declutterers",
+        "image_prompt": "real screenshot",
+        "asset_path": "/tmp/source.png",
+        "daily_budget_eur": 10,
+        "landing_page_url": "https://peermarket.eu/",
+        "objective": "OUTCOME_TRAFFIC",
+        "current_meta_ids": {
+            "campaign_id": "10",
+            "ad_set_id": "20",
+            "ad_ids": {"NL": "31", "FR": "32", "EN": "33"},
+            "creative_ids": {"NL": "41", "FR": "42", "EN": "43"},
+        },
+    }
+    limits = {
+        "performance_snapshot_max_age_hours": 2,
+        "learning_min_impressions": 1000,
+        "learning_min_landing_page_views": 30,
+        "learning_min_registrations": 10,
+        "meta_autonomy_cooldown_hours": 24,
+        "meta_autonomy_max_test_days": 7,
+        "meta_autonomy_max_replacements_24h": 1,
+        "meta_autonomy_max_increase_percent": 20,
+        "meta_autonomy_max_daily_budget_eur": 20,
+        "meta_no_delivery_grace_hours": 2,
+        "meta_account_timezone": "Europe/Brussels",
+    }
+    decision = build_policy_decision(
+        publication, variants, replacement_source=source, history=(), limits=limits, now=NOW
+    )
+    assert decision.kind is DecisionKind.REPLACE
+    assert decision.evidence["frozen_basis"]["approved_budget_cents"] == 1000
+
+
 async def test_collection_uses_configured_last_completed_account_days_and_utc_alignment(
     engine, monkeypatch
 ):
@@ -287,6 +395,25 @@ async def test_feature_flags_default_false_and_disabled_pulse_does_not_collect(e
     await run_hourly_pulse(engine, peermarket, settings=_settings(meta_insights_enabled=False))
 
     collector.assert_not_awaited()
+
+
+async def test_hourly_collects_before_autonomy_and_passes_explicit_dependencies(
+    engine, monkeypatch
+):
+    calls = []
+    collector = AsyncMock(side_effect=lambda *args, **kwargs: calls.append("collect"))
+    autonomy = AsyncMock(side_effect=lambda *args, **kwargs: calls.append("autonomy"))
+    monkeypatch.setattr("peermarket_agent.agent.loops.hourly.collect_meta_performance", collector)
+    monkeypatch.setattr("peermarket_agent.agent.loops.hourly.run_autonomy_cycle", autonomy)
+    settings = _settings(meta_insights_enabled=True, meta_autonomy_enabled=True)
+    claude, notifier = object(), object()
+    peermarket = AsyncMock()
+    peermarket.fetch_kpis.return_value = {}
+
+    await run_hourly_pulse(engine, peermarket, settings=settings, notifier=notifier, claude=claude)
+
+    assert calls == ["collect", "autonomy"]
+    autonomy.assert_awaited_once_with(engine, claude, notifier, settings)
 
 
 async def test_missing_attribution_view_alerts_once_without_blocking_meta(engine, monkeypatch):

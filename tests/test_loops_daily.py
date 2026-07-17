@@ -1,5 +1,6 @@
 """Daily Loop B tests."""
 
+import json
 import os
 from unittest.mock import AsyncMock
 
@@ -67,7 +68,11 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             ClaudeResponse(
                 text=(
                     '{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", '
-                    '"body": "Veilig verkopen.", "cta": "Plaats het nu"}'
+                    '"body": "Veilig verkopen.", "cta": "Plaats het nu", '
+                    '"script": "Verkoop lokaal en veilig via PeerMarket.", '
+                    '"shots": ["Toon het item", "Open PeerMarket"], '
+                    '"on_screen_text": ["Veilig lokaal verkopen"], '
+                    '"recording_notes": "Film verticaal bij daglicht."}'
                 ),
                 input_tokens=200,
                 output_tokens=40,
@@ -84,7 +89,7 @@ async def test_run_daily_drafts_dms_persisted_drafts_and_summary(prepared_db):
             ),
             # 5) Email gen
             ClaudeResponse(
-                text=('{"subject": "Je hebt nog niets verkocht", "body": "' + "woord " * 80 + '"}'),
+                text=json.dumps({"subject": "Je hebt nog niets verkocht", "body": "woord " * 80}),
                 input_tokens=250,
                 output_tokens=80,
                 model="claude-sonnet-4-6",
@@ -159,7 +164,11 @@ async def test_run_daily_drafts_skips_gate_rejections(prepared_db):
             ClaudeResponse(
                 text=(
                     '{"hook": "Wil je vandaag veilig en lokaal spullen verkopen?", '
-                    '"body": "Veilig verkopen.", "cta": "Plaats het nu"}'
+                    '"body": "Veilig verkopen.", "cta": "Plaats het nu", '
+                    '"script": "Verkoop lokaal en veilig via PeerMarket.", '
+                    '"shots": ["Toon het item", "Open PeerMarket"], '
+                    '"on_screen_text": ["Veilig lokaal verkopen"], '
+                    '"recording_notes": "Film verticaal bij daglicht."}'
                 ),
                 input_tokens=200,
                 output_tokens=40,

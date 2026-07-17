@@ -322,3 +322,23 @@ def test_verifier_source_has_no_meta_mutation_surface():
     assert "pause_meta_ad" not in source
     assert "api_update" not in source
     assert 'text("UPDATE ' not in source
+
+
+def test_autonomy_command_accepts_draft_id_and_emits_sanitized_json(monkeypatch):
+    report = {
+        "draft_id": 156,
+        "feature_flags": {"enabled": True, "shadow": True, "allowlisted": True},
+        "publication_exists": True,
+        "decision": {"kind": "observe", "reason": "insufficient_evidence"},
+        "action": None,
+        "reconciliation_blocked": False,
+    }
+    inspect = AsyncMock(return_value=report)
+    monkeypatch.setattr("peermarket_agent.cli_performance.inspect_autonomy", inspect)
+
+    result = CliRunner().invoke(cli, ["autonomy", "--draft-id", "156"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == report
+    assert "token" not in result.output.casefold()
+    inspect.assert_awaited_once_with(156)

@@ -221,6 +221,101 @@ async def verify_draft(draft_id: int) -> dict[str, Any]:
     return report
 
 
+def _safe_autonomy_evidence(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "snapshot_id",
+        "delivery_state",
+        "attribution_complete",
+        "winner_variant_id",
+        "loser_variant_id",
+        "winner_value",
+        "loser_value",
+        "metric",
+    }
+    return {key: value[key] for key in sorted(allowed & value.keys())}
+
+
+async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
+    """Return a fixed, sanitized autonomous-lifecycle projection for one draft."""
+    settings = get_settings()
+    engine = create_async_engine(settings.agent_db_url, future=True, pool_pre_ping=True)
+    try:
+        async with readonly_connection(engine) as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT p.draft_id,p.state AS publication_state,p.approved_budget_cents,"
+                            "p.external_ids->>'campaign_id' AS campaign_id,d.id AS decision_id,"
+                            "d.kind,d.reason,d.window_start,d.window_end,d.evidence,"
+                            "d.old_budget_cents,d.new_budget_cents,a.id AS action_id,a.status AS action_status,"
+                            "a.failure_category,a.next_evaluation_at,a.audit "
+                            "FROM publications p LEFT JOIN LATERAL (SELECT * FROM autonomous_decisions "
+                            "WHERE campaign_id=p.external_ids->>'campaign_id' ORDER BY id DESC LIMIT 1) d "
+                            "ON TRUE LEFT JOIN LATERAL (SELECT * FROM autonomous_actions "
+                            "WHERE decision_id=d.id ORDER BY id DESC LIMIT 1) a ON TRUE "
+                            "WHERE p.draft_id=:draft_id AND p.channel='meta'"
+                        ),
+                        {"draft_id": draft_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        report: dict[str, Any] = {
+            "draft_id": draft_id,
+            "feature_flags": {
+                "enabled": settings.meta_autonomy_enabled,
+                "shadow": settings.meta_autonomy_shadow,
+                "allowlisted": False,
+            },
+            "publication_exists": row is not None,
+        }
+        if row is None:
+            return report
+        campaign_id = row["campaign_id"]
+        report["feature_flags"]["allowlisted"] = campaign_id in tuple(
+            settings.meta_autonomy_campaign_ids
+        )
+        report["campaign_id"] = campaign_id
+        report["publication_state"] = row["publication_state"]
+        report["budget"] = {
+            "approved_cents": row["approved_budget_cents"],
+            "old_cents": row["old_budget_cents"],
+            "new_cents": row["new_budget_cents"],
+        }
+        report["decision"] = (
+            {
+                "id": row["decision_id"],
+                "kind": row["kind"],
+                "reason": row["reason"],
+                "window_start": row["window_start"],
+                "window_end": row["window_end"],
+                "evidence": _safe_autonomy_evidence(row["evidence"]),
+            }
+            if row["decision_id"] is not None
+            else None
+        )
+        audit = row["audit"] if isinstance(row["audit"], dict) else {}
+        report["action"] = (
+            {
+                "id": row["action_id"],
+                "status": row["action_status"],
+                "failure_category": row["failure_category"],
+                "next_evaluation_at": row["next_evaluation_at"],
+                "rollback_recorded": "rollback_result" in audit,
+            }
+            if row["action_id"] is not None
+            else None
+        )
+        report["reconciliation_blocked"] = row["action_status"] == "reconciliation_required"
+        return report
+    finally:
+        await engine.dispose()
+
+
 @click.group()
 def cli() -> None:
     """Read-only performance operations."""
@@ -235,6 +330,13 @@ def verify(draft_id: int) -> None:
     failures = _verification_failures(report)
     if failures:
         raise click.ClickException("verification failed: " + ", ".join(failures))
+
+
+@cli.command("autonomy")
+@click.option("--draft-id", required=True, type=click.IntRange(min=1))
+def autonomy(draft_id: int) -> None:
+    """Inspect persisted autonomy state without permitting a database write."""
+    click.echo(json.dumps(asyncio.run(inspect_autonomy(draft_id)), sort_keys=True, default=str))
 
 
 if __name__ == "__main__":

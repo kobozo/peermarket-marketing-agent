@@ -122,7 +122,9 @@ async def test_download_uses_bot_token_and_slack_id_not_untrusted_filename(tmp_p
         ("clip.exe", "video/mp4"),
     ],
 )
-async def test_download_rejects_mime_extension_mismatch_before_network(tmp_path, filename, mimetype):
+async def test_download_rejects_mime_extension_mismatch_before_network(
+    tmp_path, filename, mimetype
+):
     with pytest.raises(ValueError, match="MIME type"):
         await download_slack_file(
             _FakeClient(), _upload(filename=filename, mimetype=mimetype), tmp_path, max_bytes=10
@@ -198,7 +200,9 @@ def test_validate_media_warns_for_landscape_and_duration_outside_limits(tmp_path
         has_audio=True,
     )
 
-    warnings = validate_media(metadata, MediaLimits(max_bytes=200, max_clips=8, max_duration_seconds=60))
+    warnings = validate_media(
+        metadata, MediaLimits(max_bytes=200, max_clips=8, max_duration_seconds=60)
+    )
 
     assert len(warnings) == 2
     assert any("vertical" in warning.lower() for warning in warnings)

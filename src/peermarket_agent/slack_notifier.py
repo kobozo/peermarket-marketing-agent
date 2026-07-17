@@ -47,7 +47,9 @@ class SlackNotifier:
             await self.send_message(text, channel_id=channel_id, thread_ts=thread_ts)
             return True
         except Exception:
-            log.exception("slack_notifier.thread_reply_failed", channel_id=channel_id, thread_ts=thread_ts)
+            log.exception(
+                "slack_notifier.thread_reply_failed", channel_id=channel_id, thread_ts=thread_ts
+            )
             return False
 
     async def send_message(

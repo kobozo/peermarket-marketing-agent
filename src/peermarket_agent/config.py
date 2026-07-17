@@ -3,7 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -75,6 +75,39 @@ class Settings(BaseSettings):
     learning_min_impressions: int = Field(default=1000, ge=1, le=10_000_000)
     learning_min_landing_page_views: int = Field(default=30, ge=1, le=1_000_000)
     learning_min_registrations: int = Field(default=10, ge=1, le=1_000_000)
+
+    # Autonomous Meta lifecycle (disabled, read-only defaults)
+    meta_autonomy_enabled: bool = False
+    meta_autonomy_shadow: bool = True
+    meta_autonomy_campaign_ids_csv: str = ""
+    meta_autonomy_max_replacements_24h: int = Field(default=1, ge=0, le=10)
+    meta_autonomy_cooldown_hours: int = Field(default=24, ge=1, le=168)
+    meta_autonomy_max_test_days: int = Field(default=7, ge=1, le=30)
+    meta_autonomy_max_increase_percent: int = Field(default=20, ge=0, le=20)
+    meta_autonomy_max_daily_budget_eur: int = Field(default=20, ge=5, le=20)
+
+    @field_validator("meta_autonomy_campaign_ids_csv")
+    @classmethod
+    def _validate_autonomy_campaign_ids(cls, value: str) -> str:
+        campaign_ids = tuple(item.strip() for item in value.split(",") if item.strip())
+        if any(
+            not campaign_id.isascii() or not campaign_id.isdecimal() for campaign_id in campaign_ids
+        ):
+            raise ValueError("autonomy campaign allowlist IDs must be numeric")
+        return value
+
+    @property
+    def meta_autonomy_campaign_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.strip() for item in self.meta_autonomy_campaign_ids_csv.split(",") if item.strip()
+        )
+
+    @model_validator(mode="after")
+    def _require_allowlist_for_live_autonomy(self) -> "Settings":
+        if self.meta_autonomy_enabled and not self.meta_autonomy_shadow:
+            if not self.meta_autonomy_campaign_ids:
+                raise ValueError("live autonomy requires a non-empty campaign allowlist")
+        return self
 
     # Resend (email)
     resend_api_key: str
