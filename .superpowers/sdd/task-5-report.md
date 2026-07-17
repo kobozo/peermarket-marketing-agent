@@ -77,3 +77,19 @@ Exact clean-database focused command:
 `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
 
 Result: `4 passed, 85 deselected in 3.08s`. Ruff passed and the diff was whitespace-clean.
+
+## PostgreSQL failure and resume matrix
+
+The production-path test is now parameterized across success and four injected SDK failures while retaining the real claimed action, real persisted nine-row experiment, real replacement-publication progress, real `MetaExecutionAdapter`, real `_replace`, and real executor finalization:
+
+- rate limit after variant `:01` progress: reverse cleanup runs, action reconciles, then the same durable action/publication is re-leased to a new worker and a fresh adapter; retry succeeds with exactly nine unique creative SDK payloads total, proving variant `:01` adoption without duplicate creation;
+- persisted payload versus live creative drift: the verifier receives and asserts exact creative IDs, landing URL, and NL/FR/EN locale payloads, then drift causes cleanup and reconciliation before activation;
+- action lease loss during activation: the next fenced write stops and stale-worker cleanup cannot mutate;
+- reverse-pause failure: cleanup is unproven and the action persists reconciliation-required rather than success or retry;
+- success: all nine activate, source pauses, every ID remains in fenced DB progress, and the final action audit state succeeds.
+
+Combined clean-DB command:
+
+`AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
+
+Result: `8 passed, 85 deselected in 5.83s`. Ruff format/check and `git diff --check` passed.

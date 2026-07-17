@@ -42,6 +42,7 @@ from peermarket_agent.autonomy.store import (
     record_experiment,
 )
 from peermarket_agent.db.migrations import run_migrations
+from peermarket_agent.meta_ads import MetaAdsError
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
 
@@ -876,17 +877,23 @@ class _PersistedHookBuilder:
         )
 
 
+@pytest.mark.parametrize(
+    "failure", [None, "rate_limit", "creative_drift", "lease_loss", "cleanup_failure"]
+)
 @pytest.mark.asyncio
 async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3(
-    engine, monkeypatch
+    engine, monkeypatch, failure
 ):
     claim = await _public_replace_claim(engine)
     await record_experiment(engine, _persisted_test_experiment())
     created_payloads = []
     active_ads = set()
     source_paused = False
+    cleanup_calls = []
+    rate_injected = False
 
     def create_resource(**kwargs):
+        nonlocal rate_injected
         progress, locale, name = kwargs["progress"], kwargs["locale"], kwargs["name"]
         if "campaign_id" not in progress:
             return "campaign_id", "campaign-new"
@@ -894,11 +901,23 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
             return "ad_set_id", "adset-new"
         variant = name.split()[-1]
         if f"creative_id:{locale}" not in progress:
+            if (
+                failure in {"rate_limit", "cleanup_failure"}
+                and len(created_payloads) == 3
+                and not rate_injected
+            ):
+                rate_injected = True
+                raise MetaAdsError("rate limited", phase="create_bundle", api_error_code=613)
             created_payloads.append((variant, locale, kwargs["creative"].primary_text))
             return f"creative_id:{locale}", f"cr-{variant}-{locale}"
         return f"ad_id:{locale}", f"ad-{variant}-{locale}"
 
     async def bundle_status(config, campaign_id, ad_set_id, ad_ids, **identity):
+        assert set(identity["creative_ids"]) == {"NL", "FR", "EN"}
+        assert identity["landing_page_url"] == "https://peermarket.eu/"
+        assert set(identity["locales"]) == {"NL", "FR", "EN"}
+        if failure == "creative_drift":
+            raise MetaAdsError("creative drift", phase="verify_bundle")
         result = {
             "campaign": {
                 "status": "ACTIVE" if active_ads else "PAUSED",
@@ -937,7 +956,17 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
             source_paused = status == "PAUSED"
         elif status == "ACTIVE":
             active_ads.add(ad_id)
+            if failure == "lease_loss" and len(active_ads) == 2:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text("UPDATE autonomous_actions SET lease_token='stolen' WHERE id=:id"),
+                        {"id": claim.id},
+                    )
         return {"status": status}
+
+    async def pause_bundle(config, campaign_id, ad_set_id, ad_ids):
+        cleanup_calls.append(tuple(ad_ids.values()))
+        return {"ad": "pause failed"} if failure == "cleanup_failure" else {}
 
     monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_resource)
     monkeypatch.setattr(
@@ -947,6 +976,9 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
     monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_budget_state", budget)
     monkeypatch.setattr("peermarket_agent.autonomy.executor.activate_meta_ad", activate)
     monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_ad_status", set_status)
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.pause_meta_replacement_bundle", pause_bundle
+    )
     monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
     settings = _settings(
         meta_autonomy_experiment_id="exp",
@@ -964,8 +996,63 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         claim,
         NOW,
     )
-    assert result.status is ExecutionStatus.SUCCEEDED
-    assert len(created_payloads) == 9
+    if failure is None:
+        assert result.status is ExecutionStatus.SUCCEEDED
+    elif failure == "lease_loss":
+        assert result.status is ExecutionStatus.FAILED
+        assert result.reason == "lease_lost"
+    else:
+        assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    expected_creatives = (
+        9
+        if failure in {None, "lease_loss"}
+        else 3
+        if failure in {"rate_limit", "cleanup_failure"}
+        else 9
+    )
+    assert len(created_payloads) == expected_creatives
+    if failure is not None:
+        assert source_paused is False
+        if failure != "lease_loss":
+            assert cleanup_calls
+        if failure == "rate_limit":
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE autonomous_actions SET status='leased',lease_owner='retry-worker',"
+                        "lease_token='retry-token',lease_expires_at=NOW()+INTERVAL '5 minutes' "
+                        "WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications SET lease_expires_at=NOW()-INTERVAL '1 second' "
+                        "WHERE action_id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            retry_claim = SimpleNamespace(
+                id=claim.id,
+                decision_id=claim.decision_id,
+                campaign_id=claim.campaign_id,
+                kind=claim.kind,
+                decision=claim.decision,
+                lease_owner="retry-worker",
+                lease_token="retry-token",
+            )
+            retry = await execute_claim(
+                engine,
+                settings,
+                MetaExecutionAdapter(settings, object()),
+                _PersistedHookBuilder(),
+                retry_claim,
+                NOW,
+            )
+            assert retry.status is ExecutionStatus.SUCCEEDED
+            assert len(created_payloads) == 9
+            assert len({item[:2] for item in created_payloads}) == 9
+        return
     assert {item[:2] for item in created_payloads} == {
         (f"exp:{number:02}", locale) for number in (1, 2, 3) for locale in ("NL", "FR", "EN")
     }
