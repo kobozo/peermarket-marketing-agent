@@ -143,22 +143,80 @@ async def test_get_meta_budget_state_reads_bound_exact_resources(monkeypatch):
     assert observed["ad_set"]["daily_budget"] == 1200
 
 
-async def test_mutation_error_redacts_credentials_and_preserves_rate_limit_code(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("api_error_code", "http_status"),
+    [(17, 400), (32, 400), (613, 400), (1, 429)],
+)
+@pytest.mark.parametrize("adapter", ["status", "budget", "read"])
+async def test_mutation_error_preserves_structured_rate_limit_diagnostics(
+    monkeypatch, adapter, api_error_code, http_status
 ):
+    from facebook_business.exceptions import FacebookRequestError
+
+    _, _, ad, adset, *_ = _patch_mutation_sdk(monkeypatch)
+    sdk_error = FacebookRequestError(
+        f"request token={_FULL_CONFIG.system_user_token}",
+        request_context={"access_token": _FULL_CONFIG.system_user_token},
+        http_status=http_status,
+        http_headers={},
+        body={
+            "error": {
+                "message": f"rate limited token={_FULL_CONFIG.system_user_token}",
+                "code": api_error_code,
+                "error_subcode": 2446079,
+                "type": "OAuthException",
+            }
+        },
+    )
+    if adapter == "status":
+        ad.api_update.side_effect = sdk_error
+        mutation = set_meta_ad_status(_FULL_CONFIG, "456", "ACTIVE")
+        expected_phase = "update_ad_status"
+        expected_ids = {"ad_id": "456"}
+    elif adapter == "budget":
+        adset.api_update.side_effect = sdk_error
+        mutation = set_meta_adset_daily_budget(_FULL_CONFIG, "123", 1200)
+        expected_phase = "update_ad_set_daily_budget"
+        expected_ids = {"ad_set_id": "123"}
+    else:
+        ad.api_get.side_effect = sdk_error
+        mutation = get_meta_budget_state(
+            _FULL_CONFIG, {"ad_id": "456", "ad_set_id": "123"}
+        )
+        expected_phase = "get_budget_state"
+        expected_ids = {"ad_id": "456", "ad_set_id": "123"}
+
+    with pytest.raises(MetaAdsError) as caught:
+        await mutation
+
+    assert caught.value.phase == expected_phase
+    assert caught.value.resource_ids == expected_ids
+    assert caught.value.api_error_code == api_error_code
+    assert caught.value.api_error_subcode == 2446079
+    assert caught.value.http_status == http_status
+    assert caught.value.api_error_type == "OAuthException"
+    assert _FULL_CONFIG.system_user_token not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+async def test_generic_mutation_error_remains_sanitized_and_unstructured(monkeypatch):
     _, _, ad, *_ = _patch_mutation_sdk(monkeypatch)
     ad.api_update.side_effect = RuntimeError(
-        f"rate limit code=17 token={_FULL_CONFIG.system_user_token}"
+        f"generic failure token={_FULL_CONFIG.system_user_token}"
     )
 
     with pytest.raises(MetaAdsError) as caught:
         await set_meta_ad_status(_FULL_CONFIG, "456", "ACTIVE")
 
-    assert caught.value.phase == "update_ad_status"
-    assert caught.value.resource_ids == {"ad_id": "456"}
-    assert "rate limit code=17" in str(caught.value)
+    assert "generic failure" in str(caught.value)
     assert _FULL_CONFIG.system_user_token not in str(caught.value)
+    assert caught.value.api_error_code is None
+    assert caught.value.api_error_subcode is None
+    assert caught.value.http_status is None
+    assert caught.value.api_error_type is None
     assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def _patch_meta_sdk(

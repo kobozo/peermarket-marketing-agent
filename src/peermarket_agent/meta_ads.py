@@ -62,11 +62,19 @@ class MetaAdsError(RuntimeError):
         resource_ids: dict[str, str] | None = None,
         observed_statuses: dict[str, dict[str, str | int]] | None = None,
         rollback_errors: dict[str, str] | None = None,
+        api_error_code: int | None = None,
+        api_error_subcode: int | None = None,
+        http_status: int | None = None,
+        api_error_type: str | None = None,
     ) -> None:
         self.phase = phase
         self.resource_ids = resource_ids or {}
         self.observed_statuses = observed_statuses or {}
         self.rollback_errors = rollback_errors or {}
+        self.api_error_code = api_error_code
+        self.api_error_subcode = api_error_subcode
+        self.http_status = http_status
+        self.api_error_type = api_error_type
         details = {
             "phase": phase,
             "resource_ids": self.resource_ids,
@@ -408,18 +416,54 @@ def _mutation_error(
     phase: str,
     resource_ids: dict[str, str],
     observed_statuses: dict[str, dict[str, str | int]] | None = None,
+    sdk_error: Exception | None = None,
 ) -> MetaAdsError:
+    diagnostics = (
+        _facebook_error_diagnostics(sdk_error, config)
+        if isinstance(sdk_error, FacebookRequestError)
+        else {}
+    )
     return MetaAdsError(
         _redact_credentials(message, config),
         phase=phase,
         resource_ids=resource_ids,
         observed_statuses=observed_statuses,
+        **diagnostics,
     )
+
+
+def _facebook_error_diagnostics(
+    error: FacebookRequestError, config: MetaConfig
+) -> dict[str, int | str | None]:
+    def safe_value(name: str) -> object:
+        accessor = getattr(error, name, None)
+        try:
+            return accessor() if callable(accessor) else accessor
+        except Exception:
+            return None
+
+    code = safe_value("api_error_code")
+    subcode = safe_value("api_error_subcode")
+    status = safe_value("http_status")
+    error_type = safe_value("api_error_type")
+    return {
+        "api_error_code": code if isinstance(code, int) and not isinstance(code, bool) else None,
+        "api_error_subcode": (
+            subcode if isinstance(subcode, int) and not isinstance(subcode, bool) else None
+        ),
+        "http_status": (
+            status if isinstance(status, int) and not isinstance(status, bool) else None
+        ),
+        "api_error_type": (
+            _redact_credentials(error_type, config) if isinstance(error_type, str) else None
+        ),
+    }
 
 
 def _sync_set_ad_status(config: MetaConfig, ad_id: str, status: str) -> dict[str, str]:
     resource_ids = {"ad_id": ad_id}
     phase = "update_ad_status"
+    mutation_error: MetaAdsError | None = None
     try:
         _ensure_enabled(config)
         api = _init_api(config)
@@ -443,12 +487,14 @@ def _sync_set_ad_status(config: MetaConfig, ad_id: str, status: str) -> dict[str
     except MetaAdsError:
         raise
     except Exception as exc:
-        raise _mutation_error(
+        mutation_error = _mutation_error(
             f"Meta ad status mutation failed: {exc}",
             config,
             phase=phase,
             resource_ids=resource_ids,
-        ) from None
+            sdk_error=exc,
+        )
+    raise mutation_error
 
 
 async def set_meta_ad_status(config: MetaConfig, ad_id: str, status: str) -> dict[str, str]:
@@ -469,6 +515,7 @@ def _normalized_daily_budget(observed: dict) -> dict[str, int]:
 def _sync_set_adset_daily_budget(config: MetaConfig, ad_set_id: str, cents: int) -> dict[str, int]:
     resource_ids = {"ad_set_id": ad_set_id}
     phase = "update_ad_set_daily_budget"
+    mutation_error: MetaAdsError | None = None
     try:
         _ensure_enabled(config)
         api = _init_api(config)
@@ -488,12 +535,14 @@ def _sync_set_adset_daily_budget(config: MetaConfig, ad_set_id: str, cents: int)
     except MetaAdsError:
         raise
     except Exception as exc:
-        raise _mutation_error(
+        mutation_error = _mutation_error(
             f"Meta ad set daily budget mutation failed: {exc}",
             config,
             phase=phase,
             resource_ids=resource_ids,
-        ) from None
+            sdk_error=exc,
+        )
+    raise mutation_error
 
 
 async def set_meta_adset_daily_budget(
@@ -510,6 +559,7 @@ def _sync_get_budget_state(
     config: MetaConfig, ids: dict[str, str]
 ) -> dict[str, dict[str, str | int]]:
     resource_ids = dict(ids)
+    mutation_error: MetaAdsError | None = None
     try:
         _ensure_enabled(config)
         api = _init_api(config)
@@ -529,12 +579,14 @@ def _sync_get_budget_state(
             },
         }
     except Exception as exc:
-        raise _mutation_error(
+        mutation_error = _mutation_error(
             f"Meta budget state read failed: {exc}",
             config,
             phase="get_budget_state",
             resource_ids=resource_ids,
-        ) from None
+            sdk_error=exc,
+        )
+    raise mutation_error
 
 
 async def get_meta_budget_state(
