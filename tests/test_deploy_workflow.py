@@ -91,21 +91,29 @@ def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials(
         "gh variable set META_AUTONOMY_MAX_REPLACEMENTS_24H --body 1",
         "gh variable set META_AUTONOMY_MAX_TEST_DAYS --body 7",
         "gh variable set META_AUTONOMY_COOLDOWN_HOURS --body 24",
-        'run_url="$(gh workflow run deploy.yml)"',
-        'gh run watch "$run_id" --exit-status',
         "peermarket-performance autonomy --draft-id 156",
         "curl -fsS http://127.0.0.1:8090/agent/healthz",
     }
     assert required <= set(text.splitlines())
+    assert 'gh workflow run deploy.yml --ref "$deploy_ref"' in text
+    assert (
+        'gh run list --workflow deploy.yml --event workflow_dispatch --branch "$deploy_ref" '
+        '--commit "$head_sha" --created ">=$boundary" --limit 20 --json databaseId '
+        '--jq ".[].databaseId"'
+    ) in text
+    assert 'gh run watch "$run_id" --exit-status' in text
     assert "Draft 156" in text
     assert "reconciliation_required" in text
     assert "kill switch" in text.casefold()
     assert "verified audit result" not in text.casefold()
     assert "rollback_recorded" in text
     assert "failure_category" in text
-    assert text.count('run_url="$(gh workflow run deploy.yml)"') == text.count(
-        'gh run watch "$run_id" --exit-status'
-    )
+    assert "dispatch_deploy()" in text
+    assert text.splitlines().count("dispatch_deploy") == 4
+    assert '[[ ! "$run_id" =~ ^[0-9]+$ ]]' in text
+    assert "${#run_ids[@]} > 1" in text
+    assert "for attempt in {1..12}" in text
+    assert "run_url=" not in text
     assert "gh run watch\n" not in text
     assert "gh secret set" not in text
     for forbidden in ("sk-", "xoxb-", "Bearer ", "password=", "token="):

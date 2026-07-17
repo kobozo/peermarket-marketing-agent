@@ -5,6 +5,49 @@ This runbook prepares the Draft 156 canary for Meta campaign
 repository variables and `deploy.yml`. Do not edit the host environment by hand,
 put credentials in variables, or paste credentials into commands, logs, or tickets.
 
+Define this fail-closed dispatch helper once in the maintainer shell. It captures
+the exact branch, commit, and UTC boundary before dispatch. Because workflow-run
+creation is asynchronous, it polls for at most one minute. Zero matches keep
+polling; multiple matches, a nonnumeric ID, timeout, or a failed run stop rollout.
+
+```bash
+dispatch_deploy() {
+  local deploy_ref head_sha boundary attempt run_id run_output
+  local -a run_ids
+  deploy_ref="$(git branch --show-current)"
+  head_sha="$(git rev-parse HEAD)"
+  boundary="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ -z "$deploy_ref" || ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "deploy requires a named branch and exact local commit SHA" >&2
+    return 1
+  fi
+  gh workflow run deploy.yml --ref "$deploy_ref" || return 1
+  for attempt in {1..12}; do
+    run_output="$(gh run list --workflow deploy.yml --event workflow_dispatch --branch "$deploy_ref" --commit "$head_sha" --created ">=$boundary" --limit 20 --json databaseId --jq ".[].databaseId")" || return 1
+    run_ids=()
+    if [[ -n "$run_output" ]]; then
+      mapfile -t run_ids <<<"$run_output"
+    fi
+    if (( ${#run_ids[@]} > 1 )); then
+      echo "ambiguous deploy runs for exact ref/SHA/boundary" >&2
+      return 1
+    fi
+    if (( ${#run_ids[@]} == 1 )); then
+      run_id="${run_ids[0]}"
+      if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+        echo "deploy run databaseId is not numeric" >&2
+        return 1
+      fi
+      gh run watch "$run_id" --exit-status
+      return
+    fi
+    sleep 5
+  done
+  echo "deploy run did not appear within 60 seconds" >&2
+  return 1
+}
+```
+
 ## Safety envelope
 
 The canary ceiling is EUR 20 per day, with at most a 20 percent increase, one
@@ -36,9 +79,7 @@ not credentials. Do not run secret-management commands as part of this rollout.
 Dispatch only the tested CI workflow and watch it finish:
 
 ```bash
-run_url="$(gh workflow run deploy.yml)"
-run_id="${run_url##*/}"
-gh run watch "$run_id" --exit-status
+dispatch_deploy
 ```
 
 On the self-hosted runner, the workflow runs migrations before restarting the
@@ -61,9 +102,7 @@ keeping shadow mode true, then deploy through CI again:
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body true
 gh variable set META_AUTONOMY_SHADOW --body true
-run_url="$(gh workflow run deploy.yml)"
-run_id="${run_url##*/}"
-gh run watch "$run_id" --exit-status
+dispatch_deploy
 ```
 
 Wait for a successful hourly collection. On the host, inspect only the persisted,
@@ -89,9 +128,7 @@ shadow mode:
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body true
 gh variable set META_AUTONOMY_SHADOW --body false
-run_url="$(gh workflow run deploy.yml)"
-run_id="${run_url##*/}"
-gh run watch "$run_id" --exit-status
+dispatch_deploy
 ```
 
 After deployment, check health and run the same Draft 156 read-only inspection.
@@ -109,9 +146,7 @@ Meta state, an unverified rollback, stale evidence, service instability, or any
 ```bash
 gh variable set META_AUTONOMY_ENABLED --body false
 gh variable set META_AUTONOMY_SHADOW --body true
-run_url="$(gh workflow run deploy.yml)"
-run_id="${run_url##*/}"
-gh run watch "$run_id" --exit-status
+dispatch_deploy
 ```
 
 Verify health, then inspect Draft 156 again with the read-only command. Do not
