@@ -433,12 +433,25 @@ _STEPS: list[str] = [
         state TEXT NOT NULL DEFAULT 'creating'
             CHECK (state IN ('creating','paused','reconciliation_required')),
         frozen_budget_cents INT NOT NULL CHECK (frozen_budget_cents > 0),
+        source_campaign_id TEXT NOT NULL,
+        changed_dimension TEXT NOT NULL,
+        landing_page_url TEXT NOT NULL,
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_expires_at TIMESTAMPTZ,
         progress JSONB NOT NULL DEFAULT '{}'::JSONB,
         failure_category TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (action_id, replacement_draft_id)
+        UNIQUE (action_id)
     )""",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS source_campaign_id TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS changed_dimension TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS landing_page_url TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_owner TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_token TEXT",
+    "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_replacement_one_per_action ON autonomous_replacement_publications(action_id)",
     """CREATE OR REPLACE FUNCTION reject_autonomous_budget_event_mutation()
        RETURNS TRIGGER AS $$
        BEGIN

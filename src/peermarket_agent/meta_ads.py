@@ -362,10 +362,20 @@ def _sync_create_bundle_resource(
         raise MetaAdsError("unknown audience profile", phase="validate_bundle")
     api = _init_api(config)
     account = AdAccount(config.ad_account_id, api=api)
+    def existing(getter_name: str, resource_name: str) -> str | None:
+        getter = getattr(account, getter_name)
+        for candidate in getter(fields=["id", "name"]):
+            if candidate.get("name") == resource_name:
+                return str(candidate["id"])
+        return None
+
     if "campaign_id" not in progress:
+        resource_name = f"{name} — campaign"
+        if found := existing("get_campaigns", resource_name):
+            return "campaign_id", found
         item = account.create_campaign(
             params={
-                Campaign.Field.name: f"{name} — campaign",
+                Campaign.Field.name: resource_name,
                 Campaign.Field.objective: "OUTCOME_TRAFFIC",
                 Campaign.Field.status: Campaign.Status.paused,
                 Campaign.Field.special_ad_categories: [],
@@ -375,9 +385,12 @@ def _sync_create_bundle_resource(
         )
         return "campaign_id", item["id"]
     if "ad_set_id" not in progress:
+        resource_name = f"{name} — adset"
+        if found := existing("get_ad_sets", resource_name):
+            return "ad_set_id", found
         item = account.create_ad_set(
             params={
-                AdSet.Field.name: f"{name} — adset",
+                AdSet.Field.name: resource_name,
                 AdSet.Field.campaign_id: progress["campaign_id"],
                 AdSet.Field.daily_budget: daily_budget_eur * 100,
                 AdSet.Field.billing_event: "IMPRESSIONS",
@@ -412,9 +425,12 @@ def _sync_create_bundle_resource(
         }
         if image_key in progress:
             link_data["image_hash"] = progress[image_key]
+        resource_name = f"{name} {locale} — creative"
+        if found := existing("get_ad_creatives", resource_name):
+            return creative_key, found
         item = account.create_ad_creative(
             params={
-                AdCreative.Field.name: f"{name} {locale} — creative",
+                AdCreative.Field.name: resource_name,
                 AdCreative.Field.object_story_spec: {
                     "page_id": config.page_id,
                     "link_data": link_data,
@@ -423,9 +439,12 @@ def _sync_create_bundle_resource(
             fields=[AdCreative.Field.id],
         )
         return creative_key, item["id"]
+    resource_name = f"{name} {locale}"
+    if found := existing("get_ads", resource_name):
+        return ad_key, found
     item = account.create_ad(
         params={
-            Ad.Field.name: f"{name} {locale}",
+            Ad.Field.name: resource_name,
             Ad.Field.adset_id: progress["ad_set_id"],
             Ad.Field.creative: {"creative_id": progress[creative_key]},
             Ad.Field.status: Ad.Status.paused,
@@ -456,6 +475,19 @@ async def create_meta_replacement_bundle_paused(
             locale is not None and f"ad_id:{locale}" not in current
         ):
             try:
+                if "campaign_id" not in current:
+                    request_key, request_name = "request_name:campaign", f"{name} — campaign"
+                elif "ad_set_id" not in current:
+                    request_key, request_name = "request_name:ad_set", f"{name} — adset"
+                elif locale is not None and f"creative_id:{locale}" not in current:
+                    request_key, request_name = (
+                        f"request_name:creative:{locale}", f"{name} {locale} — creative"
+                    )
+                else:
+                    request_key, request_name = f"request_name:ad:{locale}", f"{name} {locale}"
+                if request_key not in current:
+                    current[request_key] = request_name
+                    await persist_progress(request_key, request_name)
                 key, value = await asyncio.to_thread(
                     _sync_create_bundle_resource,
                     config=config,
@@ -486,6 +518,36 @@ async def create_meta_replacement_bundle_paused(
         creative_ids={locale: current[f"creative_id:{locale}"] for locale in ("NL", "FR", "EN")},
         ad_ids=ad_ids,
         ads_manager_url=_build_ads_manager_url(config.ad_account_id, ad_ids["NL"]),
+    )
+
+
+def _sync_get_replacement_bundle_statuses(
+    config: MetaConfig, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+) -> dict[str, dict[str, str | int]]:
+    _ensure_enabled(config)
+    _init_api(config)
+    if set(ad_ids) != {"NL", "FR", "EN"}:
+        raise MetaAdsError("exact NL/FR/EN ad IDs required", phase="verify_bundle")
+    result: dict[str, dict[str, str | int]] = {
+        "campaign": dict(Campaign(campaign_id).api_get(fields=["status", "effective_status"])),
+        "ad_set": dict(
+            AdSet(ad_set_id).api_get(fields=["status", "effective_status", "daily_budget"])
+        ),
+    }
+    result["ad_set"] = {**result["ad_set"], **_normalized_daily_budget(result["ad_set"])}
+    for locale, ad_id in ad_ids.items():
+        result[f"ad:{locale}"] = dict(
+            Ad(ad_id).api_get(fields=["status", "effective_status"])
+        )
+    return result
+
+
+async def get_meta_replacement_bundle_statuses(
+    config: MetaConfig, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+) -> dict[str, dict[str, str | int]]:
+    """Live-read the complete replacement hierarchy and exact ad-set budget."""
+    return await asyncio.to_thread(
+        _sync_get_replacement_bundle_statuses, config, campaign_id, ad_set_id, ad_ids
     )
 
 

@@ -29,9 +29,9 @@ LOCALES = ("NL", "FR", "EN")
 DIMENSIONS = {"hook", "copy", "visual", "audience"}
 _LOCALE_MARKER = re.compile(r"(^|\s)(?:\[(?:NL|FR|EN)\]|(?:NL|FR|EN):)(?:\s|$)", re.I)
 _LANGUAGE_SIGNALS = {
-    "NL": re.compile(r"\b(?:de|het|een|voor|van|met|je|jouw|veilig|buurt)\b", re.I),
-    "FR": re.compile(r"\b(?:le|la|les|des|une|pour|avec|vous|votre|près)\b", re.I),
-    "EN": re.compile(r"\b(?:the|a|an|for|with|you|your|safe|nearby|people)\b", re.I),
+    "NL": re.compile(r"\b(?:de|het|een|voor|van|met|je|jouw|veilig|buurt|koop|verkoop|vertrouwde|buren|echte|mensen|dichtbij)\b", re.I),
+    "FR": re.compile(r"\b(?:le|la|les|des|une|pour|avec|vous|votre|près|achetez|vendez|sécurité|sereinement|voisins|personnes|fiables|localement)\b", re.I),
+    "EN": re.compile(r"\b(?:the|a|an|for|with|you|your|safe|safely|nearby|people|buy|sell|trusted|verified|local)\b", re.I),
 }
 
 
@@ -117,6 +117,7 @@ class ReplacementDraft:
     landing_page_url: str
     cost_cents: int
     brand_scores: Mapping[str, int]
+    locale_quality: Mapping[str, dict] | None = None
 
 
 def _verify_frozen(source: ReplacementSource, decision: FrozenDecision) -> None:
@@ -138,9 +139,55 @@ def _validate_native(locale: str, item: ReplacementLocale) -> None:
     complete = item.complete_text()
     if _LOCALE_MARKER.search(complete):
         raise ValueError("replacement contains a literal locale marker")
-    # Conservative signal, not a claim of semantic language detection.
-    if not _LANGUAGE_SIGNALS[locale].search(item.body):
-        raise ValueError(f"{locale} replacement lacks native-language validation signals")
+    # Conservative complete-field signal. CTA labels are Meta platform tokens and are
+    # reviewed semantically by the native-quality gate below.
+    for field in ("hook", "body", "headline", "description"):
+        if not _LANGUAGE_SIGNALS[locale].search(getattr(item, field)):
+            raise ValueError(
+                f"{locale} replacement {field} lacks native-language validation signals"
+            )
+
+
+async def _review_native_quality(
+    claude: ClaudeClient, locale: str, item: ReplacementLocale
+) -> dict:
+    response = await claude.complete(
+        system=(
+            "You are an independent native-language advertising quality reviewer. "
+            "Return JSON only; never rewrite the copy."
+        ),
+        user=(
+            f"Requested locale: {locale}. Review the complete creative JSON below, including "
+            "hook, body, headline, description, and CTA. Confirm every field is in the exact "
+            "requested language (allow the standard Meta CTA platform label), idiomatic, and "
+            "not a literal translation. Return exactly: "
+            '{"locale":"NL|FR|EN","exact_language":true,"idiomatic":true,'
+            '"literal_translation":false,"field_results":{"hook":true,"body":true,'
+            '"headline":true,"description":true,"cta_label":true},"evidence":"..."}. '
+            f"Creative: {json.dumps(asdict(item), ensure_ascii=False, sort_keys=True)}"
+        ),
+        temperature=0,
+        max_tokens=350,
+    )
+    payload = parse_claude_json(response.text)
+    expected = {
+        "locale", "exact_language", "idiomatic", "literal_translation", "field_results", "evidence"
+    }
+    fields = {"hook", "body", "headline", "description", "cta_label"}
+    if (
+        set(payload) != expected
+        or payload["locale"] != locale
+        or payload["exact_language"] is not True
+        or payload["idiomatic"] is not True
+        or payload["literal_translation"] is not False
+        or not isinstance(payload["field_results"], dict)
+        or set(payload["field_results"]) != fields
+        or any(payload["field_results"].get(field) is not True for field in fields)
+        or not isinstance(payload["evidence"], str)
+        or not payload["evidence"].strip()
+    ):
+        raise ValueError(f"{locale} replacement failed native-quality validation")
+    return payload
 
 
 def _validate_locale(payload: dict, source: ReplacementSource, locale: str) -> ReplacementLocale:
@@ -227,6 +274,7 @@ async def _persist(engine: AsyncEngine, draft: ReplacementDraft) -> int:
         "image_prompt": draft.image_prompt,
         "asset_path": draft.asset_path,
         "suggested_daily_budget_eur": draft.daily_budget_eur,
+        "locale_quality": draft.locale_quality,
     }
     async with engine.begin() as conn:
         action_id = await conn.scalar(
@@ -275,6 +323,7 @@ async def build_replacement(
     brand_voice = load_brand_voice()
     locales: dict[str, ReplacementLocale] = {}
     scores: dict[str, int] = {}
+    quality: dict[str, dict] = {}
     total_cost = 0
     for locale in LOCALES:
         learnings = (
@@ -315,6 +364,7 @@ async def build_replacement(
         if score < BRAND_SCORE_THRESHOLD:
             raise ValueError(f"{locale} complete replacement failed brand validation")
         scores[locale] = int(score)
+        quality[locale] = await _review_native_quality(claude, locale, item)
     normalized = [_normalized(item.complete_text()) for item in locales.values()]
     if len(set(normalized)) != len(LOCALES):
         raise ValueError("literal translation detector rejected cross-locale sameness")
@@ -336,6 +386,7 @@ async def build_replacement(
         landing_page_url=source.landing_page_url,
         cost_cents=total_cost,
         brand_scores=scores,
+        locale_quality=quality,
     )
     writer = persist or (lambda value: _persist(engine, value))
     result = writer(provisional)

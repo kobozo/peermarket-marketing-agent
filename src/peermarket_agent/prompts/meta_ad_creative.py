@@ -122,9 +122,10 @@ def build_replacement_user_prompt(
         f"Locale: {locale}\n"
         f"Write the creative in {language_name}, written natively rather than translated.\n"
         f"Change exactly this primary experiment dimension: {changed_dimension}.\n"
-        "Return strict JSON only, with exactly: locale, changed_dimension, primary_text, "
-        "headline, description, cta_label, audience_profile_key, "
-        "suggested_daily_budget_eur. Do not use locale labels or placeholders in the copy.\n"
+        "Return strict JSON only, with exactly: locale, changed_dimension, hook, body, "
+        "headline, description, cta_label, audience_profile_key, image_prompt, asset_path, "
+        "suggested_daily_budget_eur. Never return primary_text. Do not use locale labels "
+        "or placeholders in the copy.\n"
         "Every field outside the selected dimension must exactly equal the frozen source.\n"
         f"Frozen source JSON: {json.dumps(source, sort_keys=True, ensure_ascii=False)}\n"
     )

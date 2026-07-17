@@ -60,7 +60,8 @@ def test_autonomy_migration_has_durable_constraints_and_audit_fields():
     assert "autonomous_decisions_append_only" in migration_sql
     assert "autonomous_budget_events_append_only" in migration_sql
     assert "create table if not exists autonomous_replacement_publications" in migration_sql
-    assert "unique (action_id, replacement_draft_id)" in migration_sql
+    assert "unique (action_id)" in migration_sql
+    assert "lease_owner text" in migration_sql
 
 
 def test_publications_migration_adds_reconciliation_columns_and_unique_draft_index():

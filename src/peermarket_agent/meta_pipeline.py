@@ -1,6 +1,7 @@
 """Approved Meta draft to durable, activated publication."""
 
 import json
+import uuid
 from dataclasses import asdict, dataclass
 
 import structlog
@@ -21,6 +22,7 @@ from peermarket_agent.meta_ads import (
     create_meta_ad_paused,
     create_meta_replacement_bundle_paused,
     get_meta_ad_statuses,
+    get_meta_replacement_bundle_statuses,
     pause_meta_ad,
 )
 from peermarket_agent.nano_banana import (
@@ -142,7 +144,7 @@ async def _require_live_replacement_claim(
             .mappings()
             .first()
         )
-    if row is None or row["status"] not in {"leased", "executing"}:
+    if row is None or row["status"] not in {"leased", "executing", "reconciliation_required"}:
         raise ValueError("autonomous replacement requires a live persisted worker claim")
     if (
         row["kind"] != "replace"
@@ -200,24 +202,62 @@ async def publish_replacement_paused(
     await _require_live_replacement_claim(engine, claim, draft)
     if set(draft.locales) != {"NL", "FR", "EN"}:
         raise ValueError("replacement must contain exact NL/FR/EN locales")
+    attempt_token = uuid.uuid4().hex
     async with engine.begin() as conn:
-        attempt = (
+        inserted = (
             (
                 await conn.execute(
                     text(
-                        "INSERT INTO autonomous_replacement_publications (action_id, replacement_draft_id, source_draft_id, frozen_budget_cents) VALUES (:action, :draft, :source, :budget) ON CONFLICT (action_id, replacement_draft_id) DO UPDATE SET updated_at=NOW() RETURNING id, state, progress"
+                        "INSERT INTO autonomous_replacement_publications "
+                        "(action_id, replacement_draft_id, source_draft_id, frozen_budget_cents, "
+                        "source_campaign_id, changed_dimension, landing_page_url, lease_owner, "
+                        "lease_token, lease_expires_at) VALUES (:action, :draft, :source, :budget, "
+                        ":campaign, :dimension, :url, :owner, :attempt_token, NOW()+INTERVAL '5 minutes') "
+                        "ON CONFLICT (action_id) DO NOTHING RETURNING id, state, progress, lease_token"
                     ),
                     {
                         "action": claim.id,
                         "draft": draft.id,
                         "source": draft.source_draft_id,
                         "budget": draft.daily_budget_eur * 100,
+                        "campaign": draft.source_campaign_id,
+                        "dimension": draft.changed_dimension,
+                        "url": draft.landing_page_url,
+                        "owner": claim.lease_owner,
+                        "attempt_token": attempt_token,
                     },
                 )
             )
             .mappings()
-            .one()
+            .first()
         )
+        if inserted is None:
+            attempt = (
+                (await conn.execute(text(
+                    "SELECT * FROM autonomous_replacement_publications WHERE action_id=:action FOR UPDATE"
+                ), {"action": claim.id})).mappings().one()
+            )
+            invariants = {
+                "replacement_draft_id": draft.id,
+                "source_draft_id": draft.source_draft_id,
+                "frozen_budget_cents": draft.daily_budget_eur * 100,
+                "source_campaign_id": draft.source_campaign_id,
+                "changed_dimension": draft.changed_dimension,
+                "landing_page_url": draft.landing_page_url,
+            }
+            if any(attempt[key] != value for key, value in invariants.items()):
+                raise ValueError("replacement action conflicts with immutable publication intention")
+            if attempt["state"] != "paused":
+                claimed = (await conn.execute(text(
+                    "UPDATE autonomous_replacement_publications SET lease_owner=:owner, "
+                    "lease_token=:token, lease_expires_at=NOW()+INTERVAL '5 minutes', updated_at=NOW() "
+                    "WHERE id=:id AND (lease_expires_at IS NULL OR lease_expires_at<=NOW()) RETURNING *"
+                ), {"id": attempt["id"], "owner": claim.lease_owner, "token": attempt_token})).mappings().first()
+                if claimed is None:
+                    raise RuntimeError("replacement publication is owned by another worker")
+                attempt = claimed
+        else:
+            attempt = inserted
     if attempt["state"] == "paused":
         progress = attempt["progress"]
         return ReplacementBundlePublication(
@@ -258,9 +298,9 @@ async def publish_replacement_paused(
         async with engine.begin() as conn:
             result = await conn.execute(
                 text(
-                    "UPDATE autonomous_replacement_publications SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE id=:id AND state IN ('creating','reconciliation_required')"
+                    "UPDATE autonomous_replacement_publications SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE id=:id AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required')"
                 ),
-                {"id": attempt["id"], "key": key, "value": value},
+                {"id": attempt["id"], "token": attempt_token, "key": key, "value": value},
             )
             if result.rowcount != 1:
                 raise RuntimeError("replacement publication progress persistence failed")
@@ -288,20 +328,48 @@ async def publish_replacement_paused(
                 text(
                     "UPDATE autonomous_replacement_publications SET "
                     "state='reconciliation_required', progress=progress || CAST(:ids AS JSONB), "
-                    "failure_category='meta_bundle_creation', updated_at=NOW() WHERE id=:id"
+                    "failure_category='meta_bundle_creation', lease_owner=NULL, lease_token=NULL, "
+                    "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_token=:token"
                 ),
-                {"id": attempt["id"], "ids": json.dumps(recovered_ids)},
+                {"id": attempt["id"], "token": attempt_token, "ids": json.dumps(recovered_ids)},
             )
+            await conn.execute(text(
+                "UPDATE autonomous_actions SET status='reconciliation_required', updated_at=NOW() WHERE id=:id"
+            ), {"id": claim.id})
         raise
-    if result.status != "PAUSED":
-        raise RuntimeError("Meta replacement bundle did not return PAUSED")
+    try:
+        observed = await get_meta_replacement_bundle_statuses(
+            _meta_config(settings), result.campaign_id, result.ad_set_id, result.ad_ids
+        )
+        expected_keys = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
+        paused_compatible = {"PAUSED", "PENDING_REVIEW"}
+        valid = set(observed) == expected_keys and all(
+            value.get("status") == "PAUSED"
+            and value.get("effective_status") in paused_compatible
+            for value in observed.values()
+        ) and observed["ad_set"].get("daily_budget") == draft.daily_budget_eur * 100
+        if result.status != "PAUSED" or not valid:
+            raise RuntimeError("live Meta replacement bundle is not exactly paused at frozen budget")
+    except Exception:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "UPDATE autonomous_replacement_publications SET state='reconciliation_required', "
+                "failure_category='post_create_validation', lease_owner=NULL, lease_token=NULL, "
+                "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_token=:token"
+            ), {"id": attempt["id"], "token": attempt_token})
+            await conn.execute(text(
+                "UPDATE autonomous_actions SET status='reconciliation_required', updated_at=NOW() WHERE id=:id"
+            ), {"id": claim.id})
+        raise
     await persist_progress("ads_manager_url", result.ads_manager_url)
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, updated_at=NOW() WHERE id=:id"
+                "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, "
+                "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
+                "WHERE id=:id AND lease_token=:token"
             ),
-            {"id": attempt["id"]},
+            {"id": attempt["id"], "token": attempt_token},
         )
         for locale in ("NL", "FR", "EN"):
             await conn.execute(

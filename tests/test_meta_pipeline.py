@@ -85,6 +85,15 @@ def _patch_replacement_preparation(monkeypatch):
     monkeypatch.setattr(
         "peermarket_agent.meta_pipeline.edit_image", AsyncMock(return_value=b"prepared")
     )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses",
+        AsyncMock(return_value={
+            "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+            "ad_set": {"status": "PAUSED", "effective_status": "PAUSED", "daily_budget": 1000},
+            **{f"ad:{locale}": {"status": "PAUSED", "effective_status": "PAUSED"}
+               for locale in ("NL", "FR", "EN")},
+        }),
+    )
 
 
 async def test_pipeline_refuses_automatic_activation_when_disabled(
@@ -365,6 +374,95 @@ async def test_autonomous_publication_mismatch_makes_no_meta_call(
             engine=engine, settings=_make_settings(), claim=claim, draft=draft
         )
     create.assert_not_awaited()
+
+
+async def test_same_action_second_replacement_draft_fails_before_external_work(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    create = AsyncMock(return_value=MetaReplacementBundleResult(
+        "new-c", "new-as", {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+        {x: f"ad-{x}" for x in ("NL", "FR", "EN")}, "https://business.facebook.com/adsmanager"
+    ))
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create)
+    await publish_replacement_paused(engine=engine, settings=_make_settings(), claim=claim, draft=draft)
+    async with engine.begin() as conn:
+        second_id = await conn.scalar(text(
+            "INSERT INTO drafts (action_type_id, channel, language, copy, metadata) "
+            "SELECT action_type_id, channel, language, copy, metadata FROM drafts WHERE id=:id RETURNING id"
+        ), {"id": draft.id})
+    object.__setattr__(draft, "id", second_id)
+    with pytest.raises(ValueError, match="immutable publication intention"):
+        await publish_replacement_paused(engine=engine, settings=_make_settings(), claim=claim, draft=draft)
+    assert create.await_count == 1
+
+
+async def test_concurrent_same_draft_has_one_bundle_owner(monkeypatch, engine_with_meta_draft):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(**kwargs):
+        entered.set()
+        await release.wait()
+        values = {"campaign_id": "new-c", "ad_set_id": "new-as",
+                  **{f"creative_id:{x}": f"cr-{x}" for x in ("NL", "FR", "EN")},
+                  **{f"ad_id:{x}": f"ad-{x}" for x in ("NL", "FR", "EN")}}
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        return MetaReplacementBundleResult(
+            "new-c", "new-as", {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")}, "https://business.facebook.com/adsmanager"
+        )
+
+    create = AsyncMock(side_effect=held)
+    monkeypatch.setattr("peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create)
+    owner = asyncio.create_task(publish_replacement_paused(
+        engine=engine, settings=_make_settings(), claim=claim, draft=draft
+    ))
+    await entered.wait()
+    with pytest.raises(RuntimeError, match="another worker"):
+        await publish_replacement_paused(engine=engine, settings=_make_settings(), claim=claim, draft=draft)
+    release.set()
+    await owner
+    assert create.await_count == 1
+
+
+async def test_live_budget_mismatch_marks_action_and_attempt_reconciliation(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses",
+        AsyncMock(return_value={
+            "campaign": {"status": "PAUSED", "effective_status": "PAUSED"},
+            "ad_set": {"status": "PAUSED", "effective_status": "PAUSED", "daily_budget": 999},
+            **{f"ad:{x}": {"status": "PAUSED", "effective_status": "PAUSED"}
+               for x in ("NL", "FR", "EN")},
+        }),
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused",
+        AsyncMock(return_value=MetaReplacementBundleResult(
+            "new-c", "new-as", {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")}, "https://business.facebook.com/adsmanager"
+        )),
+    )
+    with pytest.raises(RuntimeError, match="not exactly paused"):
+        await publish_replacement_paused(engine=engine, settings=_make_settings(), claim=claim, draft=draft)
+    async with engine.connect() as conn:
+        attempt_state = await conn.scalar(text(
+            "SELECT state FROM autonomous_replacement_publications WHERE action_id=:id"
+        ), {"id": claim.id})
+        action_state = await conn.scalar(text(
+            "SELECT status FROM autonomous_actions WHERE id=:id"
+        ), {"id": claim.id})
+    assert attempt_state == action_state == "reconciliation_required"
 
 
 async def test_autonomous_bundle_partial_failure_retry_reuses_structured_ids(

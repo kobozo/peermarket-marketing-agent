@@ -11,6 +11,7 @@ from peermarket_agent.meta_ads import (
     MetaAdsError,
     MetaBundleLocale,
     MetaConfig,
+    _sync_create_bundle_resource,
     activate_meta_ad,
     create_meta_ad_paused,
     create_meta_replacement_bundle_paused,
@@ -51,7 +52,84 @@ async def test_replacement_bundle_creates_one_budget_hierarchy_and_three_locale_
     )
     assert created.count("campaign_id") == created.count("ad_set_id") == 1
     assert result.ad_ids == {"NL": "ad-NL", "FR": "ad-FR", "EN": "ad-EN"}
-    assert persisted.await_count == 8
+    assert persisted.await_count == 16
+    persisted_keys = [call.args[0] for call in persisted.await_args_list]
+    assert "request_name:campaign" in persisted_keys
+    assert {f"request_name:ad:{locale}" for locale in ("NL", "FR", "EN")} <= set(persisted_keys)
+
+
+@pytest.mark.parametrize(
+    ("progress", "expected_key"),
+    [
+        ({}, "campaign_id"),
+        ({"campaign_id": "c1"}, "ad_set_id"),
+        ({"campaign_id": "c1", "ad_set_id": "as1"}, "creative_id:NL"),
+        (
+            {"campaign_id": "c1", "ad_set_id": "as1", "creative_id:NL": "cr1"},
+            "ad_id:NL",
+        ),
+    ],
+)
+def test_bundle_retry_looks_up_resource_created_before_id_persistence(
+    monkeypatch, progress, expected_key
+):
+    """A process death after Meta create but before DB persistence cannot duplicate resources."""
+    class FakeAccount:
+        def __init__(self):
+            self.resources = {"campaign": [], "ad_set": [], "creative": [], "ad": []}
+            self.creates = 0
+
+        def _get(self, kind):
+            return list(self.resources[kind])
+
+        def get_campaigns(self, fields):
+            return self._get("campaign")
+
+        def get_ad_sets(self, fields):
+            return self._get("ad_set")
+
+        def get_ad_creatives(self, fields):
+            return self._get("creative")
+
+        def get_ads(self, fields):
+            return self._get("ad")
+
+        def _create(self, kind, params):
+            self.creates += 1
+            item = {"id": f"{kind}-id", "name": params["name"]}
+            self.resources[kind].append(item)
+            return item
+
+        def create_campaign(self, params, fields):
+            return self._create("campaign", params)
+
+        def create_ad_set(self, params, fields):
+            return self._create("ad_set", params)
+
+        def create_ad_creative(self, params, fields):
+            return self._create("creative", params)
+
+        def create_ad(self, params, fields):
+            return self._create("ad", params)
+
+    account = FakeAccount()
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", lambda config: object())
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdAccount", lambda *args, **kwargs: account)
+    kwargs = dict(
+        config=_FULL_CONFIG,
+        name="PeerMarket autonomous action-7",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        landing_page_url="https://peermarket.eu/",
+        locale="NL",
+        creative=MetaBundleLocale("body", "head", "desc", "LEARN_MORE", None),
+        progress=progress,
+    )
+    first = _sync_create_bundle_resource(**kwargs)
+    second = _sync_create_bundle_resource(**kwargs)
+    assert first == second
+    assert first[0] == expected_key
+    assert account.creates == 1
 
 
 async def test_replacement_bundle_retry_reuses_durable_progress(monkeypatch):
