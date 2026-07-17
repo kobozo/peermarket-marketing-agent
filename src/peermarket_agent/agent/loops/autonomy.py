@@ -217,22 +217,52 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
         )
     eligible = []
     plain_rows = [dict(row) for row in rows]
-    for row in plain_rows:
+    grouped: dict[str, list[dict]] = {}
+    for item in plain_rows:
+        campaign = str((item.get("external_ids") or {}).get("campaign_id") or "")
+        grouped.setdefault(campaign, []).append(item)
+    for campaign_id in sorted(grouped):
+        campaign_rows = sorted(
+            grouped[campaign_id], key=lambda item: (item["draft_id"], item["publication_id"])
+        )
+        row = campaign_rows[0]
         try:
             performance = dict(row["performance"] or {})
             if not isinstance(performance.get("autonomy_basis"), dict):
                 continue
             inputs = performance.get("autonomy_inputs")
             if not isinstance(inputs, dict) or inputs.get("schema") != "autonomy-inputs/v1":
-                inputs = _canonical_inputs(row, plain_rows)
+                inputs = _canonical_inputs(row, campaign_rows)
             variants = inputs["variants"]
             source = inputs["replacement_source"]
+            publications = [
+                {
+                    "publication_id": int(item["publication_id"]),
+                    "draft_id": int(item["draft_id"]),
+                    "approved_budget_cents": int(item["approved_budget_cents"]),
+                    "external_ids": dict(item["external_ids"] or {}),
+                }
+                for item in campaign_rows
+            ]
+            basis = dict(performance["autonomy_basis"])
+            basis.update(
+                {
+                    "approved_budget_cents": sum(
+                        item["approved_budget_cents"] for item in publications
+                    ),
+                    "publication_ids": [item["publication_id"] for item in publications],
+                    "campaign_publications": publications,
+                    "campaign_total_budget_cents": sum(
+                        item["approved_budget_cents"] for item in publications
+                    ),
+                }
+            )
+            performance["autonomy_basis"] = basis
             publication = {
                 "external_ids": dict(row["external_ids"] or {}),
-                "approved_budget_cents": row["approved_budget_cents"],
+                "approved_budget_cents": basis["campaign_total_budget_cents"],
                 "performance": performance,
             }
-            campaign_id = publication["external_ids"]["campaign_id"]
             history_rows = await campaign_history(engine, campaign_id)
             history = []
             for item in history_rows:
@@ -315,7 +345,13 @@ async def persist_autonomy_inputs(engine: AsyncEngine) -> int:
             performance = dict(row.get("performance") or {})
             if not isinstance(performance.get("autonomy_basis"), dict):
                 continue
-            performance["autonomy_inputs"] = _canonical_inputs(row, rows)
+            campaign = (row.get("external_ids") or {}).get("campaign_id")
+            campaign_rows = [
+                item
+                for item in rows
+                if (item.get("external_ids") or {}).get("campaign_id") == campaign
+            ]
+            performance["autonomy_inputs"] = _canonical_inputs(row, campaign_rows)
             result = await conn.execute(
                 text(
                     "UPDATE publications SET performance=CAST(:performance AS JSONB),updated_at=NOW() "
@@ -356,18 +392,23 @@ async def _audit(
             text(
                 "UPDATE slack_outbox SET status='obsolete',lease_owner=NULL,lease_expires_at=NULL,"
                 "last_failure_category='superseded_autonomy_lifecycle' "
-                "WHERE draft_id=:draft AND message_kind='autonomy_audit' "
+                "WHERE autonomy_campaign_id=:campaign AND message_kind='autonomy_audit' "
                 "AND status IN ('pending','failed') AND idempotency_key<>:key"
             ),
-            {"draft": draft_id, "key": key},
+            {"campaign": decision.campaign_id, "key": key},
         )
         await conn.execute(
             text(
-                "INSERT INTO slack_outbox(idempotency_key,draft_id,message_kind,payload) "
-                "VALUES (:key,:draft,'autonomy_audit',CAST(:payload AS JSONB)) "
+                "INSERT INTO slack_outbox(idempotency_key,draft_id,message_kind,payload,autonomy_campaign_id) "
+                "VALUES (:key,:draft,'autonomy_audit',CAST(:payload AS JSONB),:campaign) "
                 "ON CONFLICT (idempotency_key) DO NOTHING"
             ),
-            {"key": key, "draft": draft_id, "payload": json.dumps(payload)},
+            {
+                "key": key,
+                "draft": draft_id,
+                "campaign": decision.campaign_id,
+                "payload": json.dumps(payload),
+            },
         )
 
 

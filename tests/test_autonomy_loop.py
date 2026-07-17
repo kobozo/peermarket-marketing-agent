@@ -16,7 +16,6 @@ from peermarket_agent.agent.loops.autonomy import (
     run_autonomy_cycle,
 )
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
-from peermarket_agent.autonomy.executor import ExecutionStatus
 from peermarket_agent.db.migrations import run_migrations
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
@@ -200,8 +199,14 @@ async def test_newer_autonomy_lifecycle_obsoletes_only_undelivered_older_audits(
                 "'autonomy:audit-decision:shadow'"
             )
         )
-    await _audit(engine, draft_id=156, decision=decision, outcome="succeeded", detail="recovered")
-    await _audit(engine, draft_id=156, decision=decision, outcome="succeeded", detail="recovered")
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status) "
+                "SELECT 157,action_type_id,'meta','MULTI','published' FROM drafts WHERE id=156"
+            )
+        )
+    await _audit(engine, draft_id=157, decision=decision, outcome="succeeded", detail="recovered")
+    await _audit(engine, draft_id=157, decision=decision, outcome="succeeded", detail="recovered")
 
     async with engine.connect() as conn:
         rows = (
@@ -276,23 +281,42 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
             },
         )
     await persist_autonomy_inputs(engine)
-    execute = AsyncMock(
-        return_value=SimpleNamespace(
-            status=ExecutionStatus.SUCCEEDED,
-            reason="executed",
-            rollback_result=None,
-            retry_at=None,
-        )
-    )
-    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.execute_production_claim", execute)
+    budgets = {"20": 1000, "21": 1000}
+    writes = []
 
-    result = await run_autonomy_cycle(
-        engine, object(), None, _limits(meta_autonomy_shadow=False), now=NOW
+    async def allocation(config, campaign_id, ad_set_id, ad_id):
+        active = {"status": "ACTIVE", "effective_status": "ACTIVE"}
+        return {
+            "campaign_id": campaign_id,
+            "ad_set_id": ad_set_id,
+            "ad_id": ad_id,
+            "ad_set": active | {"daily_budget": budgets[ad_set_id]},
+            "ad": active,
+        }
+
+    async def set_budget(config, ad_set_id, cents):
+        budgets[ad_set_id] = cents
+        writes.append((ad_set_id, cents))
+        return {"daily_budget": cents}
+
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_allocation_state", allocation)
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.set_meta_adset_daily_budget", set_budget
     )
+    settings = _limits(
+        meta_autonomy_shadow=False,
+        meta_app_id="app",
+        meta_app_secret="secret",
+        meta_system_user_token="token",
+        meta_ad_account_id="act",
+        meta_page_id="page",
+    )
+
+    result = await run_autonomy_cycle(engine, object(), None, settings, now=NOW)
 
     assert result["queued"] == 1
     assert result["executed"] == 1
-    execute.assert_awaited_once()
+    assert writes == [("20", 800), ("21", 1200)]
     async with engine.connect() as conn:
         assert (
             await conn.scalar(
@@ -305,4 +329,10 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
                 text("SELECT count(*) FROM slack_outbox WHERE message_kind='autonomy_audit'")
             )
             >= 1
+        )
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM autonomous_actions WHERE status='succeeded'")
+            )
+            == 1
         )

@@ -224,6 +224,9 @@ _STEPS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending ON slack_outbox (status, next_attempt_at)",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_owner TEXT",
     "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE slack_outbox ADD COLUMN IF NOT EXISTS autonomy_campaign_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_slack_outbox_autonomy_campaign ON slack_outbox "
+    "(autonomy_campaign_id, id) WHERE message_kind='autonomy_audit'",
     """DO $$
        DECLARE constraint_name TEXT;
        BEGIN

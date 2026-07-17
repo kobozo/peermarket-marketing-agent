@@ -405,6 +405,58 @@ async def _publication(engine: Any, campaign_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] | None:
+    frozen = claim.decision.evidence.get("frozen_basis") or {}
+    expected = frozen.get("campaign_publications")
+    if not isinstance(expected, list) or not expected:
+        return await _publication(engine, claim.campaign_id)
+    async with engine.connect() as conn:
+        rows = [
+            dict(row)
+            for row in (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT id AS publication_id,draft_id,state,external_ids,"
+                            "approved_budget_cents,performance FROM publications WHERE channel='meta' "
+                            "AND external_ids->>'campaign_id'=:campaign ORDER BY id"
+                        ),
+                        {"campaign": claim.campaign_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        ]
+    actual = [
+        {
+            "publication_id": int(row["publication_id"]),
+            "draft_id": int(row["draft_id"]),
+            "approved_budget_cents": int(row["approved_budget_cents"]),
+            "external_ids": dict(row["external_ids"] or {}),
+        }
+        for row in rows
+        if row["state"] in {"active", "published"}
+    ]
+    if actual != expected:
+        return None
+    total = sum(item["approved_budget_cents"] for item in actual)
+    if (
+        total != frozen.get("campaign_total_budget_cents")
+        or total != claim.decision.old_budget_cents
+    ):
+        return None
+    canonical = rows[0]
+    performance = dict(canonical["performance"] or {})
+    performance["autonomy_basis"] = dict(frozen)
+    return {
+        **canonical,
+        "external_ids": dict(frozen.get("external_ids") or canonical["external_ids"]),
+        "approved_budget_cents": total,
+        "performance": performance,
+    }
+
+
 def _ids(publication: Mapping[str, Any]) -> dict[str, str]:
     raw = publication.get("external_ids") or {}
     return {key: str(raw[key]) for key in ("campaign_id", "ad_set_id", "ad_id") if raw.get(key)}
@@ -797,7 +849,11 @@ async def execute_claim(
         _WRITE_STARTED.reset(write_token)
         return ExecutionResult(ExecutionStatus.REFUSED, "lease_lost")
     try:
-        publication = await _publication(engine, claim.campaign_id)
+        publication = (
+            await _reallocation_publication(engine, claim)
+            if claim.kind is DecisionKind.REALLOCATE
+            else await _publication(engine, claim.campaign_id)
+        )
     except BaseException as exc:
         if isinstance(exc, asyncio.CancelledError):
             _WRITE_STARTED.reset(write_token)
@@ -837,9 +893,22 @@ async def execute_claim(
     heartbeat = asyncio.create_task(_heartbeat(engine, claim, lost))
     before = None
     try:
-        before = await _external(
-            engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+        aggregate_reallocation = claim.kind is DecisionKind.REALLOCATE and isinstance(
+            (claim.decision.evidence.get("frozen_basis") or {}).get("campaign_publications"), list
         )
+        if aggregate_reallocation:
+            active = {"status": "ACTIVE", "effective_status": "ACTIVE"}
+            before = {
+                **_ids(publication),
+                "budget_cents": publication["approved_budget_cents"],
+                "status": "ACTIVE",
+                "effective_status": "ACTIVE",
+                "hierarchy": {key: dict(active) for key in ("campaign", "ad_set", "ad")},
+            }
+        else:
+            before = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+            )
         history = _history_events(await campaign_history(engine, claim.campaign_id))
         reason = _policy_reason(claim, settings, publication, before, history, now)
         if reason:
