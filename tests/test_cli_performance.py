@@ -369,8 +369,58 @@ def test_hook_experiment_projection_is_sanitized_and_ready():
         meta_autonomy_shadow=True,
         meta_autonomy_campaign_ids=("120249125021520342",),
     )
-    status = _hook_experiment_status(rows, settings=settings, draft_id=156)
+    expected = {
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "2",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": identity,
+    }
+    status = _hook_experiment_status(rows, settings=settings, draft_id=156, expected=expected)
     assert status["ready"] is True
     assert status["variant_count"] == 3
     assert all(item["languages"] == ["EN", "FR", "NL"] for item in status["variants"])
     assert "sensitive-audience-value" not in json.dumps(status)
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("ad_set_id", "wrong", "persisted_identity_mismatch"),
+        ("landing_page_url", "https://wrong.example", "persisted_identity_mismatch"),
+        ("changed_dimension", "body", "persisted_identity_mismatch"),
+        ("variant_id", "exp:99", "variant_ids_mismatch"),
+    ],
+)
+def test_hook_experiment_projection_blocks_adversarial_persisted_identity(field, value, reason):
+    from peermarket_agent.cli_performance import _hook_experiment_status
+
+    identity = {"audience": "fixed"}
+    rows = [
+        {
+            "experiment_id": "exp",
+            "variant_id": f"exp:{variant:02}",
+            "language": language,
+            "campaign_id": "120249125021520342",
+            "ad_set_id": "2",
+            "landing_page_url": "https://peermarket.eu/signup",
+            "changed_dimension": "hook",
+            "fixed_identity": identity,
+        }
+        for variant in (1, 2, 3)
+        for language in ("NL", "FR", "EN")
+    ]
+    rows[-1][field] = value
+    settings = SimpleNamespace(
+        meta_autonomy_experiment_id="exp",
+        meta_autonomy_shadow=True,
+        meta_autonomy_campaign_ids=("120249125021520342",),
+    )
+    expected = {
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "2",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": identity,
+    }
+    status = _hook_experiment_status(rows, settings=settings, draft_id=156, expected=expected)
+    assert status["ready"] is False
+    assert status["blocked_reason"] == reason

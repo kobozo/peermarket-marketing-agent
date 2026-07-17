@@ -95,6 +95,11 @@ def test_hook_experiment_runbook_is_ci_only_shadow_first_and_has_kill_switch():
     ):
         assert required.casefold() in text.casefold()
     assert "gh secret set" not in text
+    assert "peermarket-performance prepare-hook-experiment --draft-id 156" in text
+    assert (
+        "peermarket-performance prepare-hook-experiment --draft-id 156"
+        in DEPLOY_WORKFLOW.read_text()
+    )
 
 
 def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials():

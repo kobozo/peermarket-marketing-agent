@@ -20,6 +20,7 @@ gh run watch "$run_id" --exit-status
 ```
 
 Do not continue unless the watched workflow succeeded and its commit matches the intended revision.
+The deploy workflow automatically runs `peermarket-performance prepare-hook-experiment --draft-id 156 --seed draft-156-shadow-v1` after migrations when `META_AUTONOMY_EXPERIMENT_ID` is configured. This is the runtime path that writes the atomic 3×3 local records; it remains shadow-only and has no Meta/action mutation surface.
 
 ## Verify
 

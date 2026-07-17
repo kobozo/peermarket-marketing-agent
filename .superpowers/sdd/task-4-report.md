@@ -24,3 +24,21 @@ Result: `2 failed, 3 passed`. Failures identified the missing hook-experiment ru
 - `git diff --check` — clean.
 
 The broader three-file run produced `28 passed, 1 skipped`; nine database-backed autonomy tests could not set up because `AGENT_DB_URL` is absent in this environment. Those errors occurred before test execution and are unrelated to Task 4 behavior.
+
+## Review rejection remediation
+
+The rejected revision exposed two material gaps, now closed:
+
+- The deployed CI path now runs `peermarket-performance prepare-hook-experiment --draft-id 156 --seed draft-156-shadow-v1` after migrations whenever an experiment ID is configured. The command loads the actual Draft 156 publication IDs, draft metadata, and database brand voice, then calls the shadow-only preparation boundary. The Task 2 store supplies the atomic transaction for all nine variant/language rows.
+- Readiness now compares persisted rows with the actual Draft 156 publication campaign/ad-set, draft landing URL/fixed identity, `changed_dimension=hook`, configured experiment ID, exact `:01`/`:02`/`:03` IDs, and exact NL/FR/EN coverage.
+- Adversarial tests independently corrupt ad-set, URL, dimension, and variant ID and require a blocked result.
+- The preparation test instruments `enqueue_action` and `execute_production_claim` and proves neither boundary is called.
+
+Review RED: the runbook/workflow test failed because no deployed path invoked `prepare-hook-experiment`; the adversarial variant-ID test then failed with `experiment_incomplete` rather than the more precise `variant_ids_mismatch`. Both contracts were corrected before GREEN.
+
+Review GREEN:
+
+- Focused preparation, CLI projection/adversarial, workflow, and runbook tests pass.
+- Ruff format/check pass on all Task 4 files.
+- Clean database broader run: `42 passed, 2 failed`. Both failures are existing production budget-write expectations in `test_three_publication_scale_preserves_allocation_rounding_and_audits` (`success` and `partial_write_failure`): the lifecycle reports one executed action but their mocked Meta budget write list remains empty. Neither failure enters hook preparation or the new CLI/runtime code.
+- No deployment, workflow dispatch, GitHub variable change, action enqueue, or Meta mutation was performed.

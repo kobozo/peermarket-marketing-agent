@@ -54,7 +54,13 @@ async def test_prepare_hook_experiment_persists_exactly_three_without_meta_mutat
     draft = _hook_draft()
     expected = build_hook_experiment(draft, "warm and practical", "shadow-1")
     persisted = AsyncMock()
+    enqueue = AsyncMock()
+    meta_mutation = AsyncMock()
     monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.record_experiment", persisted)
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.enqueue_action", enqueue)
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.autonomy.execute_production_claim", meta_mutation
+    )
     settings = SimpleNamespace(
         meta_autonomy_shadow=True,
         meta_autonomy_campaign_ids=(draft["campaign_id"],),
@@ -68,6 +74,8 @@ async def test_prepare_hook_experiment_persists_exactly_three_without_meta_mutat
     assert result == expected
     assert len(result.variants) == 3
     persisted.assert_awaited_once_with(engine, result)
+    enqueue.assert_not_awaited()
+    meta_mutation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
