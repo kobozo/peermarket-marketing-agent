@@ -15,6 +15,12 @@ def _immutable(*args: object, **kwargs: object) -> None:
 class _FrozenDict(dict[str, Any]):
     """A JSON-serializable dict whose mutation API is disabled."""
 
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        if getattr(self, "_frozen_initialized", False):
+            raise TypeError("frozen evidence cannot be reinitialized")
+        dict.__init__(self, *args, **kwargs)
+        object.__setattr__(self, "_frozen_initialized", True)
+
     __setitem__ = _immutable
     __delitem__ = _immutable
     clear = _immutable
@@ -23,10 +29,17 @@ class _FrozenDict(dict[str, Any]):
     setdefault = _immutable
     update = _immutable
     __ior__ = _immutable
+    __setattr__ = _immutable
 
 
 class _FrozenList(list[Any]):
     """A JSON-serializable list whose mutation API is disabled."""
+
+    def __init__(self, *args: object) -> None:
+        if getattr(self, "_frozen_initialized", False):
+            raise TypeError("frozen evidence cannot be reinitialized")
+        list.__init__(self, *args)
+        object.__setattr__(self, "_frozen_initialized", True)
 
     __setitem__ = _immutable
     __delitem__ = _immutable
@@ -40,6 +53,7 @@ class _FrozenList(list[Any]):
     sort = _immutable
     __iadd__ = _immutable
     __imul__ = _immutable
+    __setattr__ = _immutable
 
 
 def _freeze_json(value: Any) -> Any:
@@ -113,6 +127,7 @@ class HookVariant:
     campaign_id: str
     ad_set_id: str
     landing_page_url: str
+    changed_dimension: str
     fixed_identity: Mapping[str, Any]
     language_bundles: Mapping[str, Mapping[str, Any]]
 
@@ -122,8 +137,13 @@ class HookVariant:
         _numeric_meta_id(self.campaign_id, "campaign_id")
         _numeric_meta_id(self.ad_set_id, "ad_set_id")
         _landing_page(self.landing_page_url)
-        if not isinstance(self.fixed_identity, Mapping) or not self.fixed_identity:
-            raise ValueError("fixed identity must be a non-empty mapping")
+        if self.changed_dimension != "hook":
+            raise ValueError("changed_dimension must be exactly hook")
+        required_identity = {"audience", "optimization", "format", "visual", "delivery"}
+        if not isinstance(self.fixed_identity, Mapping) or not required_identity <= set(
+            self.fixed_identity
+        ):
+            raise ValueError("fixed identity requires audience/optimization/format/visual/delivery")
         if not isinstance(self.language_bundles, Mapping) or set(self.language_bundles) != {
             "NL",
             "FR",
@@ -135,6 +155,13 @@ class HookVariant:
             for bundle in self.language_bundles.values()
         ):
             raise ValueError("each NL/FR/EN language bundle must be non-empty")
+        bundle_fields = {"hook", "body", "headline", "description", "cta_label"}
+        if any(
+            set(bundle) != bundle_fields
+            or any(not isinstance(value, str) or not value.strip() for value in bundle.values())
+            for bundle in self.language_bundles.values()
+        ):
+            raise ValueError("language bundles require exact complete creative fields")
         object.__setattr__(self, "fixed_identity", _freeze_json(self.fixed_identity))
         object.__setattr__(self, "language_bundles", _freeze_json(self.language_bundles))
 
@@ -147,6 +174,7 @@ class HookExperiment:
     campaign_id: str
     ad_set_id: str
     landing_page_url: str
+    changed_dimension: str
     fixed_identity: Mapping[str, Any]
     variants: tuple[HookVariant, ...]
 
@@ -155,6 +183,8 @@ class HookExperiment:
         _numeric_meta_id(self.campaign_id, "campaign_id")
         _numeric_meta_id(self.ad_set_id, "ad_set_id")
         _landing_page(self.landing_page_url)
+        if self.changed_dimension != "hook":
+            raise ValueError("changed_dimension must be exactly hook")
         if not isinstance(self.fixed_identity, Mapping) or not self.fixed_identity:
             raise ValueError("fixed identity must be a non-empty mapping")
         variants = tuple(self.variants)
@@ -168,10 +198,28 @@ class HookExperiment:
             or item.campaign_id != self.campaign_id
             or item.ad_set_id != self.ad_set_id
             or item.landing_page_url != self.landing_page_url
+            or item.changed_dimension != self.changed_dimension
             or item.fixed_identity != identity
             for item in variants
         ):
             raise ValueError("variant fixed identity must match its hook experiment")
+        non_hook_fields = ("body", "headline", "description", "cta_label")
+        baseline = variants[0]
+        if any(
+            any(
+                item.language_bundles[locale][field] != baseline.language_bundles[locale][field]
+                for locale in ("NL", "FR", "EN")
+                for field in non_hook_fields
+            )
+            for item in variants[1:]
+        ):
+            raise ValueError("only hook text may differ across hook variants")
+        hook_signatures = {
+            tuple(item.language_bundles[locale]["hook"] for locale in ("NL", "FR", "EN"))
+            for item in variants
+        }
+        if len(hook_signatures) != 3:
+            raise ValueError("hook experiment requires three distinct hook values")
         object.__setattr__(self, "fixed_identity", identity)
         object.__setattr__(self, "variants", variants)
 

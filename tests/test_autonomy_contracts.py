@@ -22,9 +22,23 @@ def _hook_variant(variant_id: str = "hook-1", **overrides):
         "campaign_id": "120249125021520342",
         "ad_set_id": "120249125021520343",
         "landing_page_url": "https://peermarket.eu/signup",
-        "fixed_identity": {"audience": "declutterers", "optimization": "LANDING_PAGE_VIEWS"},
+        "changed_dimension": "hook",
+        "fixed_identity": {
+            "audience": "declutterers",
+            "optimization": "LANDING_PAGE_VIEWS",
+            "format": "single_image",
+            "visual": "asset-1",
+            "delivery": "lowest_cost",
+            "placements": ["feed"],
+        },
         "language_bundles": {
-            locale: {"hook": f"{locale} hook", "headline": f"{locale} headline"}
+            locale: {
+                "hook": f"{locale} {variant_id}",
+                "body": f"{locale} body",
+                "headline": f"{locale} headline",
+                "description": f"{locale} description",
+                "cta_label": "Learn More",
+            }
             for locale in ("NL", "FR", "EN")
         },
     }
@@ -38,7 +52,15 @@ def _hook_experiment(**overrides):
         "campaign_id": "120249125021520342",
         "ad_set_id": "120249125021520343",
         "landing_page_url": "https://peermarket.eu/signup",
-        "fixed_identity": {"audience": "declutterers", "optimization": "LANDING_PAGE_VIEWS"},
+        "changed_dimension": "hook",
+        "fixed_identity": {
+            "audience": "declutterers",
+            "optimization": "LANDING_PAGE_VIEWS",
+            "format": "single_image",
+            "visual": "asset-1",
+            "delivery": "lowest_cost",
+            "placements": ["feed"],
+        },
         "variants": tuple(_hook_variant(f"hook-{number}") for number in range(1, 4)),
     }
     values.update(overrides)
@@ -67,7 +89,16 @@ def test_hook_experiment_requires_exactly_three_unique_variants():
 
 
 def test_hook_variant_requires_complete_nl_fr_en_bundles_and_deep_freezes_them():
-    bundles = {locale: {"hook": locale} for locale in ("NL", "FR", "EN")}
+    bundles = {
+        locale: {
+            "hook": locale,
+            "body": "fixed body",
+            "headline": "fixed headline",
+            "description": "fixed description",
+            "cta_label": "Learn More",
+        }
+        for locale in ("NL", "FR", "EN")
+    }
     variant = _hook_variant(language_bundles=bundles)
     bundles["NL"]["hook"] = "changed"
     assert variant.language_bundles["NL"]["hook"] == "NL"
@@ -78,9 +109,40 @@ def test_hook_variant_requires_complete_nl_fr_en_bundles_and_deep_freezes_them()
 
 
 def test_hook_experiment_rejects_variant_fixed_identity_drift():
-    drifted = _hook_variant("hook-3", fixed_identity={"audience": "other"})
+    identity = dict(_hook_variant("hook-3").fixed_identity)
+    identity["audience"] = "other"
+    drifted = _hook_variant("hook-3", fixed_identity=identity)
     with pytest.raises(ValueError, match="fixed identity"):
         _hook_experiment(variants=(_hook_variant("hook-1"), _hook_variant("hook-2"), drifted))
+
+
+def test_hook_experiment_allows_only_hook_text_to_change():
+    bundles = {
+        locale: dict(_hook_variant("hook-3").language_bundles[locale])
+        for locale in ("NL", "FR", "EN")
+    }
+    bundles["NL"]["headline"] = "changed headline"
+    changed_headline = _hook_variant("hook-3", language_bundles=bundles)
+    with pytest.raises(ValueError, match="only hook"):
+        _hook_experiment(
+            variants=(_hook_variant("hook-1"), _hook_variant("hook-2"), changed_headline)
+        )
+    with pytest.raises(ValueError, match="changed_dimension"):
+        _hook_variant(changed_dimension="copy")
+
+
+def test_recursive_frozen_contract_containers_cannot_be_reinitialized():
+    variant = _hook_variant()
+    original_identity = dict(variant.fixed_identity)
+    original_nl = dict(variant.language_bundles["NL"])
+    with pytest.raises(TypeError):
+        variant.fixed_identity.__init__({"audience": "mutated"})
+    with pytest.raises(TypeError):
+        variant.language_bundles["NL"].__init__({"hook": "mutated"})
+    with pytest.raises(TypeError):
+        variant.fixed_identity["placements"].__init__(["mutated"])
+    assert dict(variant.fixed_identity) == original_identity
+    assert dict(variant.language_bundles["NL"]) == original_nl
 
 
 def _decision(**overrides):
