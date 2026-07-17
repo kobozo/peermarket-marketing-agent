@@ -45,6 +45,7 @@ from peermarket_agent.meta_ads import (
     get_meta_allocation_state,
     get_meta_budget_state,
     get_meta_replacement_bundle_statuses,
+    hook_variant_locale_urls,
     pause_meta_replacement_bundle,
     set_meta_ad_status,
     set_meta_adset_daily_budget,
@@ -285,7 +286,9 @@ class MetaExecutionAdapter:
                 bundle.ad_set_id,
                 bundle.ad_ids,
                 creative_ids=bundle.creative_ids,
-                landing_page_url=self._hook_landings[experiment_id],
+                landing_page_url=hook_variant_locale_urls(
+                    self._hook_landings[experiment_id], variant_id
+                ),
                 locales=self._hook_identities[experiment_id][variant_id],
                 image_hashes=bundle.image_hashes,
             )
@@ -388,9 +391,10 @@ class MetaExecutionAdapter:
                 ad_set,
                 ad_ids,
                 creative_ids=creative_ids,
-                landing_page_url=self._hook_landings[
-                    claim.decision.evidence["source"]["experiment_id"]
-                ],
+                landing_page_url=hook_variant_locale_urls(
+                    self._hook_landings[claim.decision.evidence["source"]["experiment_id"]],
+                    variant_id,
+                ),
                 locales=self._hook_identities[claim.decision.evidence["source"]["experiment_id"]][
                     variant_id
                 ],

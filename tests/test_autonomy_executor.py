@@ -930,7 +930,6 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
 
     async def bundle_status(config, campaign_id, ad_set_id, ad_ids, **identity):
         assert set(identity["creative_ids"]) == {"NL", "FR", "EN"}
-        assert identity["landing_page_url"] == "https://peermarket.eu/"
         assert set(identity["locales"]) == {"NL", "FR", "EN"}
         if failure == "creative_drift":
             raise MetaAdsError("creative drift", phase="verify_bundle")

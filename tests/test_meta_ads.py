@@ -209,7 +209,7 @@ def _bundle_identity_kwargs(kind):
         name="PeerMarket autonomous action-7",
         audience_profile_key="declutterers",
         daily_budget_eur=10,
-        landing_page_url="https://peermarket.eu/?utm_content=frozen",
+        landing_page_url={"NL": "https://peermarket.eu/?utm_content=frozen"},
         locale=locale,
         creative=creative,
         progress=progress,
@@ -463,6 +463,17 @@ async def test_live_bundle_validation_reads_parent_links_and_frozen_creative_ide
     assert observed["ad_set"]["campaign_id"] == "c1"
     assert observed["ad:NL"]["creative"]["id"] == "cr-NL"
     assert observed["creative:NL"]["object_story_spec"]["link_data"]["message"] == "body"
+    with pytest.raises(MetaAdsError, match="frozen creative identity mismatch"):
+        await get_meta_replacement_bundle_statuses(
+            _FULL_CONFIG,
+            "c1",
+            "as1",
+            {"NL": "ad-NL"},
+            creative_ids={"NL": "cr-NL"},
+            landing_page_url={"NL": "https://peermarket.eu/?utm_content=wrong"},
+            locales={"NL": locale},
+            image_hashes={"NL": "ih"},
+        )
 
 
 @pytest.mark.parametrize(

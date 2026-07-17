@@ -804,10 +804,7 @@ async def create_meta_hook_experiment_bundles_paused(
             config=config,
             name=f"{experiment_id} {variant_id}",
             locales=variants[variant_id],
-            landing_page_url={
-                locale: _with_utm_content(landing_page_url, f"{variant_id}:{locale}")
-                for locale in ("NL", "FR", "EN")
-            },
+            landing_page_url=hook_variant_locale_urls(landing_page_url, variant_id),
             audience_profile_key=audience_profile_key,
             daily_budget_eur=daily_budget_eur,
             progress=local,
@@ -833,6 +830,14 @@ def _with_utm_content(url: str, identity: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
+def hook_variant_locale_urls(base_url: str, variant_id: str) -> dict[str, str]:
+    """Return the frozen destination identity for each locale ad."""
+    return {
+        locale: _with_utm_content(base_url, f"{variant_id}:{locale}")
+        for locale in ("NL", "FR", "EN")
+    }
+
+
 def _sync_get_replacement_bundle_statuses(
     config: MetaConfig,
     campaign_id: str,
@@ -840,7 +845,7 @@ def _sync_get_replacement_bundle_statuses(
     ad_ids: Mapping[str, str],
     *,
     creative_ids: Mapping[str, str] | None = None,
-    landing_page_url: str | None = None,
+    landing_page_url: str | Mapping[str, str] | None = None,
     locales: Mapping[str, MetaBundleLocale] | None = None,
     image_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, str | int]]:
@@ -883,7 +888,11 @@ def _sync_get_replacement_bundle_statuses(
             frozen = locales[locale]
             link_data: dict[str, object] = {
                 "message": frozen.primary_text,
-                "link": landing_page_url,
+                "link": (
+                    landing_page_url[locale]
+                    if isinstance(landing_page_url, Mapping)
+                    else landing_page_url
+                ),
                 "name": frozen.headline,
                 "description": frozen.description,
                 "call_to_action": {"type": frozen.cta_type},

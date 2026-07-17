@@ -100,6 +100,18 @@ def test_hook_experiment_runbook_is_ci_only_shadow_first_and_has_kill_switch():
         "all three ordered variant IDs"
         in (Path(__file__).parents[1] / "docs" / "autonomous-ad-lifecycle-runbook.md").read_text()
     )
+    autonomy_text = " ".join(RUNBOOK.read_text().split())
+    for audit_field in (
+        "configured experiment ID",
+        "all three ordered variant IDs",
+        "thresholds",
+        "per-variant samples",
+        "complete fresh evidence window",
+        "next evaluation",
+        "neutral",
+        "shadow",
+    ):
+        assert audit_field.casefold() in autonomy_text.casefold()
     assert (
         "peermarket-performance prepare-hook-experiment --draft-id 156"
         in DEPLOY_WORKFLOW.read_text()
