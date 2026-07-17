@@ -150,11 +150,62 @@ def test_prior_replacement_limit_blocks_another_replacement(limits):
     assert evaluate_campaign(_snapshot(), history, limits, NOW).reason == "replacement_limit"
 
 
-def test_winner_with_loser_reallocates_without_changing_total(limits):
-    snapshot = _snapshot(reallocation={"old_budget_cents": 1_000, "new_budget_cents": 1_000})
+def test_winner_with_loser_reallocates_exact_adsets_without_changing_total(limits):
+    allocations = {
+        "winner": {
+            "ad_set_id": "22",
+            "ad_id": "2",
+            "old_budget_cents": 400,
+            "new_budget_cents": 600,
+        },
+        "loser": {
+            "ad_set_id": "11",
+            "ad_id": "1",
+            "old_budget_cents": 600,
+            "new_budget_cents": 400,
+        },
+    }
+    snapshot = _snapshot(
+        reallocation={
+            "old_budget_cents": 1_000,
+            "new_budget_cents": 1_000,
+            "allocations": allocations,
+        }
+    )
     decision = evaluate_campaign(snapshot, (), limits, NOW)
     assert decision.kind is DecisionKind.REALLOCATE
     assert decision.old_budget_cents == decision.new_budget_cents == 1_000
+    assert decision.allocations == allocations
+
+
+def test_reallocation_without_exact_two_sided_identity_fails_closed(limits):
+    snapshot = _snapshot(reallocation={"old_budget_cents": 1_000, "new_budget_cents": 1_000})
+    assert evaluate_campaign(snapshot, (), limits, NOW).reason == "invalid_snapshot"
+
+
+def test_reallocation_with_non_meta_ids_fails_closed(limits):
+    allocations = {
+        "winner": {
+            "ad_set_id": "not-meta",
+            "ad_id": "2",
+            "old_budget_cents": 400,
+            "new_budget_cents": 600,
+        },
+        "loser": {
+            "ad_set_id": "11",
+            "ad_id": "1",
+            "old_budget_cents": 600,
+            "new_budget_cents": 400,
+        },
+    }
+    snapshot = _snapshot(
+        reallocation={
+            "old_budget_cents": 1000,
+            "new_budget_cents": 1000,
+            "allocations": allocations,
+        }
+    )
+    assert evaluate_campaign(snapshot, (), limits, NOW).reason == "invalid_snapshot"
 
 
 def test_scale_is_capped_from_rolling_opening_budget(limits):
@@ -330,7 +381,9 @@ def test_normal_evaluation_requires_valid_aware_now(bad_now, limits):
 def test_no_delivery_requires_explicit_elapsed_active_period(elapsed, reason, limits):
     decision = evaluate_campaign(
         _snapshot(delivery_state="no_delivery", configured_active_since=NOW - elapsed),
-        (), limits, NOW,
+        (),
+        limits,
+        NOW,
     )
     assert decision.kind is DecisionKind.OBSERVE
     assert decision.reason == reason

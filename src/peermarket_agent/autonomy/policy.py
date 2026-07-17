@@ -126,6 +126,7 @@ def evaluate_campaign(
             outcome,
             reallocation["old_budget_cents"],
             reallocation["new_budget_cents"],
+            reallocation["allocations"],
         )
 
     if normalized["allow_replacement"]:
@@ -211,6 +212,7 @@ def _normalize_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         normalized["reallocation"] = {
             "old_budget_cents": _positive_int(item.get("old_budget_cents"), "old_budget_cents"),
             "new_budget_cents": _positive_int(item.get("new_budget_cents"), "new_budget_cents"),
+            "allocations": _normalize_allocations(item.get("allocations")),
         }
     return normalized
 
@@ -359,9 +361,7 @@ def _compare_variants(left, right):
     rate_order = _compare_rates(left, right)
     if rate_order:
         return rate_order
-    return (right["variant_id"] > left["variant_id"]) - (
-        right["variant_id"] < left["variant_id"]
-    )
+    return (right["variant_id"] > left["variant_id"]) - (right["variant_id"] < left["variant_id"])
 
 
 def _in_cooldown(history, policy, now):
@@ -369,7 +369,41 @@ def _in_cooldown(history, policy, now):
     return any(event["kind"] in _MUTATIONS and event["at"] > boundary for event in history)
 
 
-def _decision(kind, snapshot, history, reason, outcome=None, old_budget=None, new_budget=None):
+def _normalize_allocations(value):
+    if not isinstance(value, Mapping) or set(value) != {"winner", "loser"}:
+        raise _InvalidEvidence
+    result = {}
+    for label, item in value.items():
+        if not isinstance(item, Mapping) or set(item) != {
+            "ad_set_id",
+            "ad_id",
+            "old_budget_cents",
+            "new_budget_cents",
+        }:
+            raise _InvalidEvidence
+        ad_set_id = _stable_id(item.get("ad_set_id"), "ad_set_id")
+        ad_id = _stable_id(item.get("ad_id"), "ad_id")
+        if not all(value.isascii() and value.isdecimal() for value in (ad_set_id, ad_id)):
+            raise _InvalidEvidence
+        result[label] = {
+            "ad_set_id": ad_set_id,
+            "ad_id": ad_id,
+            "old_budget_cents": _positive_int(item.get("old_budget_cents"), "old_budget_cents"),
+            "new_budget_cents": _positive_int(item.get("new_budget_cents"), "new_budget_cents"),
+        }
+    return result
+
+
+def _decision(
+    kind,
+    snapshot,
+    history,
+    reason,
+    outcome=None,
+    old_budget=None,
+    new_budget=None,
+    allocations=None,
+):
     evidence = {
         "snapshot_id": snapshot["snapshot_id"],
         "delivery_state": snapshot["delivery_state"],
@@ -380,6 +414,8 @@ def _decision(kind, snapshot, history, reason, outcome=None, old_budget=None, ne
         evidence["configured_active_since"] = snapshot["configured_active_since"].isoformat()
     if outcome:
         evidence.update(outcome)
+    if allocations is not None:
+        evidence["allocations"] = allocations
     canonical = {
         "campaign_id": snapshot["campaign_id"],
         "window_start": snapshot["window_start"].isoformat(),
@@ -404,6 +440,7 @@ def _decision(kind, snapshot, history, reason, outcome=None, old_budget=None, ne
         idempotency_key=f"autonomy:{digest}",
         old_budget_cents=old_budget,
         new_budget_cents=new_budget,
+        allocations=allocations,
     )
 
 

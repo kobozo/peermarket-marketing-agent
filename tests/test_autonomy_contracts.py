@@ -49,6 +49,15 @@ def test_frozen_decision_is_immutable():
         decision.reason = "changed"
 
 
+def test_reallocation_requires_exact_winner_and_loser_budget_intent():
+    with pytest.raises(ValueError, match="allocations"):
+        _decision(
+            kind=DecisionKind.REALLOCATE,
+            old_budget_cents=1000,
+            new_budget_cents=1000,
+        )
+
+
 def test_frozen_decision_deeply_isolates_and_freezes_evidence():
     source = {
         "metrics": [{"name": "spend", "values": [12, 24]}],

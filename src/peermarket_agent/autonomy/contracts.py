@@ -86,6 +86,7 @@ class FrozenDecision:
     idempotency_key: str = ""
     old_budget_cents: int | None = None
     new_budget_cents: int | None = None
+    allocations: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.campaign_id.isascii() or not self.campaign_id.isdecimal():
@@ -117,3 +118,33 @@ class FrozenDecision:
             or self.new_budget_cents <= 0
         ):
             raise ValueError("budget actions require positive old and new budget cents")
+        if self.kind is DecisionKind.REALLOCATE:
+            if not isinstance(self.allocations, Mapping) or set(self.allocations) != {
+                "winner",
+                "loser",
+            }:
+                raise ValueError("reallocation requires exact winner and loser allocations")
+            frozen = _freeze_json(self.allocations)
+            for item in frozen.values():
+                if (
+                    not isinstance(item, Mapping)
+                    or set(item) != {"ad_set_id", "ad_id", "old_budget_cents", "new_budget_cents"}
+                    or not all(
+                        isinstance(item[key], str) and item[key].isascii() and item[key].isdecimal()
+                        for key in ("ad_set_id", "ad_id")
+                    )
+                    or not all(
+                        type(item[key]) is int and item[key] > 0
+                        for key in ("old_budget_cents", "new_budget_cents")
+                    )
+                ):
+                    raise ValueError("reallocation allocations are invalid")
+            if (
+                sum(item["old_budget_cents"] for item in frozen.values()) != self.old_budget_cents
+                or sum(item["new_budget_cents"] for item in frozen.values())
+                != self.new_budget_cents
+                or frozen["winner"]["new_budget_cents"] <= frozen["winner"]["old_budget_cents"]
+                or frozen["loser"]["new_budget_cents"] >= frozen["loser"]["old_budget_cents"]
+            ):
+                raise ValueError("reallocation allocations do not preserve total movement")
+            object.__setattr__(self, "allocations", frozen)

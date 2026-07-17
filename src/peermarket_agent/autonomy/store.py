@@ -216,6 +216,7 @@ async def claim_next_action(
         idempotency_key=row["decision_key"],
         old_budget_cents=row["old_budget_cents"],
         new_budget_cents=row["new_budget_cents"],
+        allocations=(row["evidence"] or {}).get("allocations"),
     )
     return ClaimedAction(
         id=row["id"],

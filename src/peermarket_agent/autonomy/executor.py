@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from collections.abc import Mapping
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -14,6 +15,11 @@ from typing import Any
 from sqlalchemy import text
 
 from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind
+from peermarket_agent.autonomy.replacements import (
+    LocaleCreative,
+    ReplacementSource,
+    build_replacement,
+)
 from peermarket_agent.autonomy.store import (
     begin_execution,
     block_campaign_for_reconciliation,
@@ -21,6 +27,19 @@ from peermarket_agent.autonomy.store import (
     finish_action,
     release_action,
 )
+from peermarket_agent.config import Settings
+from peermarket_agent.meta_ads import (
+    MetaBundleLocale,
+    MetaConfig,
+    activate_meta_ad,
+    get_meta_ad_statuses,
+    get_meta_budget_state,
+    get_meta_replacement_bundle_statuses,
+    pause_meta_replacement_bundle,
+    set_meta_ad_status,
+    set_meta_adset_daily_budget,
+)
+from peermarket_agent.meta_pipeline import publish_replacement_paused
 
 _HEARTBEAT_SECONDS = 30.0
 _RATE_LIMIT_CODES = {4, 17, 32, 613}
@@ -34,6 +53,7 @@ _PAUSED_EFFECTIVE = {
     "PREAPPROVED",
     "PENDING_BILLING_INFO",
 }
+_WRITE_STARTED: ContextVar[bool] = ContextVar("autonomy_write_started", default=False)
 
 
 class ExecutionStatus(StrEnum):
@@ -57,6 +77,180 @@ class ExecutionResult:
 
 class _AmbiguousExternalWrite(RuntimeError):
     """An external mutation failed without proving whether Meta applied it."""
+
+
+class _SagaFailure(RuntimeError):
+    def __init__(self, cause: BaseException, rollback_result: Any) -> None:
+        self.cause = cause
+        self.rollback_result = rollback_result
+        super().__init__(type(cause).__name__)
+
+
+class MetaExecutionAdapter:
+    """Production bridge from executor verbs to the Task 4/5 interfaces."""
+
+    def __init__(self, settings: Settings, claude: Any) -> None:
+        self.settings = settings
+        self.claude = claude
+        self.config = MetaConfig(
+            app_id=settings.meta_app_id,
+            app_secret=settings.meta_app_secret,
+            system_user_token=settings.meta_system_user_token,
+            ad_account_id=settings.meta_ad_account_id,
+            page_id=settings.meta_page_id,
+        )
+        self._drafts: dict[str, Any] = {}
+        self._identities: dict[str, dict[str, Any]] = {}
+
+    async def read_source(self, campaign_id: str, *, ids: Mapping[str, str]) -> dict[str, Any]:
+        statuses = await get_meta_ad_statuses(self.config, dict(ids))
+        budget = await get_meta_budget_state(self.config, dict(ids))
+        return {
+            "campaign_id": campaign_id,
+            "ad_set_id": ids["ad_set_id"],
+            "ad_id": ids["ad_id"],
+            "status": statuses["ad"]["status"],
+            "effective_status": statuses["ad"]["effective_status"],
+            "hierarchy": statuses,
+            "budget_cents": budget["ad_set"]["daily_budget"],
+        }
+
+    async def pause_source(self, *, source: Mapping[str, Any]) -> Any:
+        return await set_meta_ad_status(self.config, source["ad_id"], "PAUSED")
+
+    async def set_budget(self, *, ad_set_id: str, cents: int) -> Any:
+        return await set_meta_adset_daily_budget(self.config, ad_set_id, cents)
+
+    async def read_allocation(self, *, allocation: Mapping[str, Any]) -> Any:
+        return await get_meta_budget_state(
+            self.config,
+            {"ad_set_id": allocation["ad_set_id"], "ad_id": allocation["ad_id"]},
+        )
+
+    async def build(self, *, engine: Any, claim: Any, source: ReplacementSource) -> Any:
+        return await build_replacement(engine, self.claude, source, claim.decision, claim=claim)
+
+    async def create_paused(self, *, engine: Any, claim: Any, draft: Any) -> Any:
+        publication = await publish_replacement_paused(
+            engine=engine, settings=self.settings, claim=claim, draft=draft
+        )
+        self._drafts[publication.campaign_id] = draft
+        async with engine.connect() as conn:
+            progress = await conn.scalar(
+                text(
+                    "SELECT progress FROM autonomous_replacement_publications WHERE action_id=:id"
+                ),
+                {"id": claim.id},
+            )
+        progress = progress or {}
+        ctas = {
+            "Learn More": "LEARN_MORE",
+            "Sign Up": "SIGN_UP",
+            "Shop Now": "SHOP_NOW",
+            "Get Started": "GET_STARTED",
+        }
+        self._identities[publication.campaign_id] = {
+            "creative_ids": publication.creative_ids,
+            "landing_page_url": draft.landing_page_url,
+            "locales": {
+                locale: MetaBundleLocale(
+                    item.primary_text,
+                    item.headline,
+                    item.description,
+                    ctas[item.cta_label],
+                    None,
+                )
+                for locale, item in draft.locales.items()
+            },
+            "image_hashes": {
+                locale: progress[f"image_hash:{locale}"]
+                for locale in ("NL", "FR", "EN")
+                if progress.get(f"image_hash:{locale}")
+            },
+        }
+        return publication
+
+    async def read_replacement(
+        self,
+        campaign_id: str,
+        ad_set_id: str,
+        ad_ids: Mapping[str, str],
+        creative_ids: Mapping[str, str] | None = None,
+    ) -> Any:
+        identity = self._identities.get(campaign_id, {})
+        return await get_meta_replacement_bundle_statuses(
+            self.config,
+            campaign_id,
+            ad_set_id,
+            ad_ids,
+            **(identity or {"creative_ids": creative_ids}),
+        )
+
+    async def activate_replacement(
+        self, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+    ) -> Any:
+        first = ad_ids["NL"]
+        result = await activate_meta_ad(
+            self.config,
+            {"campaign_id": campaign_id, "ad_set_id": ad_set_id, "ad_id": first},
+        )
+        for locale in ("FR", "EN"):
+            await set_meta_ad_status(self.config, ad_ids[locale], "ACTIVE")
+        return result
+
+    async def pause_replacement(
+        self, campaign_id: str, ad_set_id: str, ad_ids: Mapping[str, str]
+    ) -> Any:
+        return await pause_meta_replacement_bundle(self.config, campaign_id, ad_set_id, ad_ids)
+
+    async def pause_persisted(self, *, engine: Any, claim: Any) -> Any:
+        async with engine.connect() as conn:
+            progress = await conn.scalar(
+                text(
+                    "SELECT progress FROM autonomous_replacement_publications WHERE action_id=:id"
+                ),
+                {"id": claim.id},
+            )
+        progress = progress or {}
+        campaign_id, ad_set_id = progress.get("campaign_id"), progress.get("ad_set_id")
+        ad_ids = {
+            locale: progress[f"ad_id:{locale}"]
+            for locale in ("NL", "FR", "EN")
+            if progress.get(f"ad_id:{locale}")
+        }
+        if not campaign_id or not ad_set_id or not ad_ids:
+            return {"observed": {}, "pause_errors": {"ids": "persisted IDs incomplete"}}
+        return await pause_meta_replacement_bundle(self.config, campaign_id, ad_set_id, ad_ids)
+
+
+async def execute_production_claim(
+    engine: Any, settings: Settings, claude: Any, claim: Any, now: datetime
+) -> ExecutionResult:
+    """Task 7 entrypoint wired exclusively to the production Task 4/5 adapters."""
+    return await execute_claim(
+        engine, settings, MetaExecutionAdapter(settings, claude), None, claim, now
+    )
+
+
+def _replacement_source(decision: Any) -> ReplacementSource:
+    raw = decision.evidence.get("source")
+    if not isinstance(raw, Mapping):
+        raise ValueError("replacement decision lacks frozen source")
+    locales = raw.get("locales")
+    if not isinstance(locales, Mapping):
+        raise ValueError("replacement decision lacks frozen locales")
+    return ReplacementSource(
+        draft_id=raw["draft_id"],
+        campaign_id=raw["campaign_id"],
+        experiment_id=raw["experiment_id"],
+        changed_dimension=raw["changed_dimension"],
+        locales={key: LocaleCreative(**value) for key, value in locales.items()},
+        audience_profile_key=raw["audience_profile_key"],
+        image_prompt=raw["image_prompt"],
+        asset_path=raw["asset_path"],
+        daily_budget_eur=raw["daily_budget_eur"],
+        landing_page_url=raw["landing_page_url"],
+    )
 
 
 def _setting(settings: object, name: str, default: Any = None) -> Any:
@@ -91,6 +285,14 @@ def _rate_limited(exc: BaseException) -> bool:
     )
 
 
+def _transient(exc: BaseException) -> bool:
+    return (
+        _rate_limited(exc)
+        or isinstance(exc, (TimeoutError, ConnectionError))
+        or getattr(exc, "http_status", None) in {500, 502, 503, 504}
+    )
+
+
 async def _renew_action(engine: Any, claim: Any, seconds: int = 300) -> None:
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -118,6 +320,7 @@ async def _external(
 async def _write_external(
     engine: Any, claim: Any, target: object, name: str, *args: Any, **kwargs: Any
 ) -> Any:
+    _WRITE_STARTED.set(True)
     try:
         return await _external(engine, claim, target, name, *args, **kwargs)
     except asyncio.CancelledError:
@@ -159,9 +362,16 @@ def _ids(publication: Mapping[str, Any]) -> dict[str, str]:
     return {key: str(raw[key]) for key in ("campaign_id", "ad_set_id", "ad_id") if raw.get(key)}
 
 
+def _source_ids(source: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        key: str(source[key]) for key in ("campaign_id", "ad_set_id", "ad_id") if source.get(key)
+    }
+
+
 def _source_ok(
     source: Mapping[str, Any], campaign: str, ids: Mapping[str, str], budget: int
 ) -> bool:
+    hierarchy = source.get("hierarchy") or {}
     return (
         str(source.get("campaign_id")) == campaign
         and all(
@@ -171,6 +381,11 @@ def _source_ok(
         and source.get("budget_cents", source.get("daily_budget")) == budget
         and source.get("status") == "ACTIVE"
         and source.get("effective_status") in _ACTIVE_EFFECTIVE
+        and set(hierarchy) == {"campaign", "ad_set", "ad"}
+        and all(
+            item.get("status") == "ACTIVE" and item.get("effective_status") in _ACTIVE_EFFECTIVE
+            for item in hierarchy.values()
+        )
     )
 
 
@@ -184,6 +399,18 @@ def _history_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return events
 
 
+def _intent(claim: Any) -> dict[str, Any]:
+    return {
+        "kind": claim.kind.value,
+        "campaign_id": claim.campaign_id,
+        "decision_id": claim.decision_id,
+        "old_budget_cents": claim.decision.old_budget_cents,
+        "new_budget_cents": claim.decision.new_budget_cents,
+        "allocations": _plain(claim.decision.allocations),
+        "decision_key": claim.decision.idempotency_key,
+    }
+
+
 def _policy_reason(
     claim: Any,
     settings: Any,
@@ -193,12 +420,32 @@ def _policy_reason(
     now: datetime,
 ) -> str | None:
     decision = claim.decision
-    snapshot_id = decision.evidence.get("snapshot_id")
     performance = publication.get("performance") or {}
-    current_snapshot = performance.get("snapshot_id") or performance.get("current", {}).get(
-        "snapshot_id"
-    )
-    if current_snapshot is not None and current_snapshot != snapshot_id:
+    snapshot = performance.get("autonomy_snapshot")
+    if not isinstance(snapshot, Mapping):
+        return "missing_snapshot"
+    captured_at = snapshot.get("captured_at")
+    if isinstance(captured_at, str):
+        with suppress(ValueError):
+            captured_at = datetime.fromisoformat(captured_at)
+    if (
+        snapshot.get("snapshot_id") != decision.evidence.get("snapshot_id")
+        or captured_at is None
+        or captured_at.tzinfo is None
+        or not timedelta(0)
+        <= now - captured_at
+        <= timedelta(hours=_setting(settings, "performance_snapshot_max_age_hours", 2))
+        or snapshot.get("window_start")
+        not in {
+            decision.window_start,
+            decision.window_start.isoformat(),
+        }
+        or snapshot.get("window_end") not in {decision.window_end, decision.window_end.isoformat()}
+        or snapshot.get("complete") is not True
+        or snapshot.get("attribution_complete") is not True
+        or snapshot.get("delivery_state") != decision.evidence.get("delivery_state")
+        or snapshot.get("variants") != decision.evidence.get("variants")
+    ):
         return "stale_snapshot"
     budget = publication.get("approved_budget_cents")
     if not isinstance(budget, int) or not _source_ok(
@@ -257,6 +504,7 @@ def _bundle_ids(bundle: Any) -> dict[str, Any]:
         "campaign_id": value["campaign_id"],
         "ad_set_id": value["ad_set_id"],
         "ad_ids": value["ad_ids"],
+        "creative_ids": value.get("creative_ids"),
     }
     if set(result["ad_ids"]) != {"NL", "FR", "EN"}:
         raise RuntimeError("replacement_bundle_must_contain_exact_locales")
@@ -266,13 +514,16 @@ def _bundle_ids(bundle: Any) -> dict[str, Any]:
     return result
 
 
-def _bundle_verified(state: Mapping[str, Any], active: bool) -> bool:
+def _bundle_verified(state: Mapping[str, Any], active: bool, budget_cents: int) -> bool:
     keys = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
-    if not keys.issubset(state):
+    if frozenset(state) not in {
+        frozenset(keys),
+        frozenset(keys | {"creative:NL", "creative:FR", "creative:EN"}),
+    }:
         return False
     wanted = "ACTIVE" if active else "PAUSED"
     effective = _ACTIVE_EFFECTIVE if active else _PAUSED_EFFECTIVE
-    return all(
+    return state["ad_set"].get("daily_budget") == budget_cents and all(
         state[key].get("status") == wanted and state[key].get("effective_status") in effective
         for key in keys
     )
@@ -281,87 +532,159 @@ def _bundle_verified(state: Mapping[str, Any], active: bool) -> bool:
 async def _replace(
     engine: Any, settings: Any, meta: Any, builder: Any, claim: Any, source: Mapping[str, Any]
 ) -> tuple[Any, Any]:
-    draft = (
-        await _call(builder, "build", engine=engine, settings=settings, claim=claim)
-        if hasattr(builder, "build")
-        else await builder(engine, settings, claim)
+    builder = builder or meta
+    frozen_source = _replacement_source(claim.decision)
+    draft = await _call(
+        builder, "build", engine=engine, settings=settings, claim=claim, source=frozen_source
     )
-    bundle = await _write_external(engine, claim, meta, "create_paused", draft=draft, claim=claim)
-    ids = _bundle_ids(bundle)
+    ids = None
+    compensated = False
+    rollback = None
     try:
+        bundle = await _write_external(
+            engine, claim, meta, "create_paused", engine=engine, draft=draft, claim=claim
+        )
+        ids = _bundle_ids(bundle)
         paused = await _external(engine, claim, meta, "read_replacement", **ids)
-        if not _bundle_verified(paused, False):
+        budget_cents = frozen_source.daily_budget_eur * 100
+        if not _bundle_verified(paused, False, budget_cents):
             raise RuntimeError("replacement_not_paused")
         await _write_external(engine, claim, meta, "activate_replacement", **ids)
         active = await _external(engine, claim, meta, "read_replacement", **ids)
-        if not _bundle_verified(active, True):
+        if not _bundle_verified(active, True, budget_cents):
             raise RuntimeError("replacement_not_active")
         try:
             await _write_external(engine, claim, meta, "pause_source", source=source)
-            source_after = await _external(engine, claim, meta, "read_source", claim.campaign_id)
+            source_after = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_source_ids(source)
+            )
             if (
                 source_after.get("status") != "PAUSED"
                 or source_after.get("effective_status") not in _PAUSED_EFFECTIVE
             ):
                 raise RuntimeError("source_not_paused")
         except BaseException:
-            await _write_external(engine, claim, meta, "pause_replacement", **ids)
-            verified = await _external(engine, claim, meta, "read_replacement", **ids)
-            if not _bundle_verified(verified, False):
+            compensated = True
+            try:
+                rollback = await _write_external(engine, claim, meta, "pause_replacement", **ids)
+                verified = await _external(engine, claim, meta, "read_replacement", **ids)
+            except Exception as rollback_error:
+                rollback = {"error": type(rollback_error).__name__}
+                raise
+            if not _bundle_verified(verified, False, budget_cents):
                 raise RuntimeError("replacement_rollback_unproven") from None
+            rollback = {"mutation": rollback, "verified": verified}
             raise
-        return active, {"source": source_after}
-    except BaseException:
-        with suppress(Exception):
-            await _write_external(engine, claim, meta, "pause_replacement", **ids)
-        raise
+        return {"replacement": active, "source": source_after}, rollback
+    except BaseException as cause:
+        if not compensated:
+            try:
+                if ids is not None:
+                    rollback = await _write_external(
+                        engine, claim, meta, "pause_replacement", **ids
+                    )
+                    verified = await _external(engine, claim, meta, "read_replacement", **ids)
+                    rollback = {"mutation": rollback, "verified": verified}
+                elif hasattr(meta, "pause_persisted"):
+                    rollback = await _write_external(
+                        engine, claim, meta, "pause_persisted", engine=engine, claim=claim
+                    )
+            except Exception as rollback_error:
+                rollback = {"error": type(rollback_error).__name__}
+        raise _SagaFailure(cause, rollback) from cause
 
 
 async def execute_claim(
     engine: Any, settings: Any, meta: Any, replacement_builder: Any, claim: Any, now: datetime
 ) -> ExecutionResult:
     """Execute one claim through the complete fail-closed lifecycle."""
+    write_token = _WRITE_STARTED.set(False)
     if not _setting(settings, "meta_autonomy_enabled", False):
+        _WRITE_STARTED.reset(write_token)
         return ExecutionResult(ExecutionStatus.REFUSED, "disabled")
     if _setting(settings, "meta_autonomy_shadow", True):
+        _WRITE_STARTED.reset(write_token)
         return ExecutionResult(ExecutionStatus.REFUSED, "shadow_mode")
     if claim.campaign_id not in tuple(_setting(settings, "meta_autonomy_campaign_ids", ())):
+        _WRITE_STARTED.reset(write_token)
         return ExecutionResult(ExecutionStatus.REFUSED, "not_allowlisted")
     if engine is None or not await begin_execution(engine, claim):
+        _WRITE_STARTED.reset(write_token)
         return ExecutionResult(ExecutionStatus.REFUSED, "lease_lost")
-    publication = await _publication(engine, claim.campaign_id)
+    try:
+        publication = await _publication(engine, claim.campaign_id)
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            _WRITE_STARTED.reset(write_token)
+            raise
+        if _transient(exc):
+            retry_at = now + timedelta(minutes=5)
+            released = await release_action(
+                engine,
+                claim,
+                failure_category="preflight_transient",
+                next_evaluation_at=retry_at,
+            )
+            _WRITE_STARTED.reset(write_token)
+            if released:
+                return ExecutionResult(
+                    ExecutionStatus.RETRYABLE,
+                    "preflight_transient",
+                    retry_at=retry_at,
+                )
+            return ExecutionResult(ExecutionStatus.FAILED, "lease_lost")
+        _WRITE_STARTED.reset(write_token)
+        raise
     if (
         publication is None
         or len(_ids(publication)) != 3
         or publication.get("state") not in {"active", "published"}
     ):
-        await finish_action(
+        finalized = await finish_action(
             engine, claim, status=ActionStatus.CANCELLED, failure_category="publication_changed"
         )
+        if not finalized:
+            _WRITE_STARTED.reset(write_token)
+            return ExecutionResult(ExecutionStatus.FAILED, "lease_lost")
+        _WRITE_STARTED.reset(write_token)
         return ExecutionResult(ExecutionStatus.CANCELLED, "publication_changed")
     lost = asyncio.Event()
     heartbeat = asyncio.create_task(_heartbeat(engine, claim, lost))
     before = None
     try:
-        before = await _external(engine, claim, meta, "read_source", claim.campaign_id)
+        before = await _external(
+            engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+        )
         history = _history_events(await campaign_history(engine, claim.campaign_id))
         reason = _policy_reason(claim, settings, publication, before, history, now)
         if reason:
-            await finish_action(
+            finalized = await finish_action(
                 engine,
                 claim,
                 status=ActionStatus.CANCELLED,
-                before_state=before,
+                before_state={"observed": before, "intent": _intent(claim)},
                 failure_category=reason,
             )
+            if not finalized:
+                return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before_state=before)
             return ExecutionResult(ExecutionStatus.CANCELLED, reason, before_state=before)
         if claim.kind is DecisionKind.PAUSE:
             await _write_external(engine, claim, meta, "pause_source", source=before)
-            after = await _external(engine, claim, meta, "read_source", claim.campaign_id)
-            if after.get("status") != "PAUSED":
+            after = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+            )
+            hierarchy = after.get("hierarchy") or {}
+            if (
+                after.get("status") != "PAUSED"
+                or after.get("effective_status") not in _PAUSED_EFFECTIVE
+                or any(
+                    hierarchy.get(key, {}).get("status") != "ACTIVE"
+                    for key in ("campaign", "ad_set")
+                )
+            ):
                 raise RuntimeError("pause_verification_failed")
             budget_event = None
-        elif claim.kind in {DecisionKind.SCALE, DecisionKind.REALLOCATE}:
+        elif claim.kind is DecisionKind.SCALE:
             await _write_external(
                 engine,
                 claim,
@@ -370,15 +693,80 @@ async def execute_claim(
                 ad_set_id=before["ad_set_id"],
                 cents=claim.decision.new_budget_cents,
             )
-            after = await _external(engine, claim, meta, "read_source", claim.campaign_id)
-            if (
-                after.get("budget_cents", after.get("daily_budget"))
-                != claim.decision.new_budget_cents
+            after = await _external(
+                engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
+            )
+            if after.get(
+                "budget_cents", after.get("daily_budget")
+            ) != claim.decision.new_budget_cents or not _source_ok(
+                after,
+                claim.campaign_id,
+                _ids(publication),
+                claim.decision.new_budget_cents,
             ):
                 raise RuntimeError("budget_verification_failed")
             budget_event = (claim.decision.old_budget_cents, claim.decision.new_budget_cents)
+        elif claim.kind is DecisionKind.REALLOCATE:
+            allocation_after = {}
+            rollback = {}
+            allocation_writes = []
+            try:
+                for item in claim.decision.allocations.values():
+                    observed = await _external(
+                        engine, claim, meta, "read_allocation", allocation=item
+                    )
+                    if (
+                        observed.get("ad_set", {}).get("daily_budget") != item["old_budget_cents"]
+                        or observed.get("ad_set", {}).get("status") != "ACTIVE"
+                        or observed.get("ad_set", {}).get("effective_status")
+                        not in _ACTIVE_EFFECTIVE
+                        or observed.get("ad", {}).get("status") != "ACTIVE"
+                        or observed.get("ad", {}).get("effective_status") not in _ACTIVE_EFFECTIVE
+                    ):
+                        raise RuntimeError("reallocation_live_state_changed")
+                for label in ("loser", "winner"):
+                    item = claim.decision.allocations[label]
+                    allocation_writes.append(label)
+                    await _write_external(
+                        engine,
+                        claim,
+                        meta,
+                        "set_budget",
+                        ad_set_id=item["ad_set_id"],
+                        cents=item["new_budget_cents"],
+                    )
+                for label, item in claim.decision.allocations.items():
+                    observed = await _external(
+                        engine, claim, meta, "read_allocation", allocation=item
+                    )
+                    if observed["ad_set"]["daily_budget"] != item["new_budget_cents"]:
+                        raise RuntimeError("reallocation_verification_failed")
+                    allocation_after[label] = observed
+            except BaseException:
+                for label in allocation_writes:
+                    item = claim.decision.allocations[label]
+                    try:
+                        mutation = await _write_external(
+                            engine,
+                            claim,
+                            meta,
+                            "set_budget",
+                            ad_set_id=item["ad_set_id"],
+                            cents=item["old_budget_cents"],
+                        )
+                        verified = await _external(
+                            engine, claim, meta, "read_allocation", allocation=item
+                        )
+                        rollback[label] = {"mutation": mutation, "verified": verified}
+                    except Exception as rollback_error:
+                        rollback[label] = {"error": type(rollback_error).__name__}
+                raise
+            after = {"source": before, "allocations": allocation_after}
+            budget_event = (claim.decision.old_budget_cents, claim.decision.new_budget_cents)
         elif claim.kind is DecisionKind.REPLACE:
-            after, _ = await _replace(engine, settings, meta, replacement_builder, claim, before)
+            after, rollback = await _replace(
+                engine, settings, meta, replacement_builder, claim, before
+            )
             budget_event = None
         else:
             after, budget_event = before, None
@@ -388,8 +776,9 @@ async def execute_claim(
             engine,
             claim,
             status=ActionStatus.SUCCEEDED,
-            before_state=before,
+            before_state={"observed": before, "intent": _intent(claim)},
             after_state=after,
+            rollback_result=locals().get("rollback"),
             budget=budget_event,
         ):
             raise RuntimeError("execution finalization fence was lost")
@@ -397,18 +786,23 @@ async def execute_claim(
     except BaseException as exc:
         if isinstance(exc, asyncio.CancelledError):
             raise
-        if not isinstance(exc, _AmbiguousExternalWrite) and _rate_limited(exc):
+        if not _WRITE_STARTED.get() and _transient(exc):
             retry_at = now + timedelta(minutes=5)
-            await release_action(
+            released = await release_action(
                 engine, claim, failure_category="meta_rate_limit", next_evaluation_at=retry_at
             )
+            if not released:
+                return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before)
             return ExecutionResult(
                 ExecutionStatus.RETRYABLE, "meta_rate_limit", before, retry_at=retry_at
             )
         reconciled = await block_campaign_for_reconciliation(
             engine,
             claim,
-            before_state=before,
+            before_state={"observed": before, "intent": _intent(claim)},
+            rollback_result=(
+                exc.rollback_result if isinstance(exc, _SagaFailure) else locals().get("rollback")
+            ),
             failure_category="external_state_unproven",
             failure_message=type(exc).__name__,
         )
@@ -421,3 +815,4 @@ async def execute_claim(
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat
+        _WRITE_STARTED.reset(write_token)
