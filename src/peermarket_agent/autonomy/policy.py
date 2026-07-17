@@ -54,6 +54,21 @@ def evaluate_campaign(
     except (TypeError, ValueError, OverflowError):
         return _observe_from_untrusted(snapshot, now, "invalid_snapshot")
 
+    normalized["policy_limits"] = {
+        "snapshot_age_hours": policy["snapshot_age"],
+        "min_impressions": policy["impressions"],
+        "min_landing_page_views": policy["views"],
+        "min_registrations": policy["registrations"],
+        "cooldown_hours": policy["cooldown"],
+        "max_test_days": policy["max_test_days"],
+        "max_replacements_24h": policy["max_replacements"],
+        "max_increase_percent": policy["increase_percent"],
+        "max_daily_budget_cents": policy["ceiling_eur"] * 100,
+        "no_delivery_grace_hours": policy["no_delivery_grace"],
+        "complete_window_required": True,
+        "account_timezone": "UTC",
+    }
+
     if normalized_history is None:
         return _decision(DecisionKind.OBSERVE, normalized, (), "invalid_history")
 
@@ -326,6 +341,9 @@ def _scale(snapshot, history, policy, now, outcome):
     if proposed <= current:
         reason = "absolute_budget_ceiling" if current >= ceiling else "increase_headroom_exhausted"
         return _decision(DecisionKind.OBSERVE, snapshot, history, reason, outcome)
+    allocations = _scale_allocations(snapshot, current, proposed)
+    if allocations is None and (snapshot.get("frozen_basis") or {}).get("campaign_publications"):
+        return _decision(DecisionKind.OBSERVE, snapshot, history, "invalid_campaign_allocations")
     return _decision(
         DecisionKind.SCALE,
         snapshot,
@@ -334,7 +352,54 @@ def _scale(snapshot, history, policy, now, outcome):
         outcome,
         current,
         proposed,
+        allocations,
     )
+
+
+def _scale_allocations(snapshot, old_total, new_total):
+    publications = (snapshot.get("frozen_basis") or {}).get("campaign_publications")
+    if publications is None:
+        return None
+    if not isinstance(publications, (list, tuple)) or not publications:
+        return None
+    prepared = []
+    try:
+        for raw in publications:
+            ids = raw["external_ids"]
+            old = _positive_int(raw["approved_budget_cents"], "approved_budget_cents")
+            if ids["campaign_id"] != snapshot["campaign_id"]:
+                return None
+            prepared.append(
+                {
+                    "publication_id": _positive_int(raw["publication_id"], "publication_id"),
+                    "variant_id": str(_positive_int(raw["draft_id"], "draft_id")),
+                    "campaign_id": snapshot["campaign_id"],
+                    "ad_set_id": _stable_id(ids["ad_set_id"], "ad_set_id"),
+                    "ad_id": _stable_id(ids["ad_id"], "ad_id"),
+                    "old_budget_cents": old,
+                }
+            )
+    except (KeyError, TypeError, _InvalidEvidence):
+        return None
+    prepared.sort(key=lambda item: (item["publication_id"], item["ad_set_id"], item["ad_id"]))
+    if sum(item["old_budget_cents"] for item in prepared) != old_total:
+        return None
+    floors = [item["old_budget_cents"] * new_total // old_total for item in prepared]
+    remainder = new_total - sum(floors)
+    order = sorted(
+        range(len(prepared)),
+        key=lambda index: (
+            -(prepared[index]["old_budget_cents"] * new_total % old_total),
+            prepared[index]["publication_id"],
+            prepared[index]["ad_set_id"],
+        ),
+    )
+    for index in order[:remainder]:
+        floors[index] += 1
+    return {
+        str(item["publication_id"]): {**item, "new_budget_cents": floors[index]}
+        for index, item in enumerate(prepared)
+    }
 
 
 def _completed_window(snapshot, now):
@@ -510,6 +575,8 @@ def _decision(
         evidence.update(outcome)
     if allocations is not None:
         evidence["allocations"] = allocations
+    if "policy_limits" in snapshot:
+        evidence["policy_limits"] = snapshot["policy_limits"]
     if kind is DecisionKind.REPLACE:
         evidence["source"] = snapshot["replacement_source"]
     if "frozen_basis" in snapshot:

@@ -270,6 +270,60 @@ def test_scale_is_capped_from_rolling_opening_budget(limits):
     assert decision.new_budget_cents == 1_200
 
 
+def test_scale_freezes_campaign_total_allocations_and_normalized_policy(limits):
+    publications = [
+        {
+            "publication_id": 3,
+            "draft_id": 103,
+            "approved_budget_cents": 333,
+            "external_ids": {"campaign_id": "120249125021520342", "ad_set_id": "23", "ad_id": "33"},
+        },
+        {
+            "publication_id": 1,
+            "draft_id": 101,
+            "approved_budget_cents": 1000,
+            "external_ids": {"campaign_id": "120249125021520342", "ad_set_id": "21", "ad_id": "31"},
+        },
+        {
+            "publication_id": 2,
+            "draft_id": 102,
+            "approved_budget_cents": 667,
+            "external_ids": {"campaign_id": "120249125021520342", "ad_set_id": "22", "ad_id": "32"},
+        },
+    ]
+    snapshot = _snapshot(
+        current_budget_cents=2_000,
+        opening_budget_cents=2_000,
+        allow_replacement=False,
+        frozen_basis={
+            "campaign_total_budget_cents": 2_000,
+            "campaign_publications": publications,
+        },
+    )
+    decision = evaluate_campaign(
+        snapshot, (), {**limits, "meta_autonomy_max_daily_budget_eur": 24}, NOW
+    )
+
+    assert decision.kind is DecisionKind.SCALE
+    assert (decision.old_budget_cents, decision.new_budget_cents) == (2_000, 2_400)
+    assert [item["new_budget_cents"] for item in decision.allocations.values()] == [1200, 800, 400]
+    assert sum(item["new_budget_cents"] for item in decision.allocations.values()) == 2_400
+    assert decision.evidence["policy_limits"] == {
+        "snapshot_age_hours": 2,
+        "min_impressions": 1_000,
+        "min_landing_page_views": 30,
+        "min_registrations": 10,
+        "cooldown_hours": 24,
+        "max_test_days": 7,
+        "max_replacements_24h": 1,
+        "max_increase_percent": 20,
+        "max_daily_budget_cents": 2_400,
+        "no_delivery_grace_hours": 2,
+        "complete_window_required": True,
+        "account_timezone": "UTC",
+    }
+
+
 def test_one_prior_increase_blocks_second_scale(limits):
     limits = {**limits, "meta_autonomy_cooldown_hours": 1}
     history = _history(

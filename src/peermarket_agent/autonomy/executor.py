@@ -304,6 +304,46 @@ def _setting(settings: object, name: str, default: Any = None) -> Any:
     return getattr(settings, name, default)
 
 
+def _policy_limits(settings: object, fallback: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_age_hours": _setting(
+            settings, "performance_snapshot_max_age_hours", fallback["snapshot_age_hours"]
+        ),
+        "min_impressions": _setting(
+            settings, "learning_min_impressions", fallback["min_impressions"]
+        ),
+        "min_landing_page_views": _setting(
+            settings, "learning_min_landing_page_views", fallback["min_landing_page_views"]
+        ),
+        "min_registrations": _setting(
+            settings, "learning_min_registrations", fallback["min_registrations"]
+        ),
+        "cooldown_hours": _setting(
+            settings, "meta_autonomy_cooldown_hours", fallback["cooldown_hours"]
+        ),
+        "max_test_days": _setting(
+            settings, "meta_autonomy_max_test_days", fallback["max_test_days"]
+        ),
+        "max_replacements_24h": _setting(
+            settings, "meta_autonomy_max_replacements_24h", fallback["max_replacements_24h"]
+        ),
+        "max_increase_percent": _setting(
+            settings, "meta_autonomy_max_increase_percent", fallback["max_increase_percent"]
+        ),
+        "max_daily_budget_cents": _setting(
+            settings,
+            "meta_autonomy_max_daily_budget_eur",
+            fallback["max_daily_budget_cents"] // 100,
+        )
+        * 100,
+        "no_delivery_grace_hours": _setting(
+            settings, "meta_no_delivery_grace_hours", fallback["no_delivery_grace_hours"]
+        ),
+        "complete_window_required": True,
+        "account_timezone": "UTC",
+    }
+
+
 async def _call(target: object, name: str, *args: Any, **kwargs: Any) -> Any:
     function = getattr(target, name)
     try:
@@ -405,7 +445,7 @@ async def _publication(engine: Any, campaign_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] | None:
+async def _aggregate_publication(engine: Any, claim: Any) -> dict[str, Any] | None:
     frozen = claim.decision.evidence.get("frozen_basis") or {}
     expected = frozen.get("campaign_publications")
     if not isinstance(expected, list) or not expected:
@@ -450,11 +490,27 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
     touched = sum(
         int(item["old_budget_cents"]) for item in (claim.decision.allocations or {}).values()
     )
+    expected_budget = total if claim.kind is DecisionKind.SCALE else touched
     if (
         total != frozen.get("campaign_total_budget_cents")
-        or touched != frozen.get("touched_allocation_budget_cents")
-        or touched != claim.decision.old_budget_cents
-        or claim.decision.new_budget_cents != touched
+        or expected_budget != claim.decision.old_budget_cents
+        or (
+            claim.kind is DecisionKind.REALLOCATE
+            and (
+                touched != frozen.get("touched_allocation_budget_cents")
+                or claim.decision.new_budget_cents != touched
+            )
+        )
+        or (
+            claim.kind is DecisionKind.SCALE
+            and (
+                touched != total
+                or sum(
+                    int(item["new_budget_cents"]) for item in claim.decision.allocations.values()
+                )
+                != claim.decision.new_budget_cents
+            )
+        )
     ):
         return None
     canonical = min(
@@ -466,7 +522,7 @@ async def _reallocation_publication(engine: Any, claim: Any) -> dict[str, Any] |
     return {
         **canonical,
         "external_ids": dict(frozen.get("external_ids") or canonical["external_ids"]),
-        "approved_budget_cents": touched,
+        "approved_budget_cents": expected_budget,
         "performance": performance,
     }
 
@@ -500,6 +556,20 @@ def _source_ok(
             item.get("status") == "ACTIVE" and item.get("effective_status") in _ACTIVE_EFFECTIVE
             for item in hierarchy.values()
         )
+    )
+
+
+def _allocation_ok(observed: Mapping[str, Any], item: Mapping[str, Any], budget: int) -> bool:
+    return (
+        all(
+            observed.get(key) == item[key]
+            for key in ("campaign_id", "variant_id", "ad_set_id", "ad_id")
+        )
+        and observed.get("ad_set", {}).get("daily_budget") == budget
+        and observed.get("ad_set", {}).get("status") == "ACTIVE"
+        and observed.get("ad_set", {}).get("effective_status") in _ACTIVE_EFFECTIVE
+        and observed.get("ad", {}).get("status") == "ACTIVE"
+        and observed.get("ad", {}).get("effective_status") in _ACTIVE_EFFECTIVE
     )
 
 
@@ -551,6 +621,9 @@ def _policy_reason(
     now: datetime,
 ) -> str | None:
     decision = claim.decision
+    frozen_limits = decision.evidence.get("policy_limits")
+    if frozen_limits is not None and frozen_limits != _policy_limits(settings, frozen_limits):
+        return "policy_limits_changed"
     if decision.kind is DecisionKind.REPLACE:
         frozen = decision.evidence.get("source")
         current = frozen.get("current_meta_ids") if isinstance(frozen, Mapping) else None
@@ -864,8 +937,8 @@ async def execute_claim(
         return ExecutionResult(ExecutionStatus.REFUSED, "lease_lost")
     try:
         publication = (
-            await _reallocation_publication(engine, claim)
-            if claim.kind is DecisionKind.REALLOCATE
+            await _aggregate_publication(engine, claim)
+            if claim.kind in {DecisionKind.REALLOCATE, DecisionKind.SCALE}
             else await _publication(engine, claim.campaign_id)
         )
     except BaseException as exc:
@@ -907,10 +980,13 @@ async def execute_claim(
     heartbeat = asyncio.create_task(_heartbeat(engine, claim, lost))
     before = None
     try:
-        aggregate_reallocation = claim.kind is DecisionKind.REALLOCATE and isinstance(
+        aggregate_budget = claim.kind in {
+            DecisionKind.REALLOCATE,
+            DecisionKind.SCALE,
+        } and isinstance(
             (claim.decision.evidence.get("frozen_basis") or {}).get("campaign_publications"), list
         )
-        if aggregate_reallocation:
+        if aggregate_budget:
             active = {"status": "ACTIVE", "effective_status": "ACTIVE"}
             before = {
                 **_ids(publication),
@@ -959,15 +1035,12 @@ async def execute_claim(
             ):
                 raise RuntimeError("pause_verification_failed")
             budget_event = None
-        elif claim.kind is DecisionKind.SCALE:
+        elif claim.kind is DecisionKind.SCALE and not claim.decision.allocations:
             fresh = await _external(
                 engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
             )
             if not _source_ok(
-                fresh,
-                claim.campaign_id,
-                _ids(publication),
-                claim.decision.old_budget_cents,
+                fresh, claim.campaign_id, _ids(publication), claim.decision.old_budget_cents
             ):
                 raise _PreconditionChanged("live_state_changed")
             await _write_external(
@@ -981,15 +1054,77 @@ async def execute_claim(
             after = await _external(
                 engine, claim, meta, "read_source", claim.campaign_id, ids=_ids(publication)
             )
-            if after.get(
-                "budget_cents", after.get("daily_budget")
-            ) != claim.decision.new_budget_cents or not _source_ok(
-                after,
-                claim.campaign_id,
-                _ids(publication),
-                claim.decision.new_budget_cents,
+            if not _source_ok(
+                after, claim.campaign_id, _ids(publication), claim.decision.new_budget_cents
             ):
                 raise RuntimeError("budget_verification_failed")
+            budget_event = (claim.decision.old_budget_cents, claim.decision.new_budget_cents)
+        elif claim.kind is DecisionKind.SCALE:
+            allocation_after = {}
+            allocation_writes = []
+            rollback = {}
+            ordered_allocations = sorted(
+                claim.decision.allocations.items(),
+                key=lambda pair: (int(pair[1]["publication_id"]), pair[1]["ad_set_id"]),
+            )
+            try:
+                for _label, item in ordered_allocations:
+                    observed = await _external(
+                        engine, claim, meta, "read_allocation", allocation=item
+                    )
+                    if item["campaign_id"] != claim.campaign_id or not _allocation_ok(
+                        observed, item, item["old_budget_cents"]
+                    ):
+                        raise _PreconditionChanged("scale_live_state_changed")
+                for label, item in ordered_allocations:
+                    fresh = await _external(engine, claim, meta, "read_allocation", allocation=item)
+                    if not _allocation_ok(fresh, item, item["old_budget_cents"]):
+                        raise _PreconditionChanged("scale_live_state_changed")
+                    allocation_writes.append((label, item))
+                    await _write_external(
+                        engine,
+                        claim,
+                        meta,
+                        "set_budget",
+                        ad_set_id=item["ad_set_id"],
+                        cents=item["new_budget_cents"],
+                    )
+                for label, item in ordered_allocations:
+                    observed = await _external(
+                        engine, claim, meta, "read_allocation", allocation=item
+                    )
+                    if not _allocation_ok(observed, item, item["new_budget_cents"]):
+                        raise RuntimeError("scale_verification_failed")
+                    allocation_after[label] = observed
+            except BaseException:
+                for label, item in reversed(allocation_writes):
+                    try:
+                        current = await _external(
+                            engine, claim, meta, "read_allocation", allocation=item
+                        )
+                        current_budget = current.get("ad_set", {}).get("daily_budget")
+                        mutation = None
+                        if current_budget == item["new_budget_cents"]:
+                            mutation = await _write_external(
+                                engine,
+                                claim,
+                                meta,
+                                "set_budget",
+                                ad_set_id=item["ad_set_id"],
+                                cents=item["old_budget_cents"],
+                            )
+                        elif current_budget != item["old_budget_cents"]:
+                            raise RuntimeError("scale_rollback_unproven")
+                        verified = await _external(
+                            engine, claim, meta, "read_allocation", allocation=item
+                        )
+                        if not _allocation_ok(verified, item, item["old_budget_cents"]):
+                            raise RuntimeError("scale_rollback_unproven")
+                        rollback[label] = {"mutation": mutation, "verified": verified}
+                    except Exception as rollback_error:
+                        rollback[label] = {"error": type(rollback_error).__name__}
+                raise
+            after = {"source": before, "allocations": allocation_after}
             budget_event = (claim.decision.old_budget_cents, claim.decision.new_budget_cents)
         elif claim.kind is DecisionKind.REALLOCATE:
             allocation_after = {}
@@ -1169,7 +1304,14 @@ async def execute_claim(
         )
         if reconciled:
             return ExecutionResult(
-                ExecutionStatus.RECONCILIATION_REQUIRED, failure_category, before
+                ExecutionStatus.RECONCILIATION_REQUIRED,
+                failure_category,
+                before,
+                rollback_result=(
+                    exc.rollback_result
+                    if isinstance(exc, _SagaFailure)
+                    else locals().get("rollback")
+                ),
             )
         return ExecutionResult(ExecutionStatus.FAILED, "lease_lost", before)
     finally:

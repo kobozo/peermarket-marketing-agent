@@ -261,7 +261,81 @@ async def test_newer_autonomy_lifecycle_obsoletes_only_undelivered_older_audits(
 
 
 @pytest.mark.asyncio
-async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, monkeypatch):
+async def test_autonomy_audit_freezes_meaningful_sanitized_campaign_content(engine):
+    await test_real_single_collected_publication_persists_canonical_input_and_observe(engine)
+    decision = FrozenDecision(
+        DecisionKind.SCALE,
+        "10",
+        {
+            "snapshot_id": "audit-content",
+            "policy_limits": {"min_impressions": 100, "cooldown_hours": 24},
+            "variants": [
+                {
+                    "variant_id": "NL",
+                    "impressions": 250,
+                    "landing_page_views": 25,
+                    "registrations": 5,
+                }
+            ],
+            "frozen_basis": {
+                "campaign_publications": [
+                    {"publication_id": 1, "external_ids": {"ad_id": "31", "ad_set_id": "21"}}
+                ]
+            },
+        },
+        "proven_winner_scale",
+        NOW - timedelta(days=1),
+        NOW,
+        "audit-content",
+        1000,
+        1200,
+        {
+            "1": {
+                "publication_id": 1,
+                "variant_id": "156",
+                "campaign_id": "10",
+                "ad_set_id": "21",
+                "ad_id": "31",
+                "old_budget_cents": 1000,
+                "new_budget_cents": 1200,
+            }
+        },
+    )
+    await _audit(
+        engine,
+        draft_id=156,
+        decision=decision,
+        outcome="succeeded",
+        detail="executed",
+        rollback_result={"needed": False, "verified": True, "token": "must-not-leak"},
+        next_evaluation_at=NOW + timedelta(hours=24),
+    )
+    async with engine.connect() as conn:
+        payload = await conn.scalar(
+            text(
+                "SELECT payload FROM slack_outbox "
+                "WHERE idempotency_key='autonomy:audit-content:succeeded'"
+            )
+        )
+
+    assert payload["campaign_id"] == "10"
+    assert payload["thresholds"] == {"min_impressions": 100, "cooldown_hours": 24}
+    assert payload["evidence"][0]["impressions"] == 250
+    assert payload["affected_ads"] == [{"ad_id": "31", "ad_set_id": "21", "publication_id": 1}]
+    assert payload["budgets"] == {"previous_cents": 1000, "new_cents": 1200}
+    assert payload["rollback"] == {"needed": False, "verified": True, "token": "[redacted]"}
+    assert "must-not-leak" not in payload["text"]
+    assert payload["next_evaluation_at"] == (NOW + timedelta(hours=24)).isoformat()
+    assert "thresholds" in payload["text"] and "samples" in payload["text"]
+
+
+@pytest.mark.parametrize(
+    "scenario", ["success", "frozen_drift", "policy_drift", "partial_write_failure"]
+)
+@pytest.mark.asyncio
+async def test_three_publication_scale_preserves_allocation_rounding_and_audits(
+    engine, monkeypatch, scenario
+):
     await test_real_single_collected_publication_persists_canonical_input_and_observe(engine)
     async with engine.begin() as conn:
         first = await conn.scalar(text("SELECT performance FROM publications WHERE draft_id=156"))
@@ -326,7 +400,7 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
             {
                 "metadata": json.dumps(
                     {
-                        "experiment_id": "unrelated-experiment",
+                        "experiment_id": "experiment-1",
                         "changed_dimension": "hook",
                         "audience_profile_key": "declutterers",
                     }
@@ -365,8 +439,25 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
                 "performance": json.dumps(first),
             },
         )
+        await conn.execute(
+            text(
+                "UPDATE publications SET approved_budget_cents=CASE draft_id "
+                "WHEN 156 THEN 501 WHEN 157 THEN 499 WHEN 158 THEN 500 "
+                "ELSE approved_budget_cents END WHERE draft_id IN (156,157,158)"
+            )
+        )
     await persist_autonomy_inputs(engine)
-    budgets = {"20": 1000, "21": 1000, "22": 500}
+    async with engine.begin() as conn:
+        canonical = await conn.scalar(
+            text("SELECT performance FROM publications WHERE draft_id=156")
+        )
+        canonical["autonomy_inputs"]["reallocation"] = None
+        canonical["autonomy_inputs"]["replacement_source"] = None
+        await conn.execute(
+            text("UPDATE publications SET performance=CAST(:value AS JSONB) WHERE draft_id=156"),
+            {"value": json.dumps(canonical)},
+        )
+    budgets = {"20": 501, "21": 499, "22": 500}
     writes = []
 
     async def allocation(config, campaign_id, ad_set_id, ad_id):
@@ -380,6 +471,8 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
         }
 
     async def set_budget(config, ad_set_id, cents):
+        if scenario == "partial_write_failure" and ad_set_id == "21":
+            raise RuntimeError("second write failed")
         budgets[ad_set_id] = cents
         writes.append((ad_set_id, cents))
         return {"daily_budget": cents}
@@ -396,18 +489,64 @@ async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, mon
         meta_ad_account_id="act",
         meta_page_id="page",
     )
+    if scenario == "frozen_drift":
+        from peermarket_agent.autonomy.executor import execute_production_claim
+
+        async def drift_then_execute(db, configured, claude, claim, now):
+            async with db.begin() as conn:
+                await conn.execute(
+                    text("UPDATE publications SET approved_budget_cents=501 WHERE draft_id=158")
+                )
+            return await execute_production_claim(db, configured, claude, claim, now)
+
+        monkeypatch.setattr(
+            "peermarket_agent.agent.loops.autonomy.execute_production_claim", drift_then_execute
+        )
+    elif scenario == "policy_drift":
+        from peermarket_agent.autonomy.executor import execute_production_claim
+
+        async def drift_policy_then_execute(db, configured, claude, claim, now):
+            configured.meta_autonomy_max_daily_budget_eur = 19
+            return await execute_production_claim(db, configured, claude, claim, now)
+
+        monkeypatch.setattr(
+            "peermarket_agent.agent.loops.autonomy.execute_production_claim",
+            drift_policy_then_execute,
+        )
 
     result = await run_autonomy_cycle(engine, object(), None, settings, now=NOW)
 
     assert result["queued"] == 1
     assert result["executed"] == 1
-    assert writes == [("20", 800), ("21", 1200)]
-    assert budgets["22"] == 500
+    if scenario in {"frozen_drift", "policy_drift"}:
+        assert writes == []
+        async with engine.connect() as conn:
+            assert (
+                await conn.scalar(
+                    text("SELECT count(*) FROM autonomous_actions WHERE status='cancelled'")
+                )
+                == 1
+            )
+        return
+    if scenario == "partial_write_failure":
+        assert budgets == {"20": 501, "21": 499, "22": 500}
+        assert writes == [("20", 601), ("20", 501)]
+        async with engine.connect() as conn:
+            assert (
+                await conn.scalar(
+                    text(
+                        "SELECT count(*) FROM autonomous_actions "
+                        "WHERE status='reconciliation_required'"
+                    )
+                )
+                == 1
+            )
+        return
+    assert writes == [("20", 601), ("21", 599), ("22", 600)]
+    assert sum(budgets.values()) == 1800
     async with engine.connect() as conn:
         assert (
-            await conn.scalar(
-                text("SELECT count(*) FROM autonomous_decisions WHERE kind='reallocate'")
-            )
+            await conn.scalar(text("SELECT count(*) FROM autonomous_decisions WHERE kind='scale'"))
             >= 1
         )
         assert (

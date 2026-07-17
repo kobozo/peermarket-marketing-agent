@@ -1086,7 +1086,7 @@ def _policy_limits():
     }
 
 
-async def _canonical_policy_replace(engine):
+async def _canonical_policy_replace(engine, **limit_overrides):
     source = _replace_claim().decision.evidence["source"]
     performance = {
         "meta": {
@@ -1128,7 +1128,7 @@ async def _canonical_policy_replace(engine):
         variants,
         replacement_source=source,
         history=(),
-        limits=_policy_limits(),
+        limits={**_policy_limits(), **limit_overrides},
         now=NOW,
     )
     assert decision.kind is DecisionKind.REPLACE
@@ -1177,7 +1177,7 @@ async def _canonical_policy_replace(engine):
 
 @pytest.mark.asyncio
 async def test_policy_replace_is_cancelled_when_replacement_count_changes_before_execution(engine):
-    decision = await _canonical_policy_replace(engine)
+    decision = await _canonical_policy_replace(engine, meta_autonomy_cooldown_hours=0)
     prior = FrozenDecision(
         DecisionKind.REPLACE,
         "10",

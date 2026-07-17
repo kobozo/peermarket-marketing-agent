@@ -164,3 +164,40 @@ class FrozenDecision:
             ):
                 raise ValueError("reallocation allocations do not preserve total movement")
             object.__setattr__(self, "allocations", frozen)
+        if self.kind is DecisionKind.SCALE and self.allocations is not None:
+            if not isinstance(self.allocations, Mapping) or not self.allocations:
+                raise ValueError("scale requires every frozen campaign allocation")
+            frozen = _freeze_json(self.allocations)
+            required = {
+                "publication_id",
+                "variant_id",
+                "campaign_id",
+                "ad_set_id",
+                "ad_id",
+                "old_budget_cents",
+                "new_budget_cents",
+            }
+            if any(
+                not isinstance(item, Mapping)
+                or set(item) != required
+                or item["campaign_id"] != self.campaign_id
+                or not all(
+                    type(item[key]) is int and item[key] > 0
+                    for key in ("publication_id", "old_budget_cents", "new_budget_cents")
+                )
+                or not all(
+                    isinstance(item[key], str) and item[key].isascii() and item[key].isdecimal()
+                    for key in ("variant_id", "ad_set_id", "ad_id")
+                )
+                for item in frozen.values()
+            ):
+                raise ValueError("scale campaign allocations are invalid")
+            if (
+                sum(item["old_budget_cents"] for item in frozen.values()) != self.old_budget_cents
+                or sum(item["new_budget_cents"] for item in frozen.values())
+                != self.new_budget_cents
+                or len({item["publication_id"] for item in frozen.values()}) != len(frozen)
+                or len({item["ad_set_id"] for item in frozen.values()}) != len(frozen)
+            ):
+                raise ValueError("scale allocations must match campaign totals and identities")
+            object.__setattr__(self, "allocations", frozen)

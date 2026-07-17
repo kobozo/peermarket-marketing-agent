@@ -15,6 +15,7 @@ from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
 from peermarket_agent.autonomy.executor import execute_production_claim
 from peermarket_agent.autonomy.snapshot import build_policy_decision
 from peermarket_agent.autonomy.store import (
+    _sanitize_audit_value,
     campaign_history,
     claim_next_action,
     enqueue_action,
@@ -245,19 +246,18 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                 for item in campaign_rows
             ]
             basis = dict(performance["autonomy_basis"])
+            campaign_total = sum(item["approved_budget_cents"] for item in publications)
             touched_budget = (
                 inputs["reallocation"]["old_budget_cents"]
                 if inputs.get("reallocation") is not None
-                else int(row["approved_budget_cents"])
+                else campaign_total
             )
             basis.update(
                 {
                     "approved_budget_cents": touched_budget,
                     "publication_ids": [item["publication_id"] for item in publications],
                     "campaign_publications": publications,
-                    "campaign_total_budget_cents": sum(
-                        item["approved_budget_cents"] for item in publications
-                    ),
+                    "campaign_total_budget_cents": campaign_total,
                     "touched_allocation_budget_cents": touched_budget,
                 }
             )
@@ -377,14 +377,71 @@ async def _audit(
     decision: Any,
     outcome: str,
     detail: str,
+    rollback_result: Any = None,
+    next_evaluation_at: datetime | None = None,
 ) -> None:
     """Persist a sanitized immutable Slack payload for retry by the outbox worker."""
     key = f"autonomy:{decision.idempotency_key}:{outcome}"
+    thresholds = dict(decision.evidence.get("policy_limits") or {})
+    evidence = [
+        {
+            key: item.get(key)
+            for key in ("variant_id", "impressions", "landing_page_views", "registrations")
+        }
+        for item in decision.evidence.get("variants", ())
+    ]
+    allocations = decision.allocations or {}
+    affected_ads = [
+        {
+            "publication_id": item.get("publication_id"),
+            "ad_set_id": item.get("ad_set_id"),
+            "ad_id": item.get("ad_id"),
+        }
+        for item in allocations.values()
+    ]
+    if not affected_ads:
+        affected_ads = [
+            {
+                "publication_id": item.get("publication_id"),
+                "ad_set_id": (item.get("external_ids") or {}).get("ad_set_id"),
+                "ad_id": (item.get("external_ids") or {}).get("ad_id"),
+            }
+            for item in (decision.evidence.get("frozen_basis") or {}).get(
+                "campaign_publications", ()
+            )
+        ]
+    affected_ads.sort(key=lambda item: (item.get("publication_id") or 0, item.get("ad_id") or ""))
+    rollback = _sanitize_audit_value(rollback_result or {"needed": False, "result": "not_required"})
+    if next_evaluation_at is None:
+        next_evaluation_at = decision.window_end + timedelta(
+            hours=int(thresholds.get("cooldown_hours", 24))
+        )
+    next_evaluation = next_evaluation_at.isoformat() if next_evaluation_at else None
     payload = {
         "audit": "autonomy",
+        "campaign_id": decision.campaign_id,
+        "outcome": outcome,
+        "decision": decision.kind.value,
+        "reason": decision.reason,
+        "thresholds": thresholds,
+        "evidence": evidence,
+        "affected_ads": affected_ads,
+        "budgets": {
+            "previous_cents": decision.old_budget_cents,
+            "new_cents": decision.new_budget_cents,
+        },
+        "rollback": rollback,
+        "next_evaluation_at": next_evaluation,
         "text": (
             f"Autonomy {outcome}: campaign {decision.campaign_id}; "
-            f"decision {decision.kind.value}; reason {decision.reason}; detail {detail}"
+            f"decision {decision.kind.value}; reason {decision.reason}; "
+            f"thresholds {json.dumps(thresholds, sort_keys=True)}; "
+            f"samples {json.dumps(evidence, sort_keys=True)}; "
+            f"affected ads {json.dumps(affected_ads, sort_keys=True)}; "
+            f"budget {decision.old_budget_cents}->{decision.new_budget_cents}; "
+            f"rollback {json.dumps(rollback, sort_keys=True)}; "
+            f"next evaluation {next_evaluation or 'pending'}; "
+            f"detail {detail}"
         ),
     }
     async with engine.begin() as conn:
@@ -502,6 +559,12 @@ async def run_autonomy_cycle(
                     decision=claim.decision,
                     outcome=outcome,
                     detail=detail,
+                    rollback_result=(
+                        result.rollback_result
+                        if result.rollback_result is not None
+                        else {"needed": False, "result": "not_required"}
+                    ),
+                    next_evaluation_at=result.retry_at,
                 )
         except Exception as error:
             summary["failed"] += 1
