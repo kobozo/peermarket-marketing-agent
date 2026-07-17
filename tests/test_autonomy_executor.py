@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind, FrozenDecision
 from peermarket_agent.autonomy.executor import (
     ExecutionStatus,
     MetaExecutionAdapter,
@@ -20,8 +20,17 @@ from peermarket_agent.autonomy.executor import (
     _SagaFailure,
     execute_claim,
 )
-from peermarket_agent.autonomy.snapshot import build_autonomy_basis, build_autonomy_snapshot
-from peermarket_agent.autonomy.store import claim_next_action, enqueue_action
+from peermarket_agent.autonomy.snapshot import (
+    build_autonomy_basis,
+    build_autonomy_snapshot,
+    build_policy_decision,
+)
+from peermarket_agent.autonomy.store import (
+    begin_execution,
+    claim_next_action,
+    enqueue_action,
+    finish_action,
+)
 from peermarket_agent.db.migrations import run_migrations
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
@@ -1085,3 +1094,329 @@ async def test_malformed_bundle_uses_persisted_ids_and_never_claims_unverified_c
     assert meta.calls == ["create_paused", "pause_persisted"]
     if not verified:
         assert failure.value.rollback_result["error"] == "RuntimeError"
+
+
+def _policy_limits():
+    return {
+        "performance_snapshot_max_age_hours": 2,
+        "learning_min_impressions": 100,
+        "learning_min_landing_page_views": 10,
+        "learning_min_registrations": 1,
+        "meta_autonomy_cooldown_hours": 24,
+        "meta_autonomy_max_test_days": 7,
+        "meta_autonomy_max_replacements_24h": 1,
+        "meta_autonomy_max_increase_percent": 20,
+        "meta_autonomy_max_daily_budget_eur": 20,
+        "meta_no_delivery_grace_hours": 2,
+    }
+
+
+async def _canonical_policy_replace(engine):
+    source = _replace_claim().decision.evidence["source"]
+    performance = {
+        "meta": {
+            "latest": {
+                "utc_alignment": {
+                    "start": datetime(2026, 7, 16, tzinfo=UTC).isoformat(),
+                    "stop_exclusive": NOW.isoformat(),
+                }
+            },
+            "last_successful_retrieval": NOW.isoformat(),
+            "error": None,
+            "restated": False,
+        },
+        "delivery": {"condition": "healthy"},
+        "attribution": {"available": True},
+    }
+    publication = {
+        "external_ids": {"campaign_id": "10", "ad_set_id": "20", "ad_id": "31"},
+        "approved_budget_cents": 1000,
+        "performance": performance,
+    }
+    performance["autonomy_basis"] = build_autonomy_basis(publication, performance)
+    common = {
+        "channel": "meta",
+        "objective": "OUTCOME_TRAFFIC",
+        "language": "MULTI",
+        "audience": "declutterers",
+        "creative_dimension": "hook",
+        "window_definition": "previous_utc_day",
+        "impressions": 1000,
+        "landing_page_views": 100,
+    }
+    variants = [
+        common | {"variant_id": "loser", "publication_id": 2, "registrations": 1},
+        common | {"variant_id": "winner", "publication_id": 3, "registrations": 10},
+    ]
+    decision = build_policy_decision(
+        publication,
+        variants,
+        replacement_source=source,
+        history=(),
+        limits=_policy_limits(),
+        now=NOW,
+    )
+    assert decision.kind is DecisionKind.REPLACE
+    assert decision.reason == "proven_loser_replace"
+    async with engine.begin() as conn:
+        action_type = await conn.scalar(
+            text(
+                "INSERT INTO action_types(name,risk_tier,default_autonomy) "
+                "VALUES ('canonical_replace','high','propose') RETURNING id"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status,metadata) "
+                "VALUES (1,:type,'meta','MULTI','published',CAST(:metadata AS JSONB))"
+            ),
+            {
+                "type": action_type,
+                "metadata": json.dumps(
+                    {
+                        "experiment_id": source["experiment_id"],
+                        "changed_dimension": source["changed_dimension"],
+                        "locales": source["locales"],
+                        "audience_profile_key": source["audience_profile_key"],
+                        "image_prompt": source["image_prompt"],
+                        "asset_path": source["asset_path"],
+                        "suggested_daily_budget_eur": 10,
+                        "landing_page_url": source["landing_page_url"],
+                    }
+                ),
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO publications(id,draft_id,channel,state,external_ids,"
+                "approved_budget_cents,performance) VALUES "
+                "(2,1,'meta','active',CAST(:ids AS JSONB),1000,CAST(:performance AS JSONB))"
+            ),
+            {
+                "ids": json.dumps(publication["external_ids"]),
+                "performance": json.dumps(performance),
+            },
+        )
+    return decision
+
+
+@pytest.mark.asyncio
+async def test_policy_replace_is_cancelled_when_replacement_count_changes_before_execution(engine):
+    decision = await _canonical_policy_replace(engine)
+    prior = FrozenDecision(
+        DecisionKind.REPLACE,
+        "10",
+        {"prior": True},
+        "prior successful replacement",
+        datetime(2026, 7, 16, tzinfo=UTC),
+        NOW,
+        "replacement-completed-after-policy-decision",
+    )
+    await enqueue_action(engine, prior)
+    prior_claim = await claim_next_action(engine, "history-worker")
+    assert await begin_execution(engine, prior_claim)
+    assert await finish_action(engine, prior_claim, status=ActionStatus.SUCCEEDED)
+    await enqueue_action(engine, decision)
+    claim = await claim_next_action(engine, "executor-worker")
+    meta = ReplacementMeta()
+
+    result = await execute_claim(
+        engine, _settings(meta_autonomy_cooldown_hours=0), meta, None, claim, NOW
+    )
+
+    assert result.status is ExecutionStatus.CANCELLED
+    assert result.reason == "replacement_limit"
+    assert meta.calls == ["read_source"]
+    async with engine.connect() as conn:
+        assert (
+            await conn.scalar(
+                text("SELECT status FROM autonomous_actions WHERE id=:id"), {"id": claim.id}
+            )
+            == "cancelled"
+        )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_retry_adopts_task5_paused_bundle_without_regeneration_or_creation(
+    engine, monkeypatch
+):
+    decision = await _canonical_policy_replace(engine)
+    await enqueue_action(engine, decision)
+    claim = await claim_next_action(engine, "worker", lease_seconds=300)
+    source = decision.evidence["source"]
+    locales = {
+        locale: value
+        | {
+            "body": f"replacement {locale}",
+            "audience_profile_key": source["audience_profile_key"],
+            "image_prompt": source["image_prompt"],
+            "asset_path": source["asset_path"],
+        }
+        for locale, value in source["locales"].items()
+    }
+    landing = "https://peermarket.eu/?utm_source=facebook&utm_medium=paid_social&utm_campaign=peermarket&utm_content=draft-3"
+    progress = {
+        "campaign_id": "50",
+        "ad_set_id": "60",
+        "ads_manager_url": "https://business.facebook.com/adsmanager/manage/campaigns?act=1",
+        **{f"ad_id:{k}": v for k, v in {"NL": "71", "FR": "72", "EN": "73"}.items()},
+        **{f"creative_id:{k}": v for k, v in {"NL": "81", "FR": "82", "EN": "83"}.items()},
+    }
+    async with engine.begin() as conn:
+        action_type = await conn.scalar(text("SELECT id FROM action_types LIMIT 1"))
+        replacement_id = await conn.scalar(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status,copy,generation_cost_cents,"
+                "brand_score,visual_truthfulness_pass,metadata) VALUES "
+                "(3,:type,'meta','MULTI','approved','bundle',3,91,true,CAST(:metadata AS JSONB)) RETURNING id"
+            ),
+            {
+                "type": action_type,
+                "metadata": json.dumps(
+                    {
+                        "autonomous_replacement": True,
+                        "source_draft_id": 1,
+                        "source_campaign_id": "10",
+                        "experiment_id": source["experiment_id"],
+                        "changed_dimension": source["changed_dimension"],
+                        "locales": locales,
+                        "audience_profile_key": source["audience_profile_key"],
+                        "image_prompt": source["image_prompt"],
+                        "asset_path": source["asset_path"],
+                        "suggested_daily_budget_eur": 10,
+                        "landing_page_url": landing,
+                    }
+                ),
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO autonomous_replacement_generations"
+                "(action_id,state,replacement_draft_id) VALUES (:action,'completed',:draft)"
+            ),
+            {"action": claim.id, "draft": replacement_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO autonomous_replacement_publications"
+                "(action_id,replacement_draft_id,source_draft_id,state,frozen_budget_cents,"
+                "source_campaign_id,changed_dimension,landing_page_url,progress) VALUES "
+                "(:action,:draft,1,'paused',1000,'10','hook',:url,CAST(:progress AS JSONB))"
+            ),
+            {
+                "action": claim.id,
+                "draft": replacement_id,
+                "url": landing,
+                "progress": json.dumps(progress),
+            },
+        )
+
+    paused = {
+        key: {"status": "PAUSED", "effective_status": "PAUSED"}
+        for key in ("campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN")
+    }
+    paused["ad_set"]["daily_budget"] = 1000
+    replacement_active = False
+    source_paused = False
+    task5_read = AsyncMock(return_value=paused)
+    create = AsyncMock(side_effect=AssertionError("must adopt persisted Task5 bundle"))
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.get_meta_replacement_bundle_statuses", task5_read
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create
+    )
+
+    async def read_replacement(*args, **kwargs):
+        state = "ACTIVE" if replacement_active else "PAUSED"
+        observed = {
+            key: {"status": state, "effective_status": state}
+            for key in ("campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN")
+        }
+        observed["ad_set"]["daily_budget"] = 1000
+        return observed
+
+    async def activate(*args, **kwargs):
+        nonlocal replacement_active
+        replacement_active = True
+        return {"status": "ACTIVE"}
+
+    async def set_status(config, ad_id, status):
+        nonlocal source_paused, replacement_active
+        if ad_id == "31":
+            source_paused = status == "PAUSED"
+        elif status == "ACTIVE":
+            replacement_active = True
+        return {"status": status}
+
+    async def source_statuses(config, ids):
+        status = "PAUSED" if source_paused else "ACTIVE"
+        return {
+            "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+            "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+            "ad": {"status": status, "effective_status": status},
+        }
+
+    async def budget(*args, **kwargs):
+        return {
+            "ad": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+            "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE", "daily_budget": 1000},
+        }
+
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.get_meta_replacement_bundle_statuses", read_replacement
+    )
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.activate_meta_ad", activate)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_ad_status", set_status)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_ad_statuses", source_statuses)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_budget_state", budget)
+
+    class ClaudeMustNotRun:
+        async def complete(self, *args, **kwargs):
+            raise AssertionError("completed generation must be adopted")
+
+    settings = _settings(
+        meta_app_id="app",
+        meta_app_secret="secret",
+        meta_system_user_token="token",
+        meta_ad_account_id="act",
+        meta_page_id="page",
+    )
+    result = await execute_claim(
+        engine, settings, MetaExecutionAdapter(settings, ClaudeMustNotRun()), None, claim, NOW
+    )
+
+    assert result.status is ExecutionStatus.SUCCEEDED
+    assert result.after_state["replacement"]["ad_set"]["daily_budget"] == 1000
+    create.assert_not_awaited()
+    task5_read.assert_awaited_once()
+    assert source_paused and replacement_active
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT status,audit FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert row["status"] == "succeeded"
+        stored_progress = await conn.scalar(
+            text("SELECT progress FROM autonomous_replacement_publications WHERE action_id=:id"),
+            {"id": claim.id},
+        )
+        assert stored_progress["campaign_id"] == "50"
+        assert {key: stored_progress[f"ad_id:{key}"] for key in ("NL", "FR", "EN")} == {
+            "NL": "71",
+            "FR": "72",
+            "EN": "73",
+        }
+        assert await conn.scalar(text("SELECT count(*) FROM drafts")) == 2
+        assert (
+            await conn.scalar(text("SELECT count(*) FROM autonomous_replacement_generations")) == 1
+        )
+        assert (
+            await conn.scalar(text("SELECT count(*) FROM autonomous_replacement_publications")) == 1
+        )
