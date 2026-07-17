@@ -1,0 +1,428 @@
+"""Pure, deterministic autonomous campaign decision policy."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Any
+
+from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+
+_DIMENSIONS = (
+    "channel",
+    "objective",
+    "language",
+    "audience",
+    "creative_dimension",
+    "window_definition",
+)
+_VARIANT_FIELDS = {
+    "variant_id",
+    "publication_id",
+    *_DIMENSIONS,
+    "impressions",
+    "landing_page_views",
+    "registrations",
+}
+_MUTATIONS = {"pause", "replace", "reallocate", "scale"}
+_DELIVERY_FAILURES = {"no_delivery", "rejected_or_error"}
+
+
+class _InvalidEvidence(ValueError):
+    pass
+
+
+def evaluate_campaign(
+    snapshot: Mapping[str, Any],
+    history: Sequence[Mapping[str, Any]],
+    limits: Mapping[str, Any] | object,
+    now: datetime,
+) -> FrozenDecision:
+    """Derive one immutable decision without performing I/O."""
+    try:
+        _aware(now, "now")
+        normalized = _normalize_snapshot(snapshot)
+        normalized_history = _normalize_history(history)
+        policy = _normalize_limits(limits)
+    except _InvalidEvidence:
+        return _observe_from_untrusted(snapshot, now, "invalid_snapshot")
+    except (TypeError, ValueError, OverflowError):
+        return _observe_from_untrusted(snapshot, now, "invalid_snapshot")
+
+    if normalized_history is None:
+        return _decision(DecisionKind.OBSERVE, normalized, (), "invalid_history")
+
+    ordered_history = normalized_history
+    if not _completed_window(normalized, now):
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "incomplete_window")
+    if not _fresh(normalized, policy, now):
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "stale_snapshot")
+    if not normalized["attribution_complete"]:
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "missing_attribution")
+    if normalized["delivery_state"] in _DELIVERY_FAILURES:
+        return _decision(
+            DecisionKind.OBSERVE,
+            normalized,
+            ordered_history,
+            f"diagnose_{normalized['delivery_state']}",
+        )
+    if normalized["delivery_state"] != "healthy":
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "delivery_unavailable")
+    if _in_cooldown(ordered_history, policy, now):
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "mutation_cooldown")
+
+    variants = normalized["variants"]
+    if not _comparable(variants):
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "not_comparable")
+    if not _evidence_floors(variants, policy):
+        duration = normalized["window_end"] - normalized["window_start"]
+        reason = (
+            "maximum_test_duration_without_qualified_comparison"
+            if duration >= timedelta(days=policy["max_test_days"])
+            else "insufficient_evidence"
+        )
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, reason)
+
+    scored = [(variant, _rate(variant)) for variant in variants]
+    values = {value for _, value in scored}
+    if len(values) == 1:
+        return _decision(DecisionKind.OBSERVE, normalized, ordered_history, "neutral_tie")
+    scored.sort(key=lambda item: (-item[1], item[0]["variant_id"]))
+    winner, winner_value = scored[0]
+    loser, loser_value = sorted(scored, key=lambda item: (item[1], item[0]["variant_id"]))[0]
+    outcome = {
+        "winner_variant_id": winner["variant_id"],
+        "loser_variant_id": loser["variant_id"],
+        "winner_value": str(winner_value),
+        "loser_value": str(loser_value),
+        "metric": "registration_per_landing_page_view",
+    }
+
+    reallocation = normalized.get("reallocation")
+    if reallocation is not None:
+        if reallocation["old_budget_cents"] != reallocation["new_budget_cents"]:
+            return _decision(
+                DecisionKind.OBSERVE, normalized, ordered_history, "invalid_reallocation"
+            )
+        return _decision(
+            DecisionKind.REALLOCATE,
+            normalized,
+            ordered_history,
+            "proven_winner_reallocate",
+            outcome,
+            reallocation["old_budget_cents"],
+            reallocation["new_budget_cents"],
+        )
+
+    if normalized["allow_replacement"]:
+        replacements = sum(
+            event["kind"] == "replace" and event["at"] > now - timedelta(hours=24)
+            for event in ordered_history
+        )
+        if replacements >= policy["max_replacements"]:
+            return _decision(
+                DecisionKind.OBSERVE, normalized, ordered_history, "replacement_limit", outcome
+            )
+        return _decision(
+            DecisionKind.REPLACE,
+            normalized,
+            ordered_history,
+            "proven_loser_replace",
+            outcome,
+        )
+
+    return _scale(normalized, ordered_history, policy, now, outcome)
+
+
+def _normalize_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(snapshot, Mapping):
+        raise _InvalidEvidence
+    campaign_id = snapshot.get("campaign_id")
+    if not isinstance(campaign_id, str) or not campaign_id.isascii() or not campaign_id.isdecimal():
+        raise _InvalidEvidence
+    window_start = _aware(snapshot.get("window_start"), "window_start")
+    window_end = _aware(snapshot.get("window_end"), "window_end")
+    captured_at = _aware(snapshot.get("captured_at"), "captured_at")
+    if (
+        type(snapshot.get("complete")) is not bool
+        or type(snapshot.get("attribution_complete")) is not bool
+    ):
+        raise _InvalidEvidence
+    delivery_state = snapshot.get("delivery_state")
+    if delivery_state not in {"healthy", "unknown", "reviewing", "terminal", *_DELIVERY_FAILURES}:
+        raise _InvalidEvidence
+    variants_value = snapshot.get("variants")
+    if not isinstance(variants_value, (list, tuple)) or not variants_value:
+        raise _InvalidEvidence
+    variants = tuple(
+        sorted(
+            (_normalize_variant(item) for item in variants_value),
+            key=lambda item: item["variant_id"],
+        )
+    )
+    current_budget = _positive_int(snapshot.get("current_budget_cents"), "current_budget_cents")
+    opening = snapshot.get("opening_budget_cents", 1_000)
+    opening_budget = _positive_int(opening, "opening_budget_cents")
+    allow_replacement = snapshot.get("allow_replacement", True)
+    if type(allow_replacement) is not bool:
+        raise _InvalidEvidence
+    normalized: dict[str, Any] = {
+        "snapshot_id": str(snapshot.get("snapshot_id", "unknown")),
+        "campaign_id": campaign_id,
+        "captured_at": captured_at,
+        "window_start": window_start,
+        "window_end": window_end,
+        "complete": snapshot["complete"],
+        "delivery_state": delivery_state,
+        "attribution_complete": snapshot["attribution_complete"],
+        "current_budget_cents": current_budget,
+        "opening_budget_cents": opening_budget,
+        "allow_replacement": allow_replacement,
+        "variants": variants,
+    }
+    if "reallocation" in snapshot:
+        item = snapshot["reallocation"]
+        if not isinstance(item, Mapping):
+            raise _InvalidEvidence
+        normalized["reallocation"] = {
+            "old_budget_cents": _positive_int(item.get("old_budget_cents"), "old_budget_cents"),
+            "new_budget_cents": _positive_int(item.get("new_budget_cents"), "new_budget_cents"),
+        }
+    return normalized
+
+
+def _normalize_variant(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) - _VARIANT_FIELDS:
+        raise _InvalidEvidence
+    variant_id = value.get("variant_id")
+    if not isinstance(variant_id, str) or not variant_id.strip():
+        raise _InvalidEvidence
+    publication_id = _positive_int(value.get("publication_id"), "publication_id")
+    normalized = {"variant_id": variant_id, "publication_id": publication_id}
+    for dimension in _DIMENSIONS:
+        item = value.get(dimension)
+        if not isinstance(item, str) or not item.strip():
+            raise _InvalidEvidence
+        normalized[dimension] = item
+    for counter in ("impressions", "landing_page_views", "registrations"):
+        normalized[counter] = _counter(value.get(counter), counter)
+    return normalized
+
+
+def _normalize_history(history: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...] | None:
+    if isinstance(history, (str, bytes)) or not isinstance(history, Sequence):
+        return None
+    result = []
+    try:
+        for item in history:
+            if not isinstance(item, Mapping):
+                return None
+            kind = item.get("kind")
+            if not isinstance(kind, str) or not kind:
+                return None
+            event = {
+                "event_id": str(item.get("event_id", "")),
+                "kind": kind,
+                "at": _aware(item.get("at"), "history.at"),
+            }
+            if "old_budget_cents" in item or "new_budget_cents" in item:
+                event["old_budget_cents"] = _positive_int(
+                    item.get("old_budget_cents"), "old_budget_cents"
+                )
+                event["new_budget_cents"] = _positive_int(
+                    item.get("new_budget_cents"), "new_budget_cents"
+                )
+            result.append(event)
+    except (_InvalidEvidence, TypeError, ValueError):
+        return None
+    return tuple(sorted(result, key=lambda item: (item["at"], item["event_id"], item["kind"])))
+
+
+def _normalize_limits(limits: Mapping[str, Any] | object) -> dict[str, int]:
+    def read(name: str) -> Any:
+        return limits.get(name) if isinstance(limits, Mapping) else getattr(limits, name)
+
+    names = {
+        "snapshot_age": "performance_snapshot_max_age_hours",
+        "impressions": "learning_min_impressions",
+        "views": "learning_min_landing_page_views",
+        "registrations": "learning_min_registrations",
+        "cooldown": "meta_autonomy_cooldown_hours",
+        "max_test_days": "meta_autonomy_max_test_days",
+        "max_replacements": "meta_autonomy_max_replacements_24h",
+        "increase_percent": "meta_autonomy_max_increase_percent",
+        "ceiling_eur": "meta_autonomy_max_daily_budget_eur",
+    }
+    return {key: _counter(read(name), name) for key, name in names.items()}
+
+
+def _scale(snapshot, history, policy, now, outcome):
+    current = snapshot["current_budget_cents"]
+    window = tuple(event for event in history if event["at"] > now - timedelta(hours=24))
+    if any(event["kind"] == "scale" for event in window):
+        return _decision(DecisionKind.OBSERVE, snapshot, history, "increase_limit", outcome)
+    budget_events = tuple(event for event in window if "old_budget_cents" in event)
+    if current != snapshot["opening_budget_cents"] and not budget_events:
+        return _decision(DecisionKind.OBSERVE, snapshot, history, "missing_budget_history", outcome)
+    opening = (
+        budget_events[0]["old_budget_cents"] if budget_events else snapshot["opening_budget_cents"]
+    )
+    increased = sum(
+        max(0, event["new_budget_cents"] - event["old_budget_cents"]) for event in budget_events
+    )
+    permitted = opening * policy["increase_percent"] // 100
+    headroom = permitted - increased
+    ceiling = policy["ceiling_eur"] * 100
+    proposed = min(current + max(0, headroom), opening + permitted, ceiling)
+    if proposed <= current:
+        reason = "absolute_budget_ceiling" if current >= ceiling else "increase_headroom_exhausted"
+        return _decision(DecisionKind.OBSERVE, snapshot, history, reason, outcome)
+    return _decision(
+        DecisionKind.SCALE,
+        snapshot,
+        history,
+        "proven_winner_scale",
+        outcome,
+        current,
+        proposed,
+    )
+
+
+def _completed_window(snapshot, now):
+    return snapshot["complete"] and snapshot["window_start"] < snapshot["window_end"] <= now
+
+
+def _fresh(snapshot, policy, now):
+    return timedelta(0) <= now - snapshot["captured_at"] <= timedelta(hours=policy["snapshot_age"])
+
+
+def _comparable(variants):
+    return (
+        len(variants) >= 2
+        and len({tuple(item[key] for key in _DIMENSIONS) for item in variants}) == 1
+    )
+
+
+def _evidence_floors(variants, policy):
+    return all(
+        item["impressions"] >= policy["impressions"]
+        and item["landing_page_views"] >= policy["views"]
+        and item["registrations"] >= policy["registrations"]
+        for item in variants
+    )
+
+
+def _rate(variant):
+    return Decimal(variant["registrations"]) / Decimal(variant["landing_page_views"])
+
+
+def _in_cooldown(history, policy, now):
+    boundary = now - timedelta(hours=policy["cooldown"])
+    return any(event["kind"] in _MUTATIONS and event["at"] > boundary for event in history)
+
+
+def _decision(kind, snapshot, history, reason, outcome=None, old_budget=None, new_budget=None):
+    evidence = {
+        "snapshot_id": snapshot["snapshot_id"],
+        "delivery_state": snapshot["delivery_state"],
+        "attribution_complete": snapshot["attribution_complete"],
+        "variants": [_json_variant(item) for item in snapshot["variants"]],
+    }
+    if outcome:
+        evidence.update(outcome)
+    canonical = {
+        "campaign_id": snapshot["campaign_id"],
+        "window_start": snapshot["window_start"].isoformat(),
+        "window_end": snapshot["window_end"].isoformat(),
+        "kind": kind.value,
+        "reason": reason,
+        "evidence": evidence,
+        "history": [_json_event(item) for item in history],
+        "old_budget_cents": old_budget,
+        "new_budget_cents": new_budget,
+    }
+    digest = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return FrozenDecision(
+        kind=kind,
+        campaign_id=snapshot["campaign_id"],
+        window_start=snapshot["window_start"],
+        window_end=snapshot["window_end"],
+        evidence=evidence,
+        reason=reason,
+        idempotency_key=f"autonomy:{digest}",
+        old_budget_cents=old_budget,
+        new_budget_cents=new_budget,
+    )
+
+
+def _observe_from_untrusted(snapshot, now, reason):
+    campaign_id = snapshot.get("campaign_id") if isinstance(snapshot, Mapping) else None
+    if not isinstance(campaign_id, str) or not campaign_id.isascii() or not campaign_id.isdecimal():
+        campaign_id = "0"
+    start = snapshot.get("window_start") if isinstance(snapshot, Mapping) else None
+    end = snapshot.get("window_end") if isinstance(snapshot, Mapping) else None
+    if not _is_aware(start) or not _is_aware(end) or start >= end:
+        end = now if _is_aware(now) else datetime.now().astimezone()
+        start = end - timedelta(microseconds=1)
+    safe = {
+        "snapshot_id": str(snapshot.get("snapshot_id", "invalid"))
+        if isinstance(snapshot, Mapping)
+        else "invalid",
+        "campaign_id": campaign_id,
+        "window_start": start,
+        "window_end": end,
+        "delivery_state": "unknown",
+        "attribution_complete": False,
+        "variants": (
+            {
+                "variant_id": "invalid",
+                "publication_id": 0,
+                **{key: "invalid" for key in _DIMENSIONS},
+                "impressions": 0,
+                "landing_page_views": 0,
+                "registrations": 0,
+            },
+        ),
+    }
+    return _decision(DecisionKind.OBSERVE, safe, (), reason)
+
+
+def _json_variant(item):
+    return {key: item[key] for key in sorted(item)}
+
+
+def _json_event(item):
+    return {
+        key: (value.isoformat() if isinstance(value, datetime) else value)
+        for key, value in sorted(item.items())
+    }
+
+
+def _counter(value, name):
+    if type(value) is not int or value < 0:
+        raise _InvalidEvidence(f"{name} must be a non-negative integer")
+    return value
+
+
+def _positive_int(value, name):
+    value = _counter(value, name)
+    if value == 0:
+        raise _InvalidEvidence(f"{name} must be positive")
+    return value
+
+
+def _aware(value, name):
+    if not _is_aware(value):
+        raise _InvalidEvidence(f"{name} must be timezone-aware")
+    return value
+
+
+def _is_aware(value):
+    return (
+        isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
+    )
