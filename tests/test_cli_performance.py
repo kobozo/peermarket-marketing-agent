@@ -342,3 +342,35 @@ def test_autonomy_command_accepts_draft_id_and_emits_sanitized_json(monkeypatch)
     assert json.loads(result.output) == report
     assert "token" not in result.output.casefold()
     inspect.assert_awaited_once_with(156)
+
+
+def test_hook_experiment_projection_is_sanitized_and_ready():
+    from types import SimpleNamespace
+
+    from peermarket_agent.cli_performance import _hook_experiment_status
+
+    identity = {"audience": "sensitive-audience-value"}
+    rows = [
+        {
+            "experiment_id": "exp",
+            "variant_id": f"exp:{variant:02}",
+            "language": language,
+            "campaign_id": "120249125021520342",
+            "ad_set_id": "2",
+            "landing_page_url": "https://peermarket.eu/signup",
+            "changed_dimension": "hook",
+            "fixed_identity": identity,
+        }
+        for variant in (1, 2, 3)
+        for language in ("NL", "FR", "EN")
+    ]
+    settings = SimpleNamespace(
+        meta_autonomy_experiment_id="exp",
+        meta_autonomy_shadow=True,
+        meta_autonomy_campaign_ids=("120249125021520342",),
+    )
+    status = _hook_experiment_status(rows, settings=settings, draft_id=156)
+    assert status["ready"] is True
+    assert status["variant_count"] == 3
+    assert all(item["languages"] == ["EN", "FR", "NL"] for item in status["variants"])
+    assert "sensitive-audience-value" not in json.dumps(status)

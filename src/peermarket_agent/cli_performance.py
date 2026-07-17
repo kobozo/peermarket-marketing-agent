@@ -264,6 +264,23 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                 .mappings()
                 .one_or_none()
             )
+            experiment_id = settings.meta_autonomy_experiment_id
+            experiment_rows = []
+            if experiment_id:
+                experiment_rows = [
+                    dict(item)
+                    for item in (
+                        await connection.execute(
+                            text(
+                                "SELECT experiment_id,variant_id,language,campaign_id,ad_set_id,"
+                                "landing_page_url,changed_dimension,fixed_identity "
+                                "FROM autonomous_hook_experiment_variants "
+                                "WHERE experiment_id=:experiment_id ORDER BY variant_id,language"
+                            ),
+                            {"experiment_id": experiment_id},
+                        )
+                    ).mappings()
+                ]
         report: dict[str, Any] = {
             "draft_id": draft_id,
             "feature_flags": {
@@ -272,6 +289,9 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
                 "allowlisted": False,
             },
             "publication_exists": row is not None,
+            "hook_experiment": _hook_experiment_status(
+                experiment_rows, settings=settings, draft_id=draft_id
+            ),
         }
         if row is None:
             return report
@@ -314,6 +334,59 @@ async def inspect_autonomy(draft_id: int) -> dict[str, Any]:
         return report
     finally:
         await engine.dispose()
+
+
+def _hook_experiment_status(rows: list[dict[str, Any]], *, settings: Any, draft_id: int) -> dict:
+    """Build a copy-free, identifier-only readiness projection."""
+    experiment_id = str(getattr(settings, "meta_autonomy_experiment_id", "") or "")
+    grouped: dict[str, set[str]] = {}
+    identities = set()
+    campaigns = set()
+    for row in rows:
+        grouped.setdefault(str(row["variant_id"]), set()).add(str(row["language"]))
+        identities.add(
+            json.dumps(
+                [
+                    row["campaign_id"],
+                    row["ad_set_id"],
+                    row["landing_page_url"],
+                    row["changed_dimension"],
+                    row["fixed_identity"],
+                ],
+                sort_keys=True,
+                default=str,
+            )
+        )
+        campaigns.add(str(row["campaign_id"]))
+    exact_bundle = len(grouped) == 3 and all(v == {"NL", "FR", "EN"} for v in grouped.values())
+    fixed_identity_match = exact_bundle and len(identities) == 1
+    allowlisted = campaigns == {"120249125021520342"} and campaigns <= set(
+        getattr(settings, "meta_autonomy_campaign_ids", ())
+    )
+    blocked = None
+    if draft_id != 156:
+        blocked = "draft_not_156"
+    elif not experiment_id:
+        blocked = "experiment_not_configured"
+    elif not getattr(settings, "meta_autonomy_shadow", True):
+        blocked = "shadow_mode_required"
+    elif not exact_bundle:
+        blocked = "experiment_incomplete"
+    elif not fixed_identity_match:
+        blocked = "fixed_identity_mismatch"
+    elif not allowlisted:
+        blocked = "campaign_not_allowlisted"
+    return {
+        "experiment_id": experiment_id or None,
+        "variant_count": len(grouped),
+        "variants": [
+            {"variant_id": key, "languages": sorted(value)}
+            for key, value in sorted(grouped.items())
+        ],
+        "fixed_identity_match": fixed_identity_match,
+        "ready": blocked is None,
+        "blocked_reason": blocked,
+    }
 
 
 @click.group()

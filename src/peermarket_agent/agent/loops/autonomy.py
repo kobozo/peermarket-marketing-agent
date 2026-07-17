@@ -11,8 +11,12 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision, HookExperiment
 from peermarket_agent.autonomy.executor import execute_production_claim
+from peermarket_agent.autonomy.hook_experiments import (
+    build_hook_experiment,
+    validate_hook_experiment,
+)
 from peermarket_agent.autonomy.snapshot import build_policy_decision
 from peermarket_agent.autonomy.store import (
     _sanitize_audit_value,
@@ -20,6 +24,7 @@ from peermarket_agent.autonomy.store import (
     claim_next_action,
     enqueue_action,
     record_decision,
+    record_experiment,
 )
 from peermarket_agent.slack_outbox import deliver_pending_outbox
 
@@ -30,6 +35,35 @@ _EXECUTABLE = {
     DecisionKind.REALLOCATE,
     DecisionKind.SCALE,
 }
+_HOOK_DRAFT_ID = 156
+_HOOK_CAMPAIGN_ID = "120249125021520342"
+
+
+async def prepare_hook_experiment(
+    engine: AsyncEngine, settings: Any, draft: Any, brand_voice: str, seed: Any
+) -> HookExperiment:
+    """Freeze and persist Draft 156's hook-only experiment without touching Meta."""
+    if not _setting(settings, "meta_autonomy_shadow", True):
+        raise ValueError("hook experiment preparation is shadow-only")
+    draft_id = draft.get("id") if isinstance(draft, dict) else getattr(draft, "id", None)
+    campaign_id = (
+        draft.get("campaign_id") if isinstance(draft, dict) else getattr(draft, "campaign_id", None)
+    )
+    if draft_id != _HOOK_DRAFT_ID:
+        raise ValueError("hook experiment is restricted to Draft 156")
+    if str(campaign_id) != _HOOK_CAMPAIGN_ID:
+        raise ValueError("Draft 156 campaign identity does not match the fixed canary")
+    if _HOOK_CAMPAIGN_ID not in tuple(_setting(settings, "meta_autonomy_campaign_ids", ())):
+        raise ValueError("Draft 156 campaign is not allowlisted")
+    if _setting(settings, "meta_autonomy_variant_count", 3) != 3:
+        raise ValueError("hook experiment requires exactly three variants")
+    experiment = build_hook_experiment(draft, brand_voice, seed)
+    validate_hook_experiment(experiment, draft, brand_voice, seed)
+    configured_id = _setting(settings, "meta_autonomy_experiment_id", "")
+    if configured_id and configured_id != experiment.experiment_id:
+        raise ValueError("configured hook experiment ID does not match the frozen experiment")
+    await record_experiment(engine, experiment)
+    return experiment
 
 
 def _registrations(performance: dict) -> int:

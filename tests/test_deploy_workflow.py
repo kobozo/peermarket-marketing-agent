@@ -6,6 +6,7 @@ import yaml
 
 DEPLOY_WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "deploy.yml"
 RUNBOOK = Path(__file__).parents[1] / "docs" / "autonomous-ad-lifecycle-runbook.md"
+HOOK_RUNBOOK = Path(__file__).parents[1] / "docs" / "multitest-hook-experiment-runbook.md"
 
 
 def test_deploy_preserves_slack_revision_runtime_contract():
@@ -65,6 +66,8 @@ def test_deploy_wires_safe_autonomy_variables():
         "META_AUTONOMY_ENABLED": "false",
         "META_AUTONOMY_SHADOW": "true",
         "META_AUTONOMY_CAMPAIGN_IDS_CSV": "",
+        "META_AUTONOMY_EXPERIMENT_ID": "",
+        "META_AUTONOMY_VARIANT_COUNT": "3",
         "META_AUTONOMY_MAX_REPLACEMENTS_24H": "1",
         "META_AUTONOMY_COOLDOWN_HOURS": "24",
         "META_AUTONOMY_MAX_TEST_DAYS": "7",
@@ -76,6 +79,22 @@ def test_deploy_wires_safe_autonomy_variables():
         assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in workflow_text
         assert f"{name}=${name}" in workflow_text
         assert f"secrets.{name}" not in workflow_text
+
+
+def test_hook_experiment_runbook_is_ci_only_shadow_first_and_has_kill_switch():
+    text = HOOK_RUNBOOK.read_text()
+    for required in (
+        "Draft 156",
+        "120249125021520342",
+        "META_AUTONOMY_EXPERIMENT_ID",
+        "META_AUTONOMY_VARIANT_COUNT --body 3",
+        "META_AUTONOMY_SHADOW --body true",
+        "peermarket-performance autonomy --draft-id 156",
+        "gh workflow run deploy.yml",
+        "kill switch",
+    ):
+        assert required.casefold() in text.casefold()
+    assert "gh secret set" not in text
 
 
 def test_autonomy_runbook_has_exact_ci_only_canary_controls_without_credentials():

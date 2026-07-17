@@ -13,12 +13,76 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from peermarket_agent.agent.loops.autonomy import (
     _audit,
     persist_autonomy_inputs,
+    prepare_hook_experiment,
     run_autonomy_cycle,
 )
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.hook_experiments import build_hook_experiment
 from peermarket_agent.db.migrations import run_migrations
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
+
+
+def _hook_draft():
+    return {
+        "id": 156,
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "120249125021520343",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": {
+            "audience": "declutterers",
+            "optimization": "LANDING_PAGE_VIEWS",
+            "format": "single_image",
+            "visual": "asset-1",
+            "delivery": "lowest_cost",
+        },
+        "language_bundles": {
+            locale: {
+                "hook": "baseline",
+                "body": f"{locale} body",
+                "headline": f"{locale} headline",
+                "description": f"{locale} description",
+                "cta_label": "Learn More",
+            }
+            for locale in ("NL", "FR", "EN")
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_prepare_hook_experiment_persists_exactly_three_without_meta_mutation(monkeypatch):
+    draft = _hook_draft()
+    expected = build_hook_experiment(draft, "warm and practical", "shadow-1")
+    persisted = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.record_experiment", persisted)
+    settings = SimpleNamespace(
+        meta_autonomy_shadow=True,
+        meta_autonomy_campaign_ids=(draft["campaign_id"],),
+        meta_autonomy_variant_count=3,
+        meta_autonomy_experiment_id=expected.experiment_id,
+    )
+    engine = object()
+    result = await prepare_hook_experiment(
+        engine, settings, draft, "warm and practical", "shadow-1"
+    )
+    assert result == expected
+    assert len(result.variants) == 3
+    persisted.assert_awaited_once_with(engine, result)
+
+
+@pytest.mark.asyncio
+async def test_prepare_hook_experiment_rejects_non_shadow_or_wrong_identity(monkeypatch):
+    persisted = AsyncMock()
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.record_experiment", persisted)
+    settings = SimpleNamespace(
+        meta_autonomy_shadow=False,
+        meta_autonomy_campaign_ids=("120249125021520342",),
+        meta_autonomy_variant_count=3,
+        meta_autonomy_experiment_id="",
+    )
+    with pytest.raises(ValueError, match="shadow-only"):
+        await prepare_hook_experiment(object(), settings, _hook_draft(), "voice", 1)
+    persisted.assert_not_awaited()
 
 
 @pytest.fixture
