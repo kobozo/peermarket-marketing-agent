@@ -6,7 +6,81 @@ from datetime import tzinfo as TzInfo
 
 import pytest
 
-from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import (
+    ActionStatus,
+    DecisionKind,
+    FrozenDecision,
+    HookExperiment,
+    HookVariant,
+)
+
+
+def _hook_variant(variant_id: str = "hook-1", **overrides):
+    values = {
+        "variant_id": variant_id,
+        "experiment_id": "draft-156-hooks-v1",
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "120249125021520343",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": {"audience": "declutterers", "optimization": "LANDING_PAGE_VIEWS"},
+        "language_bundles": {
+            locale: {"hook": f"{locale} hook", "headline": f"{locale} headline"}
+            for locale in ("NL", "FR", "EN")
+        },
+    }
+    values.update(overrides)
+    return HookVariant(**values)
+
+
+def _hook_experiment(**overrides):
+    values = {
+        "experiment_id": "draft-156-hooks-v1",
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "120249125021520343",
+        "landing_page_url": "https://peermarket.eu/signup",
+        "fixed_identity": {"audience": "declutterers", "optimization": "LANDING_PAGE_VIEWS"},
+        "variants": tuple(_hook_variant(f"hook-{number}") for number in range(1, 4)),
+    }
+    values.update(overrides)
+    return HookExperiment(**values)
+
+
+def test_hook_experiment_is_immutable_with_stable_exact_ids():
+    experiment = _hook_experiment()
+    assert experiment.experiment_id == "draft-156-hooks-v1"
+    assert [variant.variant_id for variant in experiment.variants] == ["hook-1", "hook-2", "hook-3"]
+    with pytest.raises(AttributeError):
+        experiment.campaign_id = "1"
+    with pytest.raises(ValueError, match="variant_id"):
+        _hook_variant(" hook-1")
+    with pytest.raises(ValueError, match="experiment_id"):
+        _hook_experiment(experiment_id="draft 156")
+    with pytest.raises(ValueError, match="ad_set_id"):
+        _hook_variant(ad_set_id="act_123")
+
+
+def test_hook_experiment_requires_exactly_three_unique_variants():
+    with pytest.raises(ValueError, match="exactly three"):
+        _hook_experiment(variants=(_hook_variant(),))
+    with pytest.raises(ValueError, match="unique"):
+        _hook_experiment(variants=tuple(_hook_variant() for _ in range(3)))
+
+
+def test_hook_variant_requires_complete_nl_fr_en_bundles_and_deep_freezes_them():
+    bundles = {locale: {"hook": locale} for locale in ("NL", "FR", "EN")}
+    variant = _hook_variant(language_bundles=bundles)
+    bundles["NL"]["hook"] = "changed"
+    assert variant.language_bundles["NL"]["hook"] == "NL"
+    with pytest.raises(TypeError):
+        variant.language_bundles["NL"]["hook"] = "changed"
+    with pytest.raises(ValueError, match="NL/FR/EN"):
+        _hook_variant(language_bundles={"NL": {"hook": "only"}})
+
+
+def test_hook_experiment_rejects_variant_fixed_identity_drift():
+    drifted = _hook_variant("hook-3", fixed_identity={"audience": "other"})
+    with pytest.raises(ValueError, match="fixed identity"):
+        _hook_experiment(variants=(_hook_variant("hook-1"), _hook_variant("hook-2"), drifted))
 
 
 def _decision(**overrides):

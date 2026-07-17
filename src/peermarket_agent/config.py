@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -80,6 +81,8 @@ class Settings(BaseSettings):
     meta_autonomy_enabled: bool = False
     meta_autonomy_shadow: bool = True
     meta_autonomy_campaign_ids_csv: str = ""
+    meta_autonomy_experiment_id: str = ""
+    meta_autonomy_variant_count: Literal[3] = 3
     meta_autonomy_max_replacements_24h: int = Field(default=1, ge=0, le=10)
     meta_autonomy_cooldown_hours: int = Field(default=24, ge=1, le=168)
     meta_autonomy_max_test_days: int = Field(default=7, ge=1, le=30)
@@ -96,6 +99,15 @@ class Settings(BaseSettings):
             raise ValueError("autonomy campaign allowlist IDs must be numeric")
         return value
 
+    @field_validator("meta_autonomy_experiment_id")
+    @classmethod
+    def _validate_autonomy_experiment_id(cls, value: str) -> str:
+        if value != value.strip() or any(character.isspace() for character in value):
+            raise ValueError("autonomy experiment ID must be stable and whitespace-free")
+        if value and (not value.isascii() or not all(c.isalnum() or c in "-_.:" for c in value)):
+            raise ValueError("autonomy experiment ID contains unsupported characters")
+        return value
+
     @property
     def meta_autonomy_campaign_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -104,6 +116,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_allowlist_for_live_autonomy(self) -> "Settings":
+        if (
+            self.meta_autonomy_experiment_id
+            and "120249125021520342" not in self.meta_autonomy_campaign_ids
+        ):
+            raise ValueError(
+                "first hook experiment requires campaign 120249125021520342 in the allowlist"
+            )
         if self.meta_autonomy_enabled and not self.meta_autonomy_shadow:
             if not self.meta_autonomy_campaign_ids:
                 raise ValueError("live autonomy requires a non-empty campaign allowlist")

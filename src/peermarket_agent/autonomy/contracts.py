@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlsplit
 
 
 def _immutable(*args: object, **kwargs: object) -> None:
@@ -73,6 +74,106 @@ class ActionStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     RECONCILIATION_REQUIRED = "reconciliation_required"
+
+
+def _stable_text_id(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not value.isascii()
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(f"{name} must be a stable non-whitespace ASCII ID")
+    return value
+
+
+def _numeric_meta_id(value: object, name: str) -> str:
+    value = _stable_text_id(value, name)
+    if not value.isdecimal():
+        raise ValueError(f"{name} must be an exact numeric Meta ID")
+    return value
+
+
+def _landing_page(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("landing_page_url must be an exact absolute HTTPS URL")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("landing_page_url must be an exact absolute HTTPS URL")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class HookVariant:
+    """One stable hook variant containing an exact multilingual creative bundle."""
+
+    variant_id: str
+    experiment_id: str
+    campaign_id: str
+    ad_set_id: str
+    landing_page_url: str
+    fixed_identity: Mapping[str, Any]
+    language_bundles: Mapping[str, Mapping[str, Any]]
+
+    def __post_init__(self) -> None:
+        _stable_text_id(self.variant_id, "variant_id")
+        _stable_text_id(self.experiment_id, "experiment_id")
+        _numeric_meta_id(self.campaign_id, "campaign_id")
+        _numeric_meta_id(self.ad_set_id, "ad_set_id")
+        _landing_page(self.landing_page_url)
+        if not isinstance(self.fixed_identity, Mapping) or not self.fixed_identity:
+            raise ValueError("fixed identity must be a non-empty mapping")
+        if not isinstance(self.language_bundles, Mapping) or set(self.language_bundles) != {
+            "NL",
+            "FR",
+            "EN",
+        }:
+            raise ValueError("language bundles require exact NL/FR/EN completeness")
+        if any(
+            not isinstance(bundle, Mapping) or not bundle
+            for bundle in self.language_bundles.values()
+        ):
+            raise ValueError("each NL/FR/EN language bundle must be non-empty")
+        object.__setattr__(self, "fixed_identity", _freeze_json(self.fixed_identity))
+        object.__setattr__(self, "language_bundles", _freeze_json(self.language_bundles))
+
+
+@dataclass(frozen=True, slots=True)
+class HookExperiment:
+    """Exactly three hook variants sharing one frozen delivery identity."""
+
+    experiment_id: str
+    campaign_id: str
+    ad_set_id: str
+    landing_page_url: str
+    fixed_identity: Mapping[str, Any]
+    variants: tuple[HookVariant, ...]
+
+    def __post_init__(self) -> None:
+        _stable_text_id(self.experiment_id, "experiment_id")
+        _numeric_meta_id(self.campaign_id, "campaign_id")
+        _numeric_meta_id(self.ad_set_id, "ad_set_id")
+        _landing_page(self.landing_page_url)
+        if not isinstance(self.fixed_identity, Mapping) or not self.fixed_identity:
+            raise ValueError("fixed identity must be a non-empty mapping")
+        variants = tuple(self.variants)
+        if len(variants) != 3 or any(not isinstance(item, HookVariant) for item in variants):
+            raise ValueError("hook experiment requires exactly three variants")
+        if len({item.variant_id for item in variants}) != 3:
+            raise ValueError("hook experiment variant IDs must be unique")
+        identity = _freeze_json(self.fixed_identity)
+        if any(
+            item.experiment_id != self.experiment_id
+            or item.campaign_id != self.campaign_id
+            or item.ad_set_id != self.ad_set_id
+            or item.landing_page_url != self.landing_page_url
+            or item.fixed_identity != identity
+            for item in variants
+        ):
+            raise ValueError("variant fixed identity must match its hook experiment")
+        object.__setattr__(self, "fixed_identity", identity)
+        object.__setattr__(self, "variants", variants)
 
 
 @dataclass(frozen=True, slots=True)
