@@ -12,12 +12,14 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from peermarket_agent.agent.loops.autonomy import (
     _audit,
+    _persisted_hook_variants,
     persist_autonomy_inputs,
     prepare_hook_experiment,
     run_autonomy_cycle,
 )
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
 from peermarket_agent.autonomy.hook_experiments import build_hook_experiment
+from peermarket_agent.autonomy.store import record_experiment
 from peermarket_agent.db.migrations import run_migrations
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
@@ -91,6 +93,31 @@ async def test_prepare_hook_experiment_rejects_non_shadow_or_wrong_identity(monk
     with pytest.raises(ValueError, match="shadow-only"):
         await prepare_hook_experiment(object(), settings, _hook_draft(), "voice", 1)
     persisted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persisted_nine_locale_rows_feed_three_logical_policy_variants(engine):
+    experiment = build_hook_experiment(_hook_draft(), "warm", "policy")
+    await record_experiment(engine, experiment)
+    samples = {
+        variant.variant_id: {
+            locale: {"impressions": 400, "landing_page_views": 20, "registrations": number}
+            for locale in ("NL", "FR", "EN")
+        }
+        for number, variant in enumerate(experiment.variants, 1)
+    }
+    variants = await _persisted_hook_variants(
+        engine,
+        experiment.experiment_id,
+        {"publication_id": 7},
+        {"hook_experiment_variants": samples},
+    )
+    assert [item["variant_id"] for item in variants] == [
+        f"{experiment.experiment_id}:{number:02}" for number in (1, 2, 3)
+    ]
+    assert [item["impressions"] for item in variants] == [1200, 1200, 1200]
+    assert [item["registrations"] for item in variants] == [3, 6, 9]
+    assert all(item["creative_dimension"] == "hook" for item in variants)
 
 
 @pytest.fixture
@@ -409,6 +436,8 @@ async def test_autonomy_audit_freezes_meaningful_sanitized_campaign_content(engi
     assert "must-not-leak" not in payload["text"]
     assert payload["next_evaluation_at"] == (NOW + timedelta(hours=24)).isoformat()
     assert "thresholds" in payload["text"] and "samples" in payload["text"]
+    assert "experiment draft-156-hook-test" in payload["text"]
+    assert "evidence window" in payload["text"] and "captured_at" in payload["text"]
 
 
 @pytest.mark.asyncio

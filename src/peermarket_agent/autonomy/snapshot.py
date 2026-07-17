@@ -86,6 +86,13 @@ def build_autonomy_snapshot(
         "replacement_source": replacement_source,
         "frozen_basis": dict(basis),
     }
+    source_experiment = (
+        replacement_source.get("experiment_id") if isinstance(replacement_source, Mapping) else None
+    )
+    if isinstance(source_experiment, str) and {item.get("variant_id") for item in variants} == {
+        f"{source_experiment}:{number:02}" for number in (1, 2, 3)
+    }:
+        snapshot["experiment_id"] = source_experiment
     if reallocation is not None:
         snapshot["reallocation"] = dict(reallocation)
     return snapshot

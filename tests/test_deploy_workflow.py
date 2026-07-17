@@ -97,6 +97,10 @@ def test_hook_experiment_runbook_is_ci_only_shadow_first_and_has_kill_switch():
     assert "gh secret set" not in text
     assert "peermarket-performance prepare-hook-experiment --draft-id 156" in text
     assert (
+        "all three ordered variant IDs"
+        in (Path(__file__).parents[1] / "docs" / "autonomous-ad-lifecycle-runbook.md").read_text()
+    )
+    assert (
         "peermarket-performance prepare-hook-experiment --draft-id 156"
         in DEPLOY_WORKFLOW.read_text()
     )

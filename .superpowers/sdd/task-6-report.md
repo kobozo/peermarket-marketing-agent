@@ -22,3 +22,11 @@ GREEN commands:
 - `git diff --check` passed.
 
 No deployment, workflow dispatch, GitHub variable change, Slack delivery, or Meta mutation was performed.
+
+## Production snapshot remediation
+
+The autonomy cycle now reads the configured experiment's nine append-only locale rows, validates exact `:01`/`:02`/`:03` × NL/FR/EN identity, and aggregates persisted per-locale performance into three logical policy variants. The snapshot builder attaches `experiment_id` only for that exact membership, preserving ordinary campaign behavior. A real PostgreSQL test proves nine persisted identities become three deterministic hook samples.
+
+Slack text now explicitly includes experiment ID and the frozen start/end/captured-at evidence window, in addition to its structured fields. The lifecycle runbook and deploy contract test require prepare/inspect plus all-three-ID audit verification.
+
+Remediation GREEN: PostgreSQL snapshot/audit `2 passed, 13 deselected`; experiment policy `4 passed, 53 deselected`; deploy/runbook `5 passed`; Ruff and diff checks passed.

@@ -268,6 +268,14 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
             inputs = performance.get("autonomy_inputs")
             if not isinstance(inputs, dict) or inputs.get("schema") != "autonomy-inputs/v1":
                 inputs = _canonical_inputs(row, campaign_rows)
+            experiment_id = str(_setting(settings, "meta_autonomy_experiment_id", "") or "")
+            if experiment_id:
+                experiment_variants = await _persisted_hook_variants(
+                    engine, experiment_id, row, performance
+                )
+                if experiment_variants is not None:
+                    inputs = dict(inputs)
+                    inputs["variants"] = experiment_variants
             variants = inputs["variants"]
             source = inputs["replacement_source"]
             publications = [
@@ -355,6 +363,65 @@ async def _eligible_campaigns(engine: AsyncEngine, settings: Any, now: datetime)
                     }
                 )
     return eligible
+
+
+async def _persisted_hook_variants(
+    engine: AsyncEngine, experiment_id: str, row: dict, performance: dict
+) -> list[dict] | None:
+    """Aggregate nine persisted locale identities into three policy variants."""
+    async with engine.connect() as conn:
+        records = [
+            dict(item)
+            for item in (
+                await conn.execute(
+                    text(
+                        "SELECT variant_id,language,campaign_id,changed_dimension,fixed_identity "
+                        "FROM autonomous_hook_experiment_variants WHERE experiment_id=:id "
+                        "ORDER BY variant_id,CASE language WHEN 'NL' THEN 1 WHEN 'FR' THEN 2 ELSE 3 END"
+                    ),
+                    {"id": experiment_id},
+                )
+            ).mappings()
+        ]
+    expected_ids = [f"{experiment_id}:{number:02}" for number in (1, 2, 3)]
+    if len(records) != 9 or sorted({item["variant_id"] for item in records}) != expected_ids:
+        return None
+    samples = performance.get("hook_experiment_variants")
+    samples = samples if isinstance(samples, dict) else {}
+    result = []
+    for index, variant_id in enumerate(expected_ids, 1):
+        locales = [item for item in records if item["variant_id"] == variant_id]
+        if {item["language"] for item in locales} != {"NL", "FR", "EN"}:
+            return None
+        locale_samples = (
+            samples.get(variant_id) if isinstance(samples.get(variant_id), dict) else {}
+        )
+
+        totals = {
+            field: sum(
+                int((locale_samples.get(locale) or {}).get(field, 0))
+                for locale in ("NL", "FR", "EN")
+            )
+            for field in ("impressions", "landing_page_views", "registrations")
+        }
+
+        identity = locales[0]["fixed_identity"]
+        result.append(
+            {
+                "variant_id": variant_id,
+                "publication_id": int(row["publication_id"]) * 10 + index,
+                "channel": "meta",
+                "objective": str(identity.get("optimization") or "LINK_CLICKS"),
+                "language": "MULTI",
+                "audience": str(identity.get("audience") or "unknown"),
+                "creative_dimension": "hook",
+                "window_definition": "hook_experiment_window",
+                "impressions": totals["impressions"],
+                "landing_page_views": totals["landing_page_views"],
+                "registrations": totals["registrations"],
+            }
+        )
+    return result
 
 
 async def persist_autonomy_inputs(engine: AsyncEngine) -> int:
@@ -493,6 +560,8 @@ async def _audit(
         "text": (
             f"Autonomy {outcome}: campaign {decision.campaign_id}; "
             f"decision {decision.kind.value}; reason {decision.reason}; "
+            f"experiment {decision.evidence.get('experiment_id') or 'none'}; "
+            f"evidence window {json.dumps(dict(decision.evidence.get('evidence_window') or {}), sort_keys=True)}; "
             f"thresholds {json.dumps(thresholds, sort_keys=True)}; "
             f"samples {json.dumps(evidence, sort_keys=True)}; "
             f"affected ads {json.dumps(affected_ads, sort_keys=True)}; "
