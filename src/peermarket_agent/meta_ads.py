@@ -60,7 +60,7 @@ class MetaAdsError(RuntimeError):
         *,
         phase: str | None = None,
         resource_ids: dict[str, str] | None = None,
-        observed_statuses: dict[str, dict[str, str]] | None = None,
+        observed_statuses: dict[str, dict[str, str | int]] | None = None,
         rollback_errors: dict[str, str] | None = None,
     ) -> None:
         self.phase = phase
@@ -123,9 +123,9 @@ def _ensure_enabled(config: MetaConfig) -> None:
         )
 
 
-def _init_api(config: MetaConfig) -> None:
+def _init_api(config: MetaConfig) -> FacebookAdsApi:
     """Initialize the global FacebookAdsApi singleton. Safe to call repeatedly."""
-    FacebookAdsApi.init(
+    return FacebookAdsApi.init(
         app_id=config.app_id,
         app_secret=config.app_secret,
         access_token=config.system_user_token,
@@ -390,6 +390,164 @@ def _redact_credentials(message: str, config: MetaConfig) -> str:
 async def pause_meta_ad(config: MetaConfig, ids: dict[str, str]) -> dict[str, str]:
     """Best-effort pause in child-to-parent order; return failures by resource."""
     return await asyncio.to_thread(_sync_pause, config, ids)
+
+
+_MUTABLE_AD_STATUSES = {"ACTIVE", "PAUSED"}
+
+
+def _validate_resource_id(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _mutation_error(
+    message: str,
+    config: MetaConfig,
+    *,
+    phase: str,
+    resource_ids: dict[str, str],
+    observed_statuses: dict[str, dict[str, str | int]] | None = None,
+) -> MetaAdsError:
+    return MetaAdsError(
+        _redact_credentials(message, config),
+        phase=phase,
+        resource_ids=resource_ids,
+        observed_statuses=observed_statuses,
+    )
+
+
+def _sync_set_ad_status(config: MetaConfig, ad_id: str, status: str) -> dict[str, str]:
+    resource_ids = {"ad_id": ad_id}
+    phase = "update_ad_status"
+    try:
+        _ensure_enabled(config)
+        api = _init_api(config)
+        ad = Ad(ad_id, api=api)
+        ad.api_update(params={"status": status})
+        phase = "verify_ad_status"
+        observed = dict(ad.api_get(fields=["status", "effective_status"]))
+        sanitized = {
+            "status": str(observed.get("status", "")),
+            "effective_status": str(observed.get("effective_status", "")),
+        }
+        if sanitized["status"] != status or sanitized["effective_status"] != status:
+            raise _mutation_error(
+                "Meta ad status verification mismatch",
+                config,
+                phase=phase,
+                resource_ids=resource_ids,
+                observed_statuses={"ad": sanitized},
+            )
+        return sanitized
+    except MetaAdsError:
+        raise
+    except Exception as exc:
+        raise _mutation_error(
+            f"Meta ad status mutation failed: {exc}",
+            config,
+            phase=phase,
+            resource_ids=resource_ids,
+        ) from None
+
+
+async def set_meta_ad_status(config: MetaConfig, ad_id: str, status: str) -> dict[str, str]:
+    """Set one ad's status and return its verified configured/effective state."""
+    validated_id = _validate_resource_id(ad_id, "ad_id")
+    if not isinstance(status, str) or status not in _MUTABLE_AD_STATUSES:
+        raise ValueError("status must be ACTIVE or PAUSED")
+    return await asyncio.to_thread(_sync_set_ad_status, config, validated_id, status)
+
+
+def _normalized_daily_budget(observed: dict) -> dict[str, int]:
+    value = observed.get("daily_budget")
+    if isinstance(value, bool):
+        raise ValueError("invalid daily_budget returned by Meta")
+    return {"daily_budget": int(value)}
+
+
+def _sync_set_adset_daily_budget(config: MetaConfig, ad_set_id: str, cents: int) -> dict[str, int]:
+    resource_ids = {"ad_set_id": ad_set_id}
+    phase = "update_ad_set_daily_budget"
+    try:
+        _ensure_enabled(config)
+        api = _init_api(config)
+        ad_set = AdSet(ad_set_id, api=api)
+        ad_set.api_update(params={"daily_budget": cents})
+        phase = "verify_ad_set_daily_budget"
+        observed = _normalized_daily_budget(dict(ad_set.api_get(fields=["daily_budget"])))
+        if observed["daily_budget"] != cents:
+            raise _mutation_error(
+                "Meta ad set daily budget verification mismatch",
+                config,
+                phase=phase,
+                resource_ids=resource_ids,
+                observed_statuses={"ad_set": observed},
+            )
+        return observed
+    except MetaAdsError:
+        raise
+    except Exception as exc:
+        raise _mutation_error(
+            f"Meta ad set daily budget mutation failed: {exc}",
+            config,
+            phase=phase,
+            resource_ids=resource_ids,
+        ) from None
+
+
+async def set_meta_adset_daily_budget(
+    config: MetaConfig, ad_set_id: str, cents: int
+) -> dict[str, int]:
+    """Set one ad set's daily budget in cents and return the verified value."""
+    validated_id = _validate_resource_id(ad_set_id, "ad_set_id")
+    if isinstance(cents, bool) or not isinstance(cents, int) or cents <= 0:
+        raise ValueError("cents must be a positive integer")
+    return await asyncio.to_thread(_sync_set_adset_daily_budget, config, validated_id, cents)
+
+
+def _sync_get_budget_state(
+    config: MetaConfig, ids: dict[str, str]
+) -> dict[str, dict[str, str | int]]:
+    resource_ids = dict(ids)
+    try:
+        _ensure_enabled(config)
+        api = _init_api(config)
+        ad = Ad(ids["ad_id"], api=api)
+        ad_set = AdSet(ids["ad_set_id"], api=api)
+        ad_state = dict(ad.api_get(fields=["status", "effective_status"]))
+        ad_set_raw = dict(ad_set.api_get(fields=["status", "effective_status", "daily_budget"]))
+        return {
+            "ad": {
+                "status": str(ad_state.get("status", "")),
+                "effective_status": str(ad_state.get("effective_status", "")),
+            },
+            "ad_set": {
+                "status": str(ad_set_raw.get("status", "")),
+                "effective_status": str(ad_set_raw.get("effective_status", "")),
+                **_normalized_daily_budget(ad_set_raw),
+            },
+        }
+    except Exception as exc:
+        raise _mutation_error(
+            f"Meta budget state read failed: {exc}",
+            config,
+            phase="get_budget_state",
+            resource_ids=resource_ids,
+        ) from None
+
+
+async def get_meta_budget_state(
+    config: MetaConfig, ids: dict[str, str]
+) -> dict[str, dict[str, str | int]]:
+    """Read ad status and its ad set status/current daily budget."""
+    if not isinstance(ids, dict):
+        raise ValueError("ids must contain ad_id and ad_set_id")
+    validated = {
+        "ad_id": _validate_resource_id(ids.get("ad_id"), "ad_id"),
+        "ad_set_id": _validate_resource_id(ids.get("ad_set_id"), "ad_set_id"),
+    }
+    return await asyncio.to_thread(_sync_get_budget_state, config, validated)
 
 
 def _sync_observe_best_effort(config: MetaConfig, ids: dict[str, str]) -> dict[str, dict[str, str]]:

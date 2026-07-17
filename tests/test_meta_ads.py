@@ -12,6 +12,9 @@ from peermarket_agent.meta_ads import (
     MetaConfig,
     activate_meta_ad,
     create_meta_ad_paused,
+    get_meta_budget_state,
+    set_meta_ad_status,
+    set_meta_adset_daily_budget,
 )
 
 _FULL_CONFIG = MetaConfig(
@@ -21,6 +24,141 @@ _FULL_CONFIG = MetaConfig(
     ad_account_id="act_999",
     page_id="61592144690879",
 )
+
+
+def _patch_mutation_sdk(monkeypatch, *, ad_state=None, adset_state=None):
+    api = object()
+    init = MagicMock(return_value=api)
+    ad = MagicMock()
+    ad.api_get.return_value = ad_state or {
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+    }
+    adset = MagicMock()
+    adset.api_get.return_value = adset_state or {
+        "status": "ACTIVE",
+        "effective_status": "ACTIVE",
+        "daily_budget": "1200",
+    }
+    ad_factory = MagicMock(return_value=ad)
+    adset_factory = MagicMock(return_value=adset)
+    monkeypatch.setattr("peermarket_agent.meta_ads._init_api", init)
+    monkeypatch.setattr("peermarket_agent.meta_ads.Ad", ad_factory)
+    monkeypatch.setattr("peermarket_agent.meta_ads.AdSet", adset_factory)
+    return api, init, ad, adset, ad_factory, adset_factory
+
+
+async def test_set_meta_ad_status_targets_exact_ad_binds_api_and_verifies(monkeypatch):
+    api, _, ad, _, ad_factory, _ = _patch_mutation_sdk(monkeypatch)
+
+    observed = await set_meta_ad_status(_FULL_CONFIG, "456", "PAUSED")
+
+    ad_factory.assert_called_once_with("456", api=api)
+    ad.api_update.assert_called_once_with(params={"status": "PAUSED"})
+    ad.api_get.assert_called_once_with(fields=["status", "effective_status"])
+    assert observed == {"status": "PAUSED", "effective_status": "PAUSED"}
+
+
+@pytest.mark.parametrize("status", ["active", "DELETED", "", None, True])
+async def test_set_meta_ad_status_rejects_invalid_status_before_api_init(monkeypatch, status):
+    _, init, *_ = _patch_mutation_sdk(monkeypatch)
+
+    with pytest.raises(ValueError, match="status"):
+        await set_meta_ad_status(_FULL_CONFIG, "456", status)
+
+    init.assert_not_called()
+
+
+async def test_set_meta_ad_status_rejects_empty_id_before_api_init(monkeypatch):
+    _, init, *_ = _patch_mutation_sdk(monkeypatch)
+
+    with pytest.raises(ValueError, match="ad_id"):
+        await set_meta_ad_status(_FULL_CONFIG, "", "PAUSED")
+
+    init.assert_not_called()
+
+
+async def test_set_meta_ad_status_raises_structured_error_on_verification_mismatch(
+    monkeypatch,
+):
+    _patch_mutation_sdk(
+        monkeypatch,
+        ad_state={"status": "ACTIVE", "effective_status": "ACTIVE"},
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await set_meta_ad_status(_FULL_CONFIG, "456", "PAUSED")
+
+    assert caught.value.phase == "verify_ad_status"
+    assert caught.value.resource_ids == {"ad_id": "456"}
+    assert caught.value.observed_statuses == {
+        "ad": {"status": "ACTIVE", "effective_status": "ACTIVE"}
+    }
+
+
+@pytest.mark.parametrize("cents", [True, False, 0, -1, 1.5, "100"])
+async def test_set_meta_adset_daily_budget_requires_positive_integer_before_api_init(
+    monkeypatch, cents
+):
+    _, init, *_ = _patch_mutation_sdk(monkeypatch)
+
+    with pytest.raises(ValueError, match="cents"):
+        await set_meta_adset_daily_budget(_FULL_CONFIG, "123", cents)
+
+    init.assert_not_called()
+
+
+async def test_set_meta_adset_daily_budget_targets_exact_adset_and_verifies(monkeypatch):
+    api, _, _, adset, _, adset_factory = _patch_mutation_sdk(monkeypatch)
+
+    observed = await set_meta_adset_daily_budget(_FULL_CONFIG, "123", 1200)
+
+    adset_factory.assert_called_once_with("123", api=api)
+    adset.api_update.assert_called_once_with(params={"daily_budget": 1200})
+    adset.api_get.assert_called_once_with(fields=["daily_budget"])
+    assert observed == {"daily_budget": 1200}
+
+
+async def test_set_meta_adset_daily_budget_mismatch_raises_structured_error(monkeypatch):
+    _patch_mutation_sdk(monkeypatch, adset_state={"daily_budget": "1100"})
+
+    with pytest.raises(MetaAdsError) as caught:
+        await set_meta_adset_daily_budget(_FULL_CONFIG, "123", 1200)
+
+    assert caught.value.phase == "verify_ad_set_daily_budget"
+    assert caught.value.resource_ids == {"ad_set_id": "123"}
+    assert caught.value.observed_statuses == {"ad_set": {"daily_budget": 1100}}
+
+
+async def test_get_meta_budget_state_reads_bound_exact_resources(monkeypatch):
+    api, _, ad, adset, ad_factory, adset_factory = _patch_mutation_sdk(monkeypatch)
+
+    observed = await get_meta_budget_state(_FULL_CONFIG, {"ad_id": "456", "ad_set_id": "123"})
+
+    ad_factory.assert_called_once_with("456", api=api)
+    adset_factory.assert_called_once_with("123", api=api)
+    ad.api_get.assert_called_once_with(fields=["status", "effective_status"])
+    adset.api_get.assert_called_once_with(fields=["status", "effective_status", "daily_budget"])
+    assert observed["ad"] == {"status": "PAUSED", "effective_status": "PAUSED"}
+    assert observed["ad_set"]["daily_budget"] == 1200
+
+
+async def test_mutation_error_redacts_credentials_and_preserves_rate_limit_code(
+    monkeypatch,
+):
+    _, _, ad, *_ = _patch_mutation_sdk(monkeypatch)
+    ad.api_update.side_effect = RuntimeError(
+        f"rate limit code=17 token={_FULL_CONFIG.system_user_token}"
+    )
+
+    with pytest.raises(MetaAdsError) as caught:
+        await set_meta_ad_status(_FULL_CONFIG, "456", "ACTIVE")
+
+    assert caught.value.phase == "update_ad_status"
+    assert caught.value.resource_ids == {"ad_id": "456"}
+    assert "rate limit code=17" in str(caught.value)
+    assert _FULL_CONFIG.system_user_token not in str(caught.value)
+    assert caught.value.__cause__ is None
 
 
 def _patch_meta_sdk(
