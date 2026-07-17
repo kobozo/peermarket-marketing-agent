@@ -641,13 +641,14 @@ def _replace_claim():
 
 
 class ReplacementMeta:
-    def __init__(self, *, source_pause_fails=False, rollback_verified=True):
+    def __init__(self, *, source_pause_fails=False, rollback_verified=True, activation_fails=False):
         self.calls = []
         self.active = False
         self.source_pause_fails = source_pause_fails
         self.rollback_verified = rollback_verified
         self.source_paused = False
         self.rollback_phase = False
+        self.activation_fails = activation_fails
 
     async def create_paused(self, **kwargs):
         self.calls.append("create_paused")
@@ -672,6 +673,8 @@ class ReplacementMeta:
     async def activate_replacement(self, **kwargs):
         self.calls.append("activate_replacement")
         self.active = True
+        if self.activation_fails:
+            raise RuntimeError("activation split failure")
 
     async def pause_source(self, **kwargs):
         self.calls.append("pause_source")
@@ -768,6 +771,90 @@ async def test_public_replace_source_pause_unverified_rollback_persists_exact_au
     rollback = row["audit"]["rollback_result"]
     assert rollback["verified"] is False
     assert rollback["observed"]["ad:NL"]["effective_status"] == "ACTIVE"
+
+    later = FrozenDecision(
+        kind=DecisionKind.PAUSE,
+        campaign_id="10",
+        evidence={"blocked_by": claim.id},
+        reason="later action",
+        window_start=datetime(2026, 7, 16, tzinfo=UTC),
+        window_end=NOW,
+        idempotency_key="later-after-reconciliation",
+    )
+    blocked = await enqueue_action(engine, later)
+    assert blocked.created is False
+    assert blocked.id == claim.id
+    assert blocked.status.value == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_public_replace_success_persists_full_final_audit(engine, monkeypatch):
+    claim = await _public_replace_claim(engine)
+    meta = ReplacementMeta()
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+
+    result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
+
+    assert result.status is ExecutionStatus.SUCCEEDED
+    assert meta.calls == [
+        "read_source",
+        "create_paused",
+        "read_replacement",
+        "activate_replacement",
+        "read_replacement",
+        "pause_source",
+        "read_source",
+    ]
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,before_state,after_state,audit "
+                        "FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "succeeded"
+    assert row["before_state"]["intent"]["kind"] == "replace"
+    assert row["after_state"]["replacement"]["ad_set"]["daily_budget"] == 1000
+    assert row["after_state"]["source"]["status"] == "PAUSED"
+    assert row["audit"] == {}
+
+
+@pytest.mark.parametrize(
+    ("meta", "category", "verified"),
+    [
+        (ReplacementMeta(source_pause_fails=True), "external_state_unproven", True),
+        (ReplacementMeta(activation_fails=True), "external_state_unproven", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_replace_split_failures_persist_proven_compensation(
+    engine, monkeypatch, meta, category, verified
+):
+    claim = await _public_replace_claim(engine)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+    result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
+    assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT failure_category,audit FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["failure_category"] == category
+    assert row["audit"]["rollback_result"]["verified"] is verified
+    assert meta.calls.count("pause_replacement") == 1
 
 
 @pytest.mark.asyncio
