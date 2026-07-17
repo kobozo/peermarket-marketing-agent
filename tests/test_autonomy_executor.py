@@ -170,7 +170,29 @@ class BudgetMeta:
 
 
 async def _scale_claim(engine, kind=DecisionKind.SCALE):
-    variants = [{"variant_id": "1"}]
+    allocations = {
+        "winner": {
+            "campaign_id": "10",
+            "variant_id": "1",
+            "ad_set_id": "21",
+            "ad_id": "31",
+            "old_budget_cents": 400,
+            "new_budget_cents": 500,
+        },
+        "loser": {
+            "campaign_id": "10",
+            "variant_id": "2",
+            "ad_set_id": "22",
+            "ad_id": "32",
+            "old_budget_cents": 600,
+            "new_budget_cents": 500,
+        },
+    }
+    variants = (
+        [{"variant_id": "1"}, {"variant_id": "2"}]
+        if kind is DecisionKind.REALLOCATE
+        else [{"variant_id": "1"}]
+    )
     performance = {
         "meta": {
             "latest": {
@@ -193,7 +215,15 @@ async def _scale_claim(engine, kind=DecisionKind.SCALE):
     }
     performance["autonomy_basis"] = build_autonomy_basis(publication, performance)
     snapshot = build_autonomy_snapshot(
-        publication, variants, replacement_source=None, allow_replacement=False
+        publication,
+        variants,
+        replacement_source=None,
+        allow_replacement=False,
+        reallocation=(
+            {"old_budget_cents": 1000, "new_budget_cents": 1000, "allocations": allocations}
+            if kind is DecisionKind.REALLOCATE
+            else None
+        ),
     )
     decision = FrozenDecision(
         kind=kind,
@@ -209,8 +239,15 @@ async def _scale_claim(engine, kind=DecisionKind.SCALE):
         window_start=snapshot["window_start"],
         window_end=snapshot["window_end"],
         idempotency_key=f"{kind.value}-1",
-        old_budget_cents=1000 if kind is DecisionKind.SCALE else None,
-        new_budget_cents=1200 if kind is DecisionKind.SCALE else None,
+        old_budget_cents=1000 if kind in {DecisionKind.SCALE, DecisionKind.REALLOCATE} else None,
+        new_budget_cents=(
+            1200
+            if kind is DecisionKind.SCALE
+            else 1000
+            if kind is DecisionKind.REALLOCATE
+            else None
+        ),
+        allocations=allocations if kind is DecisionKind.REALLOCATE else None,
     )
     await enqueue_action(engine, decision)
     claim = await claim_next_action(engine, "worker")
@@ -315,6 +352,93 @@ async def test_public_pause_readback_failure_requires_reconciliation(engine):
         "status": "reconciliation_required",
         "failure_message": "pause_verification_failed",
     }
+
+
+class ReallocationMeta(BudgetMeta):
+    def __init__(self, fail_write=None, rollback_unproven=False):
+        super().__init__()
+        self.fail_writes = set(fail_write if isinstance(fail_write, tuple) else (fail_write,))
+        self.rollback_unproven = rollback_unproven
+        self.writes = 0
+        self.budgets = {"21": 400, "22": 600}
+
+    async def read_allocation(self, allocation):
+        budget = self.budgets[allocation["ad_set_id"]]
+        if self.rollback_unproven and self.writes > 2:
+            budget = allocation["new_budget_cents"]
+        active = {"status": "ACTIVE", "effective_status": "ACTIVE"}
+        return dict(allocation) | {"ad_set": active | {"daily_budget": budget}, "ad": active}
+
+    async def set_budget(self, ad_set_id, cents):
+        self.writes += 1
+        if self.writes in self.fail_writes:
+            raise RuntimeError("injected write failure")
+        self.budgets[ad_set_id] = cents
+        return {"daily_budget": cents}
+
+
+@pytest.mark.parametrize(
+    ("fail_write", "rollback_unproven", "expected"),
+    [
+        (None, False, ExecutionStatus.SUCCEEDED),
+        (1, False, ExecutionStatus.RECONCILIATION_REQUIRED),
+        (2, False, ExecutionStatus.RECONCILIATION_REQUIRED),
+        (2, True, ExecutionStatus.RECONCILIATION_REQUIRED),
+        ((2, 3), False, ExecutionStatus.RECONCILIATION_REQUIRED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_reallocation_write_and_rollback_matrix(
+    engine, fail_write, rollback_unproven, expected
+):
+    claim = await _scale_claim(engine, DecisionKind.REALLOCATE)
+    result = await execute_claim(
+        engine, _settings(), ReallocationMeta(fail_write, rollback_unproven), None, claim, NOW
+    )
+    assert result.status is expected
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,before_state,after_state,audit,failure_category FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["before_state"]["intent"]["kind"] == "reallocate"
+    if expected is ExecutionStatus.SUCCEEDED:
+        assert row["after_state"]["allocations"]["winner"]["ad_set"]["daily_budget"] == 500
+    else:
+        assert row["status"] == "reconciliation_required"
+        assert "rollback_result" in row["audit"]
+
+
+@pytest.mark.asyncio
+async def test_public_execution_rechecks_cooldown_race_after_claim(engine):
+    claim = await _scale_claim(engine)
+    async with engine.begin() as conn:
+        decision_id = await conn.scalar(
+            text(
+                "INSERT INTO autonomous_decisions(decision_key,kind,campaign_id,window_start,window_end,evidence,reason) "
+                "VALUES ('race-history','pause','10',NOW()-INTERVAL '2 hours',NOW()-INTERVAL '1 hour','{}','race') RETURNING id"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO autonomous_actions(decision_id,campaign_id,status,updated_at) "
+                "VALUES (:decision,'10','succeeded',NOW())"
+            ),
+            {"decision": decision_id},
+        )
+    meta = BudgetMeta()
+    result = await execute_claim(engine, _settings(), meta, None, claim, NOW)
+    assert result.status is ExecutionStatus.CANCELLED
+    assert result.reason == "cooldown"
+    assert meta.calls == ["read_source"]
 
 
 def _settings(**overrides):

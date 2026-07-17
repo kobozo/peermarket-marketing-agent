@@ -67,6 +67,9 @@ def _json_default(value: Any) -> str:
 
 
 async def _record_decision(conn: AsyncConnection, decision: FrozenDecision) -> RecordedDecision:
+    evidence = dict(decision.evidence)
+    if decision.allocations is not None:
+        evidence["allocations"] = decision.allocations
     inserted = await conn.scalar(
         text(
             "INSERT INTO autonomous_decisions "
@@ -81,7 +84,7 @@ async def _record_decision(conn: AsyncConnection, decision: FrozenDecision) -> R
             "campaign_id": decision.campaign_id,
             "window_start": decision.window_start,
             "window_end": decision.window_end,
-            "evidence": _json(decision.evidence),
+            "evidence": _json(evidence),
             "reason": decision.reason,
             "old_budget": decision.old_budget_cents,
             "new_budget": decision.new_budget_cents,
