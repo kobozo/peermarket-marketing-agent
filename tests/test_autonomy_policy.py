@@ -25,6 +25,7 @@ def limits():
         "meta_autonomy_max_increase_percent": 20,
         "meta_autonomy_max_daily_budget_eur": 20,
         "meta_no_delivery_grace_hours": 2,
+        "meta_account_timezone": "Europe/Brussels",
     }
 
 
@@ -320,7 +321,7 @@ def test_scale_freezes_campaign_total_allocations_and_normalized_policy(limits):
         "max_daily_budget_cents": 2_400,
         "no_delivery_grace_hours": 2,
         "complete_window_required": True,
-        "account_timezone": "UTC",
+        "account_timezone": "Europe/Brussels",
     }
 
 

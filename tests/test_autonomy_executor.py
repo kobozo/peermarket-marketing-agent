@@ -1083,6 +1083,7 @@ def _policy_limits():
         "meta_autonomy_max_increase_percent": 20,
         "meta_autonomy_max_daily_budget_eur": 20,
         "meta_no_delivery_grace_hours": 2,
+        "meta_account_timezone": "Europe/Brussels",
     }
 
 

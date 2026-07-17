@@ -379,6 +379,7 @@ async def _audit(
     detail: str,
     rollback_result: Any = None,
     next_evaluation_at: datetime | None = None,
+    after_state: Any = None,
 ) -> None:
     """Persist a sanitized immutable Slack payload for retry by the outbox worker."""
     key = f"autonomy:{decision.idempotency_key}:{outcome}"
@@ -417,6 +418,21 @@ async def _audit(
             hours=int(thresholds.get("cooldown_hours", 24))
         )
     next_evaluation = next_evaluation_at.isoformat() if next_evaluation_at else None
+    replacement_result = None
+    if decision.kind is DecisionKind.REPLACE and isinstance(after_state, dict):
+        replacement = after_state.get("replacement")
+        source_after = after_state.get("source")
+        if isinstance(replacement, dict) and isinstance(source_after, dict):
+            ad_ids = replacement.get("ad_ids")
+            if isinstance(ad_ids, dict) and set(ad_ids) == {"NL", "FR", "EN"}:
+                replacement_result = {
+                    "campaign_id": str(replacement.get("campaign_id")),
+                    "ad_set_id": str(replacement.get("ad_set_id")),
+                    "ad_ids": {locale: str(ad_ids[locale]) for locale in ("NL", "FR", "EN")},
+                    "source_ad_id": str(source_after.get("ad_id")),
+                    "source_status": str(source_after.get("status")),
+                    "changed": "replacement_activated_source_paused",
+                }
     payload = {
         "audit": "autonomy",
         "campaign_id": decision.campaign_id,
@@ -432,6 +448,7 @@ async def _audit(
         },
         "rollback": rollback,
         "next_evaluation_at": next_evaluation,
+        "replacement_result": replacement_result,
         "text": (
             f"Autonomy {outcome}: campaign {decision.campaign_id}; "
             f"decision {decision.kind.value}; reason {decision.reason}; "
@@ -441,6 +458,7 @@ async def _audit(
             f"budget {decision.old_budget_cents}->{decision.new_budget_cents}; "
             f"rollback {json.dumps(rollback, sort_keys=True)}; "
             f"next evaluation {next_evaluation or 'pending'}; "
+            f"replacement result {json.dumps(replacement_result, sort_keys=True)}; "
             f"detail {detail}"
         ),
     }
@@ -565,6 +583,7 @@ async def run_autonomy_cycle(
                         else {"needed": False, "result": "not_required"}
                     ),
                     next_evaluation_at=result.retry_at,
+                    after_state=result.after_state,
                 )
         except Exception as error:
             summary["failed"] += 1

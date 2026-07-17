@@ -290,6 +290,7 @@ async def test_collector_basis_flows_through_public_policy_builder(engine, monke
         "meta_autonomy_max_increase_percent": 20,
         "meta_autonomy_max_daily_budget_eur": 20,
         "meta_no_delivery_grace_hours": 2,
+        "meta_account_timezone": "Europe/Brussels",
     }
     decision = build_policy_decision(
         publication, variants, replacement_source=source, history=(), limits=limits, now=NOW

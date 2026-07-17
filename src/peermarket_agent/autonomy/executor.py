@@ -340,7 +340,9 @@ def _policy_limits(settings: object, fallback: Mapping[str, Any]) -> dict[str, A
             settings, "meta_no_delivery_grace_hours", fallback["no_delivery_grace_hours"]
         ),
         "complete_window_required": True,
-        "account_timezone": "UTC",
+        "account_timezone": _setting(
+            settings, "meta_account_timezone", fallback["account_timezone"]
+        ),
     }
 
 
@@ -875,7 +877,7 @@ async def _replace(
             if not verified:
                 raise RuntimeError("replacement_rollback_unproven") from None
             raise source_pause_error
-        return {"replacement": active, "source": source_after}, rollback
+        return {"replacement": dict(active) | ids, "source": source_after}, rollback
     except BaseException as cause:
         if not compensated:
             try:

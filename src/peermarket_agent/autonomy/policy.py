@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import cmp_to_key
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
 
@@ -66,7 +67,7 @@ def evaluate_campaign(
         "max_daily_budget_cents": policy["ceiling_eur"] * 100,
         "no_delivery_grace_hours": policy["no_delivery_grace"],
         "complete_window_required": True,
-        "account_timezone": "UTC",
+        "account_timezone": policy["account_timezone"],
     }
 
     if normalized_history is None:
@@ -301,7 +302,7 @@ def _normalize_history(
     return tuple(sorted(result, key=lambda item: (item["at"], item["event_id"], item["kind"])))
 
 
-def _normalize_limits(limits: Mapping[str, Any] | object) -> dict[str, int]:
+def _normalize_limits(limits: Mapping[str, Any] | object) -> dict[str, Any]:
     def read(name: str) -> Any:
         return limits.get(name) if isinstance(limits, Mapping) else getattr(limits, name)
 
@@ -317,7 +318,16 @@ def _normalize_limits(limits: Mapping[str, Any] | object) -> dict[str, int]:
         "ceiling_eur": "meta_autonomy_max_daily_budget_eur",
         "no_delivery_grace": "meta_no_delivery_grace_hours",
     }
-    return {key: _counter(read(name), name) for key, name in names.items()}
+    normalized = {key: _counter(read(name), name) for key, name in names.items()}
+    timezone = read("meta_account_timezone")
+    if not isinstance(timezone, str) or not timezone.strip():
+        raise _InvalidEvidence("meta_account_timezone must be a non-empty IANA zone")
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise _InvalidEvidence("meta_account_timezone must be a valid IANA zone") from exc
+    normalized["account_timezone"] = timezone
+    return normalized
 
 
 def _scale(snapshot, history, policy, now, outcome):

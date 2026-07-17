@@ -47,6 +47,7 @@ def _limits(**overrides):
         "meta_autonomy_max_increase_percent": 20,
         "meta_autonomy_max_daily_budget_eur": 20,
         "meta_no_delivery_grace_hours": 2,
+        "meta_account_timezone": "Europe/Brussels",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -329,8 +330,67 @@ async def test_autonomy_audit_freezes_meaningful_sanitized_campaign_content(engi
     assert "thresholds" in payload["text"] and "samples" in payload["text"]
 
 
+@pytest.mark.asyncio
+async def test_replacement_success_audit_whitelists_new_bundle_and_retains_source(engine):
+    await test_real_single_collected_publication_persists_canonical_input_and_observe(engine)
+    decision = FrozenDecision(
+        DecisionKind.REPLACE,
+        "10",
+        {
+            "snapshot_id": "replace-audit",
+            "policy_limits": {"account_timezone": "Europe/Brussels", "cooldown_hours": 24},
+            "variants": [],
+            "frozen_basis": {
+                "campaign_publications": [
+                    {"publication_id": 1, "external_ids": {"ad_set_id": "20", "ad_id": "30"}}
+                ]
+            },
+            "source": {"secret": "not-used"},
+        },
+        "proven_loser_replace",
+        NOW - timedelta(days=1),
+        NOW,
+        "replace-audit",
+    )
+    await _audit(
+        engine,
+        draft_id=156,
+        decision=decision,
+        outcome="succeeded",
+        detail="executed",
+        after_state={
+            "replacement": {
+                "campaign_id": "11",
+                "ad_set_id": "21",
+                "ad_ids": {"NL": "31", "FR": "32", "EN": "33"},
+                "creative_ids": {"NL": "token=leak"},
+            },
+            "source": {"ad_id": "30", "status": "PAUSED", "access_token": "leak"},
+        },
+    )
+    async with engine.connect() as conn:
+        payload = await conn.scalar(
+            text(
+                "SELECT payload FROM slack_outbox WHERE idempotency_key="
+                "'autonomy:replace-audit:succeeded'"
+            )
+        )
+    assert payload["thresholds"]["account_timezone"] == "Europe/Brussels"
+    assert payload["replacement_result"] == {
+        "campaign_id": "11",
+        "ad_set_id": "21",
+        "ad_ids": {"NL": "31", "FR": "32", "EN": "33"},
+        "source_ad_id": "30",
+        "source_status": "PAUSED",
+        "changed": "replacement_activated_source_paused",
+    }
+    assert payload["affected_ads"] == [{"publication_id": 1, "ad_set_id": "20", "ad_id": "30"}]
+    assert "token=leak" not in json.dumps(payload)
+
+
 @pytest.mark.parametrize(
-    "scenario", ["success", "frozen_drift", "policy_drift", "partial_write_failure"]
+    "scenario",
+    ["success", "frozen_drift", "policy_drift", "timezone_drift", "partial_write_failure"],
 )
 @pytest.mark.asyncio
 async def test_three_publication_scale_preserves_allocation_rounding_and_audits(
@@ -513,12 +573,23 @@ async def test_three_publication_scale_preserves_allocation_rounding_and_audits(
             "peermarket_agent.agent.loops.autonomy.execute_production_claim",
             drift_policy_then_execute,
         )
+    elif scenario == "timezone_drift":
+        from peermarket_agent.autonomy.executor import execute_production_claim
+
+        async def drift_timezone_then_execute(db, configured, claude, claim, now):
+            configured.meta_account_timezone = "UTC"
+            return await execute_production_claim(db, configured, claude, claim, now)
+
+        monkeypatch.setattr(
+            "peermarket_agent.agent.loops.autonomy.execute_production_claim",
+            drift_timezone_then_execute,
+        )
 
     result = await run_autonomy_cycle(engine, object(), None, settings, now=NOW)
 
     assert result["queued"] == 1
     assert result["executed"] == 1
-    if scenario in {"frozen_drift", "policy_drift"}:
+    if scenario in {"frozen_drift", "policy_drift", "timezone_drift"}:
         assert writes == []
         async with engine.connect() as conn:
             assert (
