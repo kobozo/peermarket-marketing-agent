@@ -38,3 +38,13 @@ Remediation checks:
 - Hook matrix tests: `4 passed`.
 - Executor shadow-boundary tests: `2 passed`.
 - No external Meta boundary, deployment, dispatch, or GitHub variable was used.
+
+## Critical identity and recovery fixwave
+
+- Removed generic `publish_replacement_paused` resource adoption from the hook path. It now initializes only the fenced replacement-publication database intention; every creative/ad, including variant `:01`, is created from its persisted HookExperiment language bundle.
+- Live matrix reads now supply creative IDs, exact landing page, exact locale payloads, and image hashes to the existing Meta identity verifier before activation. Ordinary replacement copy therefore cannot pass as hook variant `:01`.
+- Every matrix progress key is persisted immediately through the action/replacement lease owner, token, and expiry fence. Partial cleanup reconstructs IDs from the database instead of relying on an in-memory completed result, preventing the previous partial-result `KeyError` class.
+- Activation renews the action lease and rereads exact creative/parent/ad identity before the first write and every subsequent ad write. Drift or lease loss enters compensation.
+- Success now requires a post-mutation live source reread satisfying the exact paused-source contract; otherwise the matrix is compensated and reconciliation remains fail-closed.
+
+Fixwave verification: Ruff and Python compilation passed; hook matrix tests `4 passed`; executor shadow-boundary tests `2 passed`; `git diff --check` passed. No external or deployment mutation occurred.
