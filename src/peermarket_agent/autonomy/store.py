@@ -432,11 +432,15 @@ async def renew_replacement_leases(
         action = await conn.execute(
             text(
                 "UPDATE autonomous_actions SET lease_expires_at=NOW()+make_interval(secs=>:seconds), "
-                "updated_at=NOW() WHERE id=:id AND status IN ('leased','executing') "
+                "updated_at=NOW() WHERE id=:id AND status IN ('leased','executing','reconciliation_required') "
                 "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW()"
             ),
-            {"seconds": lease_seconds, "id": claim.id, "owner": claim.lease_owner,
-             "token": claim.lease_token},
+            {
+                "seconds": lease_seconds,
+                "id": claim.id,
+                "owner": claim.lease_owner,
+                "token": claim.lease_token,
+            },
         )
         attempt = await conn.execute(
             text(
@@ -445,8 +449,12 @@ async def renew_replacement_leases(
                 "WHERE id=:id AND lease_owner=:owner AND lease_token=:token "
                 "AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required')"
             ),
-            {"seconds": lease_seconds, "id": publication_id, "owner": claim.lease_owner,
-             "token": publication_token},
+            {
+                "seconds": lease_seconds,
+                "id": publication_id,
+                "owner": claim.lease_owner,
+                "token": publication_token,
+            },
         )
         if action.rowcount != 1 or attempt.rowcount != 1:
             raise RuntimeError("replacement lease ownership was lost")

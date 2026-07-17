@@ -61,6 +61,28 @@ _LANDING_PAGE = "https://peermarket.eu/"
 _META_RECONCILIATION_ID_KEYS = {"campaign_id", "ad_set_id", "creative_id", "ad_id"}
 _TERMINAL_META_STATUSES = {"ARCHIVED", "DELETED"}
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
+_NONDELIVERING_EFFECTIVE_STATUSES = {
+    "PAUSED",
+    "CAMPAIGN_PAUSED",
+    "ADSET_PAUSED",
+    "PENDING_REVIEW",
+    "IN_PROCESS",
+    "PREAPPROVED",
+    "PENDING_BILLING_INFO",
+}
+
+
+def _is_verified_paused_bundle(observed: dict, budget_cents: int) -> bool:
+    expected = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
+    return (
+        set(observed) == expected
+        and all(
+            item.get("status") == "PAUSED"
+            and item.get("effective_status") in _NONDELIVERING_EFFECTIVE_STATUSES
+            for item in observed.values()
+        )
+        and observed["ad_set"].get("daily_budget") == budget_cents
+    )
 
 
 def _start_replacement_heartbeat(
@@ -71,13 +93,13 @@ def _start_replacement_heartbeat(
     async def beat() -> None:
         try:
             while True:
-                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
                 await renew_replacement_leases(
                     engine,
                     claim,
                     publication_id=publication_id,
                     publication_token=publication_token,
                 )
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -240,6 +262,25 @@ async def publish_replacement_paused(
         raise ValueError("replacement must contain exact NL/FR/EN locales")
     attempt_token = uuid.uuid4().hex
     async with engine.begin() as conn:
+        action = (
+            await conn.execute(
+                text(
+                    "SELECT id FROM autonomous_actions WHERE id=:id AND status IN ('leased','executing',"
+                    "'reconciliation_required') AND lease_owner=:owner AND lease_token=:claim_token "
+                    "AND lease_expires_at>NOW() FOR UPDATE"
+                ),
+                {"id": claim.id, "owner": claim.lease_owner, "claim_token": claim.lease_token},
+            )
+        ).first()
+        if action is None:
+            raise RuntimeError("replacement action ownership was lost")
+        await conn.execute(
+            text(
+                "UPDATE autonomous_actions SET lease_expires_at=NOW()+INTERVAL '5 minutes', "
+                "updated_at=NOW() WHERE id=:id"
+            ),
+            {"id": claim.id},
+        )
         inserted = (
             (
                 await conn.execute(
@@ -269,9 +310,16 @@ async def publish_replacement_paused(
         )
         if inserted is None:
             attempt = (
-                (await conn.execute(text(
-                    "SELECT * FROM autonomous_replacement_publications WHERE action_id=:action FOR UPDATE"
-                ), {"action": claim.id})).mappings().one()
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT * FROM autonomous_replacement_publications WHERE action_id=:action FOR UPDATE"
+                        ),
+                        {"action": claim.id},
+                    )
+                )
+                .mappings()
+                .one()
             )
             invariants = {
                 "replacement_draft_id": draft.id,
@@ -282,13 +330,28 @@ async def publish_replacement_paused(
                 "landing_page_url": draft.landing_page_url,
             }
             if any(attempt[key] != value for key, value in invariants.items()):
-                raise ValueError("replacement action conflicts with immutable publication intention")
+                raise ValueError(
+                    "replacement action conflicts with immutable publication intention"
+                )
             if attempt["state"] != "paused":
-                claimed = (await conn.execute(text(
-                    "UPDATE autonomous_replacement_publications SET lease_owner=:owner, "
-                    "lease_token=:token, lease_expires_at=NOW()+INTERVAL '5 minutes', updated_at=NOW() "
-                    "WHERE id=:id AND (lease_expires_at IS NULL OR lease_expires_at<=NOW()) RETURNING *"
-                ), {"id": attempt["id"], "owner": claim.lease_owner, "token": attempt_token})).mappings().first()
+                claimed = (
+                    (
+                        await conn.execute(
+                            text(
+                                "UPDATE autonomous_replacement_publications SET lease_owner=:owner, "
+                                "lease_token=:token, lease_expires_at=NOW()+INTERVAL '5 minutes', updated_at=NOW() "
+                                "WHERE id=:id AND (lease_expires_at IS NULL OR lease_expires_at<=NOW()) RETURNING *"
+                            ),
+                            {
+                                "id": attempt["id"],
+                                "owner": claim.lease_owner,
+                                "token": attempt_token,
+                            },
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
                 if claimed is None:
                     raise RuntimeError("replacement publication is owned by another worker")
                 attempt = claimed
@@ -350,9 +413,16 @@ async def publish_replacement_paused(
         async with engine.begin() as conn:
             result = await conn.execute(
                 text(
-                    "UPDATE autonomous_replacement_publications SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE id=:id AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required')"
+                    "UPDATE autonomous_replacement_publications r SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE r.id=:id AND r.lease_owner=:owner AND r.lease_token=:token AND r.lease_expires_at>NOW() AND r.state IN ('creating','reconciliation_required') AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=r.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
                 ),
-                {"id": attempt["id"], "token": attempt_token, "key": key, "value": value},
+                {
+                    "id": attempt["id"],
+                    "owner": claim.lease_owner,
+                    "token": attempt_token,
+                    "claim_token": claim.lease_token,
+                    "key": key,
+                    "value": value,
+                },
             )
             if result.rowcount != 1:
                 raise RuntimeError("replacement publication progress persistence failed")
@@ -373,22 +443,33 @@ async def publish_replacement_paused(
             progress=attempt["progress"],
             persist_progress=persist_progress,
         )
+    except asyncio.CancelledError:
+        await _stop_heartbeat(heartbeat)
+        raise
     except Exception as exc:
         await _stop_heartbeat(heartbeat)
         recovered_ids = exc.resource_ids if isinstance(exc, MetaAdsError) else {}
         async with engine.begin() as conn:
-            await conn.execute(
+            failed = await conn.execute(
                 text(
                     "UPDATE autonomous_replacement_publications SET "
                     "state='reconciliation_required', progress=progress || CAST(:ids AS JSONB), "
                     "failure_category='meta_bundle_creation', lease_owner=NULL, lease_token=NULL, "
-                    "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_token=:token"
+                    "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_owner=:owner "
+                    "AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required') "
+                    "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
                 ),
-                {"id": attempt["id"], "token": attempt_token, "ids": json.dumps(recovered_ids)},
+                {
+                    "id": attempt["id"],
+                    "owner": claim.lease_owner,
+                    "token": attempt_token,
+                    "claim_token": claim.lease_token,
+                    "ids": json.dumps(recovered_ids),
+                },
             )
-        if not await require_reconciliation(
-            engine, claim, failure_category="meta_bundle_creation"
-        ):
+            if failed.rowcount != 1:
+                raise RuntimeError("replacement publication ownership was lost") from exc
+        if not await require_reconciliation(engine, claim, failure_category="meta_bundle_creation"):
             raise RuntimeError("replacement action ownership was lost") from exc
         raise
     try:
@@ -397,27 +478,38 @@ async def publish_replacement_paused(
         observed = await get_meta_replacement_bundle_statuses(
             _meta_config(settings), result.campaign_id, result.ad_set_id, result.ad_ids
         )
-        expected_keys = {"campaign", "ad_set", "ad:NL", "ad:FR", "ad:EN"}
-        paused_compatible = {"PAUSED", "PENDING_REVIEW"}
-        valid = set(observed) == expected_keys and all(
-            value.get("status") == "PAUSED"
-            and value.get("effective_status") in paused_compatible
-            for value in observed.values()
-        ) and observed["ad_set"].get("daily_budget") == draft.daily_budget_eur * 100
+        valid = _is_verified_paused_bundle(observed, draft.daily_budget_eur * 100)
         if result.status != "PAUSED" or not valid:
-            raise RuntimeError("live Meta replacement bundle is not exactly paused at frozen budget")
-    except Exception:
+            raise RuntimeError(
+                "live Meta replacement bundle is not exactly paused at frozen budget"
+            )
+    except asyncio.CancelledError:
+        await _stop_heartbeat(heartbeat)
+        raise
+    except Exception as exc:
         await _stop_heartbeat(heartbeat)
         async with engine.begin() as conn:
-            await conn.execute(text(
-                "UPDATE autonomous_replacement_publications SET state='reconciliation_required', "
-                "failure_category='post_create_validation', lease_owner=NULL, lease_token=NULL, "
-                "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_token=:token"
-            ), {"id": attempt["id"], "token": attempt_token})
+            reconciled = await conn.execute(
+                text(
+                    "UPDATE autonomous_replacement_publications SET state='reconciliation_required', "
+                    "failure_category='post_create_validation', lease_owner=NULL, lease_token=NULL, "
+                    "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_owner=:owner "
+                    "AND lease_token=:token AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required') "
+                    "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
+                ),
+                {
+                    "id": attempt["id"],
+                    "owner": claim.lease_owner,
+                    "token": attempt_token,
+                    "claim_token": claim.lease_token,
+                },
+            )
+            if reconciled.rowcount != 1:
+                raise RuntimeError("replacement publication ownership was lost") from exc
         if not await require_reconciliation(
             engine, claim, failure_category="post_create_validation"
         ):
-            raise RuntimeError("replacement action ownership was lost")
+            raise RuntimeError("replacement action ownership was lost") from exc
         raise
     if ownership_lost.is_set():
         await _stop_heartbeat(heartbeat)
@@ -428,9 +520,16 @@ async def publish_replacement_paused(
             text(
                 "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, "
                 "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() "
-                "WHERE id=:id AND lease_token=:token"
+                "WHERE id=:id AND state IN ('creating','reconciliation_required') "
+                "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW() "
+                "AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=autonomous_replacement_publications.action_id AND a.status IN ('leased','executing','reconciliation_required') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
             ),
-            {"id": attempt["id"], "token": attempt_token},
+            {
+                "id": attempt["id"],
+                "owner": claim.lease_owner,
+                "token": attempt_token,
+                "claim_token": claim.lease_token,
+            },
         )
         if finalized.rowcount != 1:
             await _stop_heartbeat(heartbeat)

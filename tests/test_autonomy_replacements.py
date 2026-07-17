@@ -185,12 +185,14 @@ async def test_each_dimension_changes_only_its_implementable_fields(dimension, c
         response
         for locale in ("NL", "FR", "EN")
         for response in (
-            _response(source, locale, **{field: values[locale] for field, values in changes.items()}),
+            _response(
+                source, locale, **{field: values[locale] for field, values in changes.items()}
+            ),
             _quality(locale),
         )
     ]
     draft = await build_replacement(
-        AsyncMock(), fake, source, _decision(source), persist=lambda _: 99
+        AsyncMock(), fake, source, _decision(source), claim=None, persist=lambda _: 99
     )
     assert set(draft.locales) == {"NL", "FR", "EN"}
     assert draft.changed_dimension == dimension
@@ -219,7 +221,7 @@ async def test_complete_locales_are_native_and_not_dutch_copies():
         _quality("EN"),
     ]
     draft = await build_replacement(
-        AsyncMock(), fake, source, _decision(source), persist=lambda _: 99
+        AsyncMock(), fake, source, _decision(source), claim=None, persist=lambda _: 99
     )
     assert draft.locales["FR"].body != draft.locales["NL"].body
     assert draft.locales["EN"].headline != draft.locales["NL"].headline
@@ -232,11 +234,15 @@ async def test_native_reviewer_rejects_literal_translation_flag():
     source = _source("copy")
     fake = AsyncMock()
     fake.complete.side_effect = [
-        _response(source, "NL", body="Vind geverifieerde kopers in je buurt en verkoop met vertrouwen."),
+        _response(
+            source, "NL", body="Vind geverifieerde kopers in je buurt en verkoop met vertrouwen."
+        ),
         _quality("NL", literal_translation=True),
     ]
     with pytest.raises(ValueError, match="native-quality"):
-        await build_replacement(AsyncMock(), fake, source, _decision(source), persist=lambda _: 99)
+        await build_replacement(
+            AsyncMock(), fake, source, _decision(source), claim=None, persist=lambda _: 99
+        )
 
 
 @pytest.mark.asyncio
@@ -252,7 +258,7 @@ async def test_native_copy_without_language_stopwords_reaches_structured_review(
         _quality("EN"),
     ]
     draft = await build_replacement(
-        AsyncMock(), fake, source, _decision(source), persist=lambda _: 99
+        AsyncMock(), fake, source, _decision(source), claim=None, persist=lambda _: 99
     )
     assert draft.locales["NL"].hook == "Betrouwbaar buurtplatform"
 
@@ -283,7 +289,9 @@ async def test_complete_locale_uses_canonical_meta_validation(changes, message):
     response = ClaudeResponse(__import__("json").dumps(payload), 10, 20, "test", "end_turn")
     fake.complete.side_effect = [response]
     with pytest.raises(ValueError, match=message):
-        await build_replacement(AsyncMock(), fake, source, _decision(source), persist=lambda _: 99)
+        await build_replacement(
+            AsyncMock(), fake, source, _decision(source), claim=None, persist=lambda _: 99
+        )
 
 
 @pytest.mark.asyncio
@@ -299,7 +307,9 @@ async def test_rejects_literal_translation_or_wrong_language_before_persistence(
     ]
     persisted = AsyncMock()
     with pytest.raises(ValueError, match="native|translation|language"):
-        await build_replacement(AsyncMock(), fake, source, _decision(source), persist=persisted)
+        await build_replacement(
+            AsyncMock(), fake, source, _decision(source), claim=None, persist=persisted
+        )
     persisted.assert_not_awaited()
 
 
@@ -308,7 +318,7 @@ async def test_url_rejects_non_peermarket_destination():
     source = _source("copy")
     object.__setattr__(source, "landing_page_url", "https://evil.example/path")
     with pytest.raises(ValueError, match="HTTPS PeerMarket"):
-        await build_replacement(AsyncMock(), AsyncMock(), source, _decision(source))
+        await build_replacement(AsyncMock(), AsyncMock(), source, _decision(source), claim=None)
 
 
 def test_dimension_needing_missing_baseline_fails_closed():

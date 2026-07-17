@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 
@@ -12,18 +13,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent._json_parse import parse_claude_json
+from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.agent.cli_draft import recent_relevant_learnings
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.store import ClaimedAction
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
-from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.prompts.brand_voice import load_brand_voice
 from peermarket_agent.prompts.meta_ad_creative import (
     AUDIENCE_PROFILES,
     _cost_cents,
-    build_replacement_user_prompt,
     build_replacement_system_prompt,
+    build_replacement_user_prompt,
 )
 
 LOCALES = ("NL", "FR", "EN")
@@ -160,7 +162,12 @@ async def _review_native_quality(
     )
     payload = parse_claude_json(response.text)
     expected = {
-        "locale", "exact_language", "idiomatic", "literal_translation", "field_results", "evidence"
+        "locale",
+        "exact_language",
+        "idiomatic",
+        "literal_translation",
+        "field_results",
+        "evidence",
     }
     fields = {"hook", "body", "headline", "description", "cta_label"}
     if (
@@ -262,7 +269,9 @@ def _validate_locale(payload: dict, source: ReplacementSource, locale: str) -> R
     return item
 
 
-async def _persist(engine: AsyncEngine, draft: ReplacementDraft) -> int:
+async def _persist(
+    engine: AsyncEngine, draft: ReplacementDraft, claim: ClaimedAction, generation_token: str
+) -> int:
     metadata = {
         "autonomous_replacement": True,
         "source_draft_id": draft.source_draft_id,
@@ -284,7 +293,9 @@ async def _persist(engine: AsyncEngine, draft: ReplacementDraft) -> int:
             raise ValueError("meta_ad_creative action type is not seeded")
         draft_id = await conn.scalar(
             text(
-                "INSERT INTO drafts (action_type_id, channel, language, copy, asset_path, generation_cost_cents, brand_score, visual_truthfulness_pass, metadata) VALUES (:action, 'meta', 'MULTI', :copy, :asset, :cost, :score, TRUE, CAST(:metadata AS JSONB)) RETURNING id"
+                "INSERT INTO drafts (action_type_id, channel, language, copy, asset_path, generation_cost_cents, brand_score, visual_truthfulness_pass, metadata, autonomous_action_id) "
+                "SELECT :action, 'meta', 'MULTI', :copy, :asset, :cost, :score, TRUE, CAST(:metadata AS JSONB), :autonomous_action "
+                "WHERE EXISTS (SELECT 1 FROM autonomous_actions a JOIN autonomous_replacement_generations g ON g.action_id=a.id WHERE a.id=:autonomous_action AND a.status IN ('leased','executing') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW() AND g.state='generating' AND g.lease_owner=:owner AND g.lease_token=:generation_token AND g.lease_expires_at>NOW()) RETURNING id"
             ),
             {
                 "action": action_id,
@@ -293,9 +304,122 @@ async def _persist(engine: AsyncEngine, draft: ReplacementDraft) -> int:
                 "cost": draft.cost_cents,
                 "score": min(draft.brand_scores.values()),
                 "metadata": json.dumps(metadata),
+                "autonomous_action": claim.id,
+                "owner": claim.lease_owner,
+                "claim_token": claim.lease_token,
+                "generation_token": generation_token,
             },
         )
+        if draft_id is None:
+            raise RuntimeError("replacement generation ownership was lost")
+        destination = build_campaign_url(draft.landing_page_url, int(draft_id))
+        await conn.execute(
+            text(
+                "UPDATE drafts SET metadata=metadata || jsonb_build_object('landing_page_url', :url) "
+                "WHERE id=:id AND autonomous_action_id=:action"
+            ),
+            {"url": destination, "id": draft_id, "action": claim.id},
+        )
+        completed = await conn.execute(
+            text(
+                "UPDATE autonomous_replacement_generations g SET state='completed', replacement_draft_id=:draft, lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=NOW() WHERE action_id=:action AND state='generating' AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW() AND EXISTS (SELECT 1 FROM autonomous_actions a WHERE a.id=g.action_id AND a.status IN ('leased','executing') AND a.lease_owner=:owner AND a.lease_token=:claim_token AND a.lease_expires_at>NOW())"
+            ),
+            {
+                "draft": draft_id,
+                "action": claim.id,
+                "owner": claim.lease_owner,
+                "token": generation_token,
+                "claim_token": claim.lease_token,
+            },
+        )
+        if completed.rowcount != 1:
+            raise RuntimeError("replacement generation ownership was lost")
     return int(draft_id)
+
+
+async def _claim_generation(engine: AsyncEngine, claim: ClaimedAction) -> tuple[str, int | None]:
+    token = uuid.uuid4().hex
+    async with engine.begin() as conn:
+        if (
+            await conn.execute(
+                text(
+                    "SELECT id FROM autonomous_actions WHERE id=:id AND status IN ('leased','executing') AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW() FOR UPDATE"
+                ),
+                {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
+            )
+        ).first() is None:
+            raise RuntimeError("replacement action ownership was lost")
+        inserted = (
+            (
+                await conn.execute(
+                    text(
+                        "INSERT INTO autonomous_replacement_generations (action_id,lease_owner,lease_token,lease_expires_at) VALUES (:action,:owner,:token,NOW()+INTERVAL '5 minutes') ON CONFLICT (action_id) DO NOTHING RETURNING state,replacement_draft_id"
+                    ),
+                    {"action": claim.id, "owner": claim.lease_owner, "token": token},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if inserted is not None:
+            return token, None
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT state,replacement_draft_id FROM autonomous_replacement_generations WHERE action_id=:action FOR UPDATE"
+                    ),
+                    {"action": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        if row["state"] == "completed":
+            return token, int(row["replacement_draft_id"])
+        reclaimed = await conn.execute(
+            text(
+                "UPDATE autonomous_replacement_generations SET lease_owner=:owner,lease_token=:token,lease_expires_at=NOW()+INTERVAL '5 minutes',updated_at=NOW() WHERE action_id=:action AND lease_expires_at<=NOW()"
+            ),
+            {"action": claim.id, "owner": claim.lease_owner, "token": token},
+        )
+        if reclaimed.rowcount != 1:
+            raise RuntimeError("replacement generation is owned by another worker")
+        return token, None
+
+
+async def _load_replacement(engine: AsyncEngine, draft_id: int) -> ReplacementDraft:
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT metadata,generation_cost_cents,brand_score FROM drafts WHERE id=:id"
+                    ),
+                    {"id": draft_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    m = row["metadata"]
+    locales = {key: ReplacementLocale(**value) for key, value in m["locales"].items()}
+    return ReplacementDraft(
+        draft_id,
+        locales,
+        m["changed_dimension"],
+        m["source_draft_id"],
+        m["source_campaign_id"],
+        m["experiment_id"],
+        m["audience_profile_key"],
+        m["image_prompt"],
+        m["asset_path"],
+        m["suggested_daily_budget_eur"],
+        m["landing_page_url"],
+        row["generation_cost_cents"],
+        {key: row["brand_score"] for key in locales},
+        m.get("locale_quality"),
+    )
 
 
 async def _freeze_destination(engine: AsyncEngine, draft_id: int, url: str) -> None:
@@ -316,10 +440,18 @@ async def build_replacement(
     source: ReplacementSource,
     decision: FrozenDecision,
     *,
+    claim: ClaimedAction | None,
     persist: Callable[[ReplacementDraft], int | Awaitable[int]] | None = None,
 ) -> ReplacementDraft:
     """Generate, validate, score the complete creatives, then persist one bundle draft."""
     _verify_frozen(source, decision)
+    generation_token: str | None = None
+    if persist is None:
+        if not isinstance(claim, ClaimedAction):
+            raise TypeError("production replacement generation requires a ClaimedAction")
+        generation_token, completed_id = await _claim_generation(engine, claim)
+        if completed_id is not None:
+            return await _load_replacement(engine, completed_id)
     brand_voice = load_brand_voice()
     locales: dict[str, ReplacementLocale] = {}
     scores: dict[str, int] = {}
@@ -388,10 +520,8 @@ async def build_replacement(
         brand_scores=scores,
         locale_quality=quality,
     )
-    writer = persist or (lambda value: _persist(engine, value))
+    writer = persist or (lambda value: _persist(engine, value, claim, generation_token))
     result = writer(provisional)
     draft_id = await result if inspect.isawaitable(result) else result
     destination = build_campaign_url(source.landing_page_url, int(draft_id))
-    if persist is None:
-        await _freeze_destination(engine, int(draft_id), destination)
     return replace(provisional, id=int(draft_id), landing_page_url=destination)

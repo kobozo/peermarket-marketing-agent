@@ -452,6 +452,19 @@ _STEPS: list[str] = [
     "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_token TEXT",
     "ALTER TABLE autonomous_replacement_publications ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomous_replacement_one_per_action ON autonomous_replacement_publications(action_id)",
+    """CREATE TABLE IF NOT EXISTS autonomous_replacement_generations (
+        action_id BIGINT PRIMARY KEY REFERENCES autonomous_actions(id),
+        state TEXT NOT NULL DEFAULT 'generating'
+            CHECK (state IN ('generating','completed')),
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        replacement_draft_id BIGINT UNIQUE REFERENCES drafts(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS autonomous_action_id BIGINT REFERENCES autonomous_actions(id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_one_autonomous_action ON drafts(autonomous_action_id) WHERE autonomous_action_id IS NOT NULL",
     """CREATE OR REPLACE FUNCTION reject_autonomous_budget_event_mutation()
        RETURNS TRIGGER AS $$
        BEGIN
