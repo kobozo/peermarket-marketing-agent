@@ -148,7 +148,13 @@ def _allocation(variant_rows: list[dict]) -> dict | None:
     if loser_ids["campaign_id"] != winner_ids["campaign_id"]:
         return None
     total = int(loser["approved_budget_cents"]) + int(winner["approved_budget_cents"])
-    half = total // 2
+    loser_new = total * 40 // 100
+    winner_new = total - loser_new
+    if not (
+        loser_new < int(loser["approved_budget_cents"])
+        and winner_new > int(winner["approved_budget_cents"])
+    ):
+        return None
     return {
         "old_budget_cents": total,
         "new_budget_cents": total,
@@ -159,7 +165,7 @@ def _allocation(variant_rows: list[dict]) -> dict | None:
                 "ad_set_id": loser_ids["ad_set_id"],
                 "ad_id": loser_ids["ad_id"],
                 "old_budget_cents": int(loser["approved_budget_cents"]),
-                "new_budget_cents": half,
+                "new_budget_cents": loser_new,
             },
             "winner": {
                 "campaign_id": winner_ids["campaign_id"],
@@ -167,7 +173,7 @@ def _allocation(variant_rows: list[dict]) -> dict | None:
                 "ad_set_id": winner_ids["ad_set_id"],
                 "ad_id": winner_ids["ad_id"],
                 "old_budget_cents": int(winner["approved_budget_cents"]),
-                "new_budget_cents": total - half,
+                "new_budget_cents": winner_new,
             },
         },
     }

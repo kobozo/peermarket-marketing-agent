@@ -16,6 +16,7 @@ from peermarket_agent.agent.loops.autonomy import (
     run_autonomy_cycle,
 )
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.executor import ExecutionStatus
 from peermarket_agent.db.migrations import run_migrations
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=UTC)
@@ -215,3 +216,93 @@ async def test_newer_autonomy_lifecycle_obsoletes_only_undelivered_older_audits(
     lifecycle = {row["idempotency_key"]: row["status"] for row in rows}
     assert lifecycle["autonomy:audit-decision:shadow"] == "obsolete"
     assert lifecycle["autonomy:audit-decision:succeeded"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_real_qualified_inputs_enqueue_claim_execute_and_audit(engine, monkeypatch):
+    await test_real_single_collected_publication_persists_canonical_input_and_observe(engine)
+    async with engine.begin() as conn:
+        first = await conn.scalar(text("SELECT performance FROM publications WHERE draft_id=156"))
+        first["attribution"]["events"] = [{"event_type": "registration", "event_count": 1}]
+        await conn.execute(
+            text("UPDATE drafts SET metadata=CAST(:metadata AS JSONB) WHERE id=156"),
+            {
+                "metadata": json.dumps(
+                    {
+                        "experiment_id": "experiment-1",
+                        "changed_dimension": "hook",
+                        "audience_profile_key": "declutterers",
+                    }
+                )
+            },
+        )
+        await conn.execute(
+            text(
+                "UPDATE publications SET performance=CAST(:performance AS JSONB) WHERE draft_id=156"
+            ),
+            {"performance": json.dumps(first)},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO drafts(id,action_type_id,channel,language,status,metadata) "
+                "SELECT 157,action_type_id,'meta','MULTI','published',CAST(:metadata AS JSONB) "
+                "FROM drafts WHERE id=156"
+            ),
+            {
+                "metadata": json.dumps(
+                    {
+                        "experiment_id": "experiment-1",
+                        "changed_dimension": "hook",
+                        "audience_profile_key": "declutterers",
+                    }
+                )
+            },
+        )
+        second = json.loads(json.dumps(first))
+        second["attribution"]["events"] = [{"event_type": "registration", "event_count": 10}]
+        second["autonomy_basis"]["external_ids"] = {
+            "campaign_id": "10",
+            "ad_set_id": "21",
+            "ad_id": "31",
+        }
+        await conn.execute(
+            text(
+                "INSERT INTO publications(draft_id,channel,state,external_ids,approved_budget_cents,performance) "
+                "VALUES (157,'meta','active',CAST(:ids AS JSONB),1000,CAST(:performance AS JSONB))"
+            ),
+            {
+                "ids": json.dumps({"campaign_id": "10", "ad_set_id": "21", "ad_id": "31"}),
+                "performance": json.dumps(second),
+            },
+        )
+    await persist_autonomy_inputs(engine)
+    execute = AsyncMock(
+        return_value=SimpleNamespace(
+            status=ExecutionStatus.SUCCEEDED,
+            reason="executed",
+            rollback_result=None,
+            retry_at=None,
+        )
+    )
+    monkeypatch.setattr("peermarket_agent.agent.loops.autonomy.execute_production_claim", execute)
+
+    result = await run_autonomy_cycle(
+        engine, object(), None, _limits(meta_autonomy_shadow=False), now=NOW
+    )
+
+    assert result["queued"] == 1
+    assert result["executed"] == 1
+    execute.assert_awaited_once()
+    async with engine.connect() as conn:
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM autonomous_decisions WHERE kind='reallocate'")
+            )
+            >= 1
+        )
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM slack_outbox WHERE message_kind='autonomy_audit'")
+            )
+            >= 1
+        )
