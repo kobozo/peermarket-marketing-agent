@@ -115,11 +115,12 @@ async def _lease_is_current(engine: AsyncEngine, message: OutboxMessage, *, owne
                 "UPDATE slack_outbox o SET status='obsolete', lease_owner=NULL, "
                 "lease_expires_at=NULL, last_failure_category='draft_not_eligible' "
                 "WHERE o.id=:id AND o.lease_owner=:owner AND o.status IN ('pending','failed') "
-                "AND o.message_kind <> 'autonomy_audit' "
-                "AND NOT EXISTS (SELECT 1 FROM drafts d WHERE d.id=o.draft_id "
-                "AND d.status='queued' AND NOT EXISTS (SELECT 1 FROM drafts newer "
-                "WHERE newer.root_draft_id=d.root_draft_id "
-                "AND newer.revision_number>d.revision_number))"
+                "AND ((o.message_kind='autonomy_audit' AND EXISTS (SELECT 1 FROM slack_outbox newer "
+                "WHERE newer.draft_id=o.draft_id AND newer.message_kind='autonomy_audit' "
+                "AND newer.id>o.id)) OR (o.message_kind<>'autonomy_audit' AND NOT EXISTS "
+                "(SELECT 1 FROM drafts d WHERE d.id=o.draft_id AND d.status='queued' "
+                "AND NOT EXISTS (SELECT 1 FROM drafts newer WHERE newer.root_draft_id=d.root_draft_id "
+                "AND newer.revision_number>d.revision_number))))"
             ),
             {"id": message.id, "owner": owner},
         )
