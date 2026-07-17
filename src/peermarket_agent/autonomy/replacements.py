@@ -15,6 +15,7 @@ from peermarket_agent._json_parse import parse_claude_json
 from peermarket_agent.agent.cli_draft import recent_relevant_learnings
 from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
 from peermarket_agent.brand_quality import BRAND_SCORE_THRESHOLD, score_draft
+from peermarket_agent.action_contracts import validate_meta
 from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.prompts.brand_voice import load_brand_voice
@@ -22,17 +23,12 @@ from peermarket_agent.prompts.meta_ad_creative import (
     AUDIENCE_PROFILES,
     _cost_cents,
     build_replacement_user_prompt,
-    build_system_prompt,
+    build_replacement_system_prompt,
 )
 
 LOCALES = ("NL", "FR", "EN")
 DIMENSIONS = {"hook", "copy", "visual", "audience"}
 _LOCALE_MARKER = re.compile(r"(^|\s)(?:\[(?:NL|FR|EN)\]|(?:NL|FR|EN):)(?:\s|$)", re.I)
-_LANGUAGE_SIGNALS = {
-    "NL": re.compile(r"\b(?:de|het|een|voor|van|met|je|jouw|veilig|buurt|koop|verkoop|vertrouwde|buren|echte|mensen|dichtbij)\b", re.I),
-    "FR": re.compile(r"\b(?:le|la|les|des|une|pour|avec|vous|votre|près|achetez|vendez|sécurité|sereinement|voisins|personnes|fiables|localement)\b", re.I),
-    "EN": re.compile(r"\b(?:the|a|an|for|with|you|your|safe|safely|nearby|people|buy|sell|trusted|verified|local)\b", re.I),
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,13 +135,6 @@ def _validate_native(locale: str, item: ReplacementLocale) -> None:
     complete = item.complete_text()
     if _LOCALE_MARKER.search(complete):
         raise ValueError("replacement contains a literal locale marker")
-    # Conservative complete-field signal. CTA labels are Meta platform tokens and are
-    # reviewed semantically by the native-quality gate below.
-    for field in ("hook", "body", "headline", "description"):
-        if not _LANGUAGE_SIGNALS[locale].search(getattr(item, field)):
-            raise ValueError(
-                f"{locale} replacement {field} lacks native-language validation signals"
-            )
 
 
 async def _review_native_quality(
@@ -258,6 +247,17 @@ def _validate_locale(payload: dict, source: ReplacementSource, locale: str) -> R
         image_prompt=payload["image_prompt"],
         asset_path=payload["asset_path"],
     )
+    validate_meta(
+        {
+            "primary_text": item.primary_text,
+            "headline": item.headline,
+            "description": item.description,
+            "cta_label": item.cta_label,
+            "audience_profile_key": item.audience_profile_key,
+            "suggested_daily_budget_eur": source.daily_budget_eur,
+        },
+        allowed_audiences=set(AUDIENCE_PROFILES),
+    )
     _validate_native(locale, item)
     return item
 
@@ -339,7 +339,7 @@ async def build_replacement(
             else ()
         )
         response = await claude.complete(
-            system=build_system_prompt(brand_voice),
+            system=build_replacement_system_prompt(brand_voice),
             user=build_replacement_user_prompt(
                 locale=locale,
                 changed_dimension=source.changed_dimension,

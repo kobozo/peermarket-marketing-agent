@@ -183,7 +183,10 @@ async def claim_next_action(
                     text(
                         "WITH candidate AS ("
                         " SELECT id FROM autonomous_actions"
-                        " WHERE status='pending' OR (status='leased' AND lease_expires_at <= NOW())"
+                        " WHERE status='pending'"
+                        " OR (status='leased' AND lease_expires_at <= NOW())"
+                        " OR (status='reconciliation_required' AND "
+                        "     (lease_expires_at IS NULL OR lease_expires_at <= NOW()))"
                         " ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1"
                         ") UPDATE autonomous_actions AS action SET status='leased', lease_owner=:worker,"
                         " lease_token=:token, lease_expires_at=NOW()+make_interval(secs => :seconds),"
@@ -387,6 +390,67 @@ async def block_campaign_for_reconciliation(
             },
         )
         return result.rowcount == 1
+
+
+async def require_reconciliation(
+    engine: AsyncEngine,
+    claim: ClaimedAction,
+    *,
+    failure_category: str,
+    failure_message: str | None = None,
+) -> bool:
+    """Fence a live leased/executing owner into reconciliation without stale overwrite."""
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text(
+                "UPDATE autonomous_actions SET status='reconciliation_required', "
+                "failure_category=:category, failure_message=:message, updated_at=NOW() "
+                "WHERE id=:id AND status IN ('leased','executing') AND lease_owner=:owner "
+                "AND lease_token=:token AND lease_expires_at>NOW()"
+            ),
+            {
+                "category": _sanitize_category(failure_category),
+                "message": _sanitize_message(failure_message),
+                "id": claim.id,
+                "owner": claim.lease_owner,
+                "token": claim.lease_token,
+            },
+        )
+        return result.rowcount == 1
+
+
+async def renew_replacement_leases(
+    engine: AsyncEngine,
+    claim: ClaimedAction,
+    *,
+    publication_id: int,
+    publication_token: str,
+    lease_seconds: int = 300,
+) -> bool:
+    """Atomically renew action and publication leases for the same fenced owner."""
+    async with engine.begin() as conn:
+        action = await conn.execute(
+            text(
+                "UPDATE autonomous_actions SET lease_expires_at=NOW()+make_interval(secs=>:seconds), "
+                "updated_at=NOW() WHERE id=:id AND status IN ('leased','executing') "
+                "AND lease_owner=:owner AND lease_token=:token AND lease_expires_at>NOW()"
+            ),
+            {"seconds": lease_seconds, "id": claim.id, "owner": claim.lease_owner,
+             "token": claim.lease_token},
+        )
+        attempt = await conn.execute(
+            text(
+                "UPDATE autonomous_replacement_publications SET "
+                "lease_expires_at=NOW()+make_interval(secs=>:seconds), updated_at=NOW() "
+                "WHERE id=:id AND lease_owner=:owner AND lease_token=:token "
+                "AND lease_expires_at>NOW() AND state IN ('creating','reconciliation_required')"
+            ),
+            {"seconds": lease_seconds, "id": publication_id, "owner": claim.lease_owner,
+             "token": publication_token},
+        )
+        if action.rowcount != 1 or attempt.rowcount != 1:
+            raise RuntimeError("replacement lease ownership was lost")
+    return True
 
 
 async def record_budget_event(

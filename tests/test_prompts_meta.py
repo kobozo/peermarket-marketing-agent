@@ -7,10 +7,28 @@ import pytest
 
 from peermarket_agent.claude import ClaudeResponse
 from peermarket_agent.prompts.meta_ad_creative import (
+    build_replacement_system_prompt,
+    build_replacement_user_prompt,
     AUDIENCE_PROFILES,
     generate_meta_ad_creative,
     pick_audience,
 )
+
+
+def test_replacement_prompt_has_one_exact_eleven_field_schema():
+    system = build_replacement_system_prompt("brand")
+    user = build_replacement_user_prompt(
+        locale="NL", changed_dimension="hook", source={}, learnings=()
+    )
+    assembled = system + "\n" + user
+    assert "exactly five fields" not in assembled
+    assert "primary_text" not in assembled
+    for field in (
+        "locale", "changed_dimension", "hook", "body", "headline", "description",
+        "cta_label", "audience_profile_key", "image_prompt", "asset_path",
+        "suggested_daily_budget_eur",
+    ):
+        assert assembled.count(f'"{field}"') == 1
 
 _GOOD_PAYLOAD = (
     "{"

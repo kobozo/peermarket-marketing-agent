@@ -188,7 +188,7 @@ async def test_expired_lease_is_recovered_with_a_new_token(engine):
     assert await begin_execution(engine, reclaimed) is True
 
 
-async def test_worker_crash_during_execution_requires_reconciliation(engine):
+async def test_worker_crash_during_execution_is_reclaimed_only_for_reconciliation(engine):
     queued = await enqueue_action(engine, decision())
     stale = await claim_next_action(engine, "crashed-worker", lease_seconds=60)
     assert stale is not None and await begin_execution(engine, stale)
@@ -200,10 +200,14 @@ async def test_worker_crash_during_execution_requires_reconciliation(engine):
             {"id": stale.id},
         )
 
-    assert await claim_next_action(engine, "replacement", lease_seconds=60) is None
+    reclaimed = await claim_next_action(engine, "replacement", lease_seconds=60)
+    assert reclaimed is not None
+    assert reclaimed.id == stale.id
+    assert reclaimed.lease_token != stale.lease_token
+    assert await begin_execution(engine, reclaimed)
     row = (await campaign_history(engine, "123"))[0]
     assert row["id"] == queued.id
-    assert row["status"] == "reconciliation_required"
+    assert row["status"] == "executing"
     assert row["failure_category"] == "worker_crash_during_execution"
     assert "crashed-worker" not in (row["failure_message"] or "")
     assert (await enqueue_action(engine, decision("later"))).created is False

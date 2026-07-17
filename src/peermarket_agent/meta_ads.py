@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -408,8 +409,18 @@ def _sync_create_bundle_resource(
     creative_key = f"creative_id:{locale}"
     ad_key = f"ad_id:{locale}"
     if creative.image_bytes and image_key not in progress:
+        image_name = (
+            f"{name} {locale} image "
+            f"{hashlib.sha256(creative.image_bytes).hexdigest()[:20]}"
+        )
+        for candidate in account.get_ad_images(fields=["hash", "name"]):
+            if candidate.get("name") == image_name:
+                return image_key, str(candidate["hash"])
         image = account.create_ad_image(
-            params={"bytes": base64.b64encode(creative.image_bytes).decode("ascii")},
+            params={
+                "bytes": base64.b64encode(creative.image_bytes).decode("ascii"),
+                "name": image_name,
+            },
             fields=["hash"],
         )
         return image_key, image["hash"]

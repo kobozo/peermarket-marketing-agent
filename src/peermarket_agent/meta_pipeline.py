@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from peermarket_agent.autonomy.contracts import DecisionKind
 from peermarket_agent.autonomy.replacements import ReplacementDraft
-from peermarket_agent.autonomy.store import ClaimedAction
+from peermarket_agent.autonomy.store import ClaimedAction, require_reconciliation
 from peermarket_agent.campaign_urls import build_campaign_url
 from peermarket_agent.config import Settings
 from peermarket_agent.meta_ads import (
@@ -333,9 +333,10 @@ async def publish_replacement_paused(
                 ),
                 {"id": attempt["id"], "token": attempt_token, "ids": json.dumps(recovered_ids)},
             )
-            await conn.execute(text(
-                "UPDATE autonomous_actions SET status='reconciliation_required', updated_at=NOW() WHERE id=:id"
-            ), {"id": claim.id})
+        if not await require_reconciliation(
+            engine, claim, failure_category="meta_bundle_creation"
+        ):
+            raise RuntimeError("replacement action ownership was lost") from exc
         raise
     try:
         observed = await get_meta_replacement_bundle_statuses(
@@ -357,9 +358,10 @@ async def publish_replacement_paused(
                 "failure_category='post_create_validation', lease_owner=NULL, lease_token=NULL, "
                 "lease_expires_at=NULL, updated_at=NOW() WHERE id=:id AND lease_token=:token"
             ), {"id": attempt["id"], "token": attempt_token})
-            await conn.execute(text(
-                "UPDATE autonomous_actions SET status='reconciliation_required', updated_at=NOW() WHERE id=:id"
-            ), {"id": claim.id})
+        if not await require_reconciliation(
+            engine, claim, failure_category="post_create_validation"
+        ):
+            raise RuntimeError("replacement action ownership was lost")
         raise
     await persist_progress("ads_manager_url", result.ads_manager_url)
     async with engine.begin() as conn:

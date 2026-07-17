@@ -41,17 +41,17 @@ def _source(dimension: str) -> ReplacementSource:
             "NL": _locale(
                 "NL",
                 "Koop veilig dichtbij",
-                "Ontdek de marktplaats voor geverifieerde mensen in jouw buurt.",
+                "Ontdek de marktplaats voor geverifieerde mensen in jouw buurt. " * 3,
             ),
             "FR": _locale(
                 "FR",
                 "Achetez en sécurité",
-                "Découvrez la place de marché des personnes vérifiées près de chez vous.",
+                "Découvrez la place de marché des personnes vérifiées près de chez vous. " * 3,
             ),
             "EN": _locale(
                 "EN",
                 "Buy safely nearby",
-                "Discover the marketplace for verified people in your neighbourhood.",
+                "Discover the marketplace for verified people in your neighbourhood. " * 3,
             ),
         },
         audience_profile_key="declutterers",
@@ -90,6 +90,8 @@ def _response(source: ReplacementSource, locale: str, **changes: str) -> ClaudeR
         "suggested_daily_budget_eur": source.daily_budget_eur,
     }
     payload.update(changes)
+    if len(payload["hook"] + "\n\n" + payload["body"]) < 125:
+        payload["body"] = (payload["body"] + " ") * 3
     if source.changed_dimension == "copy" and "body" in changes:
         payload.update(
             {
@@ -238,6 +240,53 @@ async def test_native_reviewer_rejects_literal_translation_flag():
 
 
 @pytest.mark.asyncio
+async def test_native_copy_without_language_stopwords_reaches_structured_review():
+    source = _source("hook")
+    fake = AsyncMock()
+    fake.complete.side_effect = [
+        _response(source, "NL", hook="Betrouwbaar buurtplatform"),
+        _quality("NL"),
+        _response(source, "FR", hook="Plateforme communautaire fiable"),
+        _quality("FR"),
+        _response(source, "EN", hook="Trusted neighbourhood marketplace"),
+        _quality("EN"),
+    ]
+    draft = await build_replacement(
+        AsyncMock(), fake, source, _decision(source), persist=lambda _: 99
+    )
+    assert draft.locales["NL"].hook == "Betrouwbaar buurtplatform"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"headline": "x" * 41}, "headline"),
+        ({"description": "x" * 41}, "description"),
+        ({"body": "x" * 301}, "primary_text"),
+        ({"body": "Veilig kopen — zonder zorgen"}, "em-dash"),
+        ({"cta_label": "Apply Now"}, "cta_label"),
+    ],
+)
+async def test_complete_locale_uses_canonical_meta_validation(changes, message):
+    source = _source("copy")
+    fake = AsyncMock()
+    response = _response(
+        source,
+        "NL",
+        body="Vind geverifieerde kopers in je buurt en verkoop met vertrouwen. " * 3,
+    )
+    payload = __import__("json").loads(response.text)
+    payload.update(changes)
+    if "body" not in changes:
+        payload["body"] = "Vind geverifieerde kopers in je buurt en verkoop met vertrouwen. " * 3
+    response = ClaudeResponse(__import__("json").dumps(payload), 10, 20, "test", "end_turn")
+    fake.complete.side_effect = [response]
+    with pytest.raises(ValueError, match=message):
+        await build_replacement(AsyncMock(), fake, source, _decision(source), persist=lambda _: 99)
+
+
+@pytest.mark.asyncio
 async def test_rejects_literal_translation_or_wrong_language_before_persistence():
     source = _source("copy")
     dutch = "Vind geverifieerde kopers in je buurt en verkoop met vertrouwen."
@@ -246,6 +295,7 @@ async def test_rejects_literal_translation_or_wrong_language_before_persistence(
         _response(source, "NL", body=dutch),
         _quality("NL"),
         _response(source, "FR", body=dutch),
+        _quality("FR", exact_language=False),
     ]
     persisted = AsyncMock()
     with pytest.raises(ValueError, match="native|translation|language"):
