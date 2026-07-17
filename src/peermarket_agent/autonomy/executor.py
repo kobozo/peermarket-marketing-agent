@@ -48,6 +48,7 @@ from peermarket_agent.meta_ads import (
     pause_meta_replacement_bundle,
     set_meta_ad_status,
     set_meta_adset_daily_budget,
+    set_meta_resource_status,
 )
 from peermarket_agent.meta_pipeline import publish_replacement_paused
 
@@ -296,27 +297,31 @@ class MetaExecutionAdapter:
     ) -> None:
         result = self._hook_results[experiment_id]
         first = next(iter(result.variants.values()))
-        await _renew_action(engine, claim)
-        before = await self.read_hook_experiment(experiment_id)
+
+        async def fence() -> dict[str, Any]:
+            await _renew_hook_publication_lease(engine, claim)
+            return await self.read_hook_experiment(experiment_id)
+
+        before = await fence()
         if any(
             state[f"ad:{locale}"].get("status") != "PAUSED"
             for state in before.values()
             for locale in ("NL", "FR", "EN")
         ):
             raise RuntimeError("hook_experiment_activation_precondition_changed")
-        await activate_meta_ad(
-            self.config,
-            {
-                "campaign_id": first.campaign_id,
-                "ad_set_id": first.ad_set_id,
-                "ad_id": first.ad_ids["NL"],
-            },
-        )
+        await set_meta_resource_status(self.config, "campaign", first.campaign_id, "ACTIVE")
+        adset_state = await fence()
+        if any(state["ad_set"].get("status") != "PAUSED" for state in adset_state.values()):
+            raise RuntimeError("hook_experiment_activation_precondition_changed")
+        await set_meta_resource_status(self.config, "ad_set", first.ad_set_id, "ACTIVE")
+        first_ad_state = await fence()
+        if first_ad_state[next(iter(first_ad_state))]["ad:NL"].get("status") != "PAUSED":
+            raise RuntimeError("hook_experiment_activation_precondition_changed")
+        await set_meta_ad_status(self.config, first.ad_ids["NL"], "ACTIVE")
         for bundle in result.variants.values():
             for _locale, ad_id in bundle.ad_ids.items():
                 if ad_id != first.ad_ids["NL"]:
-                    await _renew_action(engine, claim)
-                    observed = await self.read_hook_experiment(experiment_id)
+                    observed = await fence()
                     target = next(
                         state[f"ad:{locale}"]
                         for variant_id, state in observed.items()
@@ -358,6 +363,7 @@ class MetaExecutionAdapter:
             {key.rsplit(":ad_id:", 1)[0] for key in progress if ":ad_id:" in key}, reverse=True
         )
         for prefix in prefixes:
+            await _renew_hook_publication_lease(engine, claim)
             ad_ids = {
                 locale: progress[f"{prefix}:ad_id:{locale}"]
                 for locale in ("NL", "FR", "EN")
@@ -621,6 +627,21 @@ async def _renew_action(engine: Any, claim: Any, seconds: int = 300) -> None:
         )
         if result.rowcount != 1:
             raise RuntimeError("execution lease ownership was lost")
+
+
+async def _renew_hook_publication_lease(engine: Any, claim: Any) -> None:
+    await _renew_action(engine, claim)
+    async with engine.connect() as conn:
+        owned = await conn.scalar(
+            text(
+                "SELECT 1 FROM autonomous_replacement_publications "
+                "WHERE action_id=:id AND lease_owner=:owner AND lease_token=:token "
+                "AND lease_expires_at>NOW()"
+            ),
+            {"id": claim.id, "owner": claim.lease_owner, "token": claim.lease_token},
+        )
+    if owned != 1:
+        raise RuntimeError("replacement publication lease ownership was lost")
 
 
 async def _external(

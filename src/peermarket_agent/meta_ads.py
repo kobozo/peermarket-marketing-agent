@@ -1134,6 +1134,31 @@ async def set_meta_ad_status(config: MetaConfig, ad_id: str, status: str) -> dic
     return await asyncio.to_thread(_sync_set_ad_status, config, validated_id, status)
 
 
+def _sync_set_meta_resource_status(
+    config: MetaConfig, resource_kind: str, resource_id: str, status: str
+) -> dict[str, str]:
+    _ensure_enabled(config)
+    api = _init_api(config)
+    resource_type = {"campaign": Campaign, "ad_set": AdSet}[resource_kind]
+    resource = resource_type(resource_id, api=api)
+    resource.api_update(params={"status": status})
+    return dict(resource.api_get(fields=["status", "effective_status"]))
+
+
+async def set_meta_resource_status(
+    config: MetaConfig, resource_kind: str, resource_id: str, status: str
+) -> dict[str, str]:
+    """Set one campaign or ad-set status through one SDK mutation."""
+    if resource_kind not in {"campaign", "ad_set"}:
+        raise ValueError("resource_kind must be campaign or ad_set")
+    validated_id = _validate_resource_id(resource_id, f"{resource_kind}_id")
+    if status not in {"ACTIVE", "PAUSED"}:
+        raise ValueError("status must be ACTIVE or PAUSED")
+    return await asyncio.to_thread(
+        _sync_set_meta_resource_status, config, resource_kind, validated_id, status
+    )
+
+
 def _normalized_daily_budget(observed: dict) -> dict[str, int]:
     value = observed.get("daily_budget")
     if isinstance(value, bool):

@@ -93,3 +93,11 @@ Combined clean-DB command:
 `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_creation_and_cleanup_refuse_transferred_replacement_lease_before_sdk or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
 
 Result: `8 passed, 85 deselected in 5.83s`. Ruff format/check and `git diff --check` passed.
+
+## Per-mutation activation and cleanup fences
+
+The former combined campaign/ad-set/first-ad activation was split into three single-resource SDK operations. Immediately before each, the adapter renews the action, verifies exact replacement-publication owner/token/expiry, and rereads the complete live creative/landing/locale hierarchy. Every remaining ad write uses the same fence. Reverse cleanup likewise renews and revalidates both leases before each variant pause.
+
+PostgreSQL fault injection now steals leases at the exact campaign→ad-set boundary, ad-set→first-ad boundary, a later-ad boundary, and between reverse variant pauses. Each case proves no later stale write occurs and finalization remains fail-closed.
+
+Combined command result: `11 passed, 85 deselected in 7.28s`. Ruff format/check and `git diff --check` passed.

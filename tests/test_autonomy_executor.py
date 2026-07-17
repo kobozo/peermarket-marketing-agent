@@ -878,7 +878,17 @@ class _PersistedHookBuilder:
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "rate_limit", "creative_drift", "lease_loss", "cleanup_failure"]
+    "failure",
+    [
+        None,
+        "rate_limit",
+        "creative_drift",
+        "lease_loss",
+        "campaign_adset_loss",
+        "adset_first_loss",
+        "cleanup_failure",
+        "cleanup_lease_loss",
+    ],
 )
 @pytest.mark.asyncio
 async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3(
@@ -891,6 +901,8 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
     source_paused = False
     cleanup_calls = []
     rate_injected = False
+    campaign_active = False
+    adset_active = False
 
     def create_resource(**kwargs):
         nonlocal rate_injected
@@ -902,7 +914,7 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         variant = name.split()[-1]
         if f"creative_id:{locale}" not in progress:
             if (
-                failure in {"rate_limit", "cleanup_failure"}
+                failure in {"rate_limit", "cleanup_failure", "cleanup_lease_loss"}
                 and len(created_payloads) == 3
                 and not rate_injected
             ):
@@ -920,12 +932,12 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
             raise MetaAdsError("creative drift", phase="verify_bundle")
         result = {
             "campaign": {
-                "status": "ACTIVE" if active_ads else "PAUSED",
-                "effective_status": "ACTIVE" if active_ads else "PAUSED",
+                "status": "ACTIVE" if campaign_active else "PAUSED",
+                "effective_status": "ACTIVE" if campaign_active else "PAUSED",
             },
             "ad_set": {
-                "status": "ACTIVE" if active_ads else "PAUSED",
-                "effective_status": "ACTIVE" if active_ads else "PAUSED",
+                "status": "ACTIVE" if adset_active else "PAUSED",
+                "effective_status": "ACTIVE" if adset_active else "PAUSED",
                 "daily_budget": 1000,
             },
         }
@@ -950,6 +962,22 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
         active_ads.add(ids["ad_id"])
         return {}
 
+    async def set_resource(config, kind, resource_id, status):
+        nonlocal campaign_active, adset_active
+        if kind == "campaign":
+            campaign_active = True
+            steal = failure == "campaign_adset_loss"
+        else:
+            adset_active = True
+            steal = failure == "adset_first_loss"
+        if steal:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE autonomous_actions SET lease_token='stolen-parent' WHERE id=:id"),
+                    {"id": claim.id},
+                )
+        return {"status": status}
+
     async def set_status(config, ad_id, status):
         nonlocal source_paused
         if ad_id == "31":
@@ -966,6 +994,14 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
 
     async def pause_bundle(config, campaign_id, ad_set_id, ad_ids):
         cleanup_calls.append(tuple(ad_ids.values()))
+        if failure == "cleanup_lease_loss" and len(cleanup_calls) == 1:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE autonomous_replacement_publications SET lease_token='cleanup-stolen' WHERE action_id=:id"
+                    ),
+                    {"id": claim.id},
+                )
         return {"ad": "pause failed"} if failure == "cleanup_failure" else {}
 
     monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_resource)
@@ -975,6 +1011,7 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
     monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_ad_statuses", statuses)
     monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_budget_state", budget)
     monkeypatch.setattr("peermarket_agent.autonomy.executor.activate_meta_ad", activate)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_resource_status", set_resource)
     monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_ad_status", set_status)
     monkeypatch.setattr(
         "peermarket_agent.autonomy.executor.pause_meta_replacement_bundle", pause_bundle
@@ -998,22 +1035,22 @@ async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exa
     )
     if failure is None:
         assert result.status is ExecutionStatus.SUCCEEDED
-    elif failure == "lease_loss":
+    elif failure in {"lease_loss", "campaign_adset_loss", "adset_first_loss"}:
         assert result.status is ExecutionStatus.FAILED
         assert result.reason == "lease_lost"
     else:
         assert result.status is ExecutionStatus.RECONCILIATION_REQUIRED
     expected_creatives = (
         9
-        if failure in {None, "lease_loss"}
+        if failure in {None, "lease_loss", "campaign_adset_loss", "adset_first_loss"}
         else 3
-        if failure in {"rate_limit", "cleanup_failure"}
+        if failure in {"rate_limit", "cleanup_failure", "cleanup_lease_loss"}
         else 9
     )
     assert len(created_payloads) == expected_creatives
     if failure is not None:
         assert source_paused is False
-        if failure != "lease_loss":
+        if failure not in {"lease_loss", "campaign_adset_loss", "adset_first_loss"}:
             assert cleanup_calls
         if failure == "rate_limit":
             async with engine.begin() as conn:
