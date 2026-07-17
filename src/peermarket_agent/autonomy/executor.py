@@ -906,7 +906,7 @@ def _policy_reason(
         or snapshot.get("complete") is not True
         or snapshot.get("attribution_complete") is not True
         or snapshot.get("delivery_state") != decision.evidence.get("delivery_state")
-        or snapshot.get("variants") != decision.evidence.get("variants")
+        or _plain(snapshot.get("variants")) != _plain(decision.evidence.get("variants"))
     ):
         return "stale_snapshot"
     budget = publication.get("approved_budget_cents")

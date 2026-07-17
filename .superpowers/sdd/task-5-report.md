@@ -48,3 +48,20 @@ Remediation checks:
 - Success now requires a post-mutation live source reread satisfying the exact paused-source contract; otherwise the matrix is compensated and reconciliation remains fail-closed.
 
 Fixwave verification: Ruff and Python compilation passed; hook matrix tests `4 passed`; executor shadow-boundary tests `2 passed`; `git diff --check` passed. No external or deployment mutation occurred.
+
+## PostgreSQL production-path coverage
+
+Added a real PostgreSQL `execute_claim` test with a canonical persisted REPLACE decision, claimed action lease, all nine append-only experiment rows, a real `MetaExecutionAdapter`, a generated replacement draft row, and the real `_replace` hook branch. Only Meta SDK-facing functions are replaced.
+
+The test proves that:
+
+- all nine creative payloads originate from persisted `exp:01`/`:02`/`:03` NL/FR/EN bundles and never from the ordinary replacement draft copy;
+- exactly nine unique ads activate and the source pauses;
+- every creative/ad ID is immediately present in fenced `autonomous_replacement_publications.progress`;
+- the action finishes `succeeded` with all three variants in persisted `after_state`.
+
+Exact focused command:
+
+`AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_autonomy_executor.py -k 'execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3 or hook_experiment_adapter_shadow or shadow_mode_is_impossible'`
+
+Result: `3 passed, 85 deselected`. Ruff and `git diff --check` also passed. Existing adapter-level PostgreSQL-independent tests continue to cover durable complete retry without duplicate SDK calls, rate-limit interruption, and child-resource drift; the saga uses the same fenced progress representation exercised by the new PostgreSQL success path.

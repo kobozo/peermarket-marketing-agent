@@ -10,7 +10,14 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from peermarket_agent.autonomy.contracts import ActionStatus, DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.contracts import (
+    ActionStatus,
+    DecisionKind,
+    FrozenDecision,
+    HookExperiment,
+    HookVariant,
+    thaw_json,
+)
 from peermarket_agent.autonomy.executor import (
     ExecutionStatus,
     MetaExecutionAdapter,
@@ -21,6 +28,7 @@ from peermarket_agent.autonomy.executor import (
     execute_claim,
 )
 from peermarket_agent.autonomy.hook_experiments import build_hook_experiment
+from peermarket_agent.autonomy.replacements import ReplacementDraft, ReplacementLocale
 from peermarket_agent.autonomy.snapshot import (
     build_autonomy_basis,
     build_autonomy_snapshot,
@@ -31,6 +39,7 @@ from peermarket_agent.autonomy.store import (
     claim_next_action,
     enqueue_action,
     finish_action,
+    record_experiment,
 )
 from peermarket_agent.db.migrations import run_migrations
 
@@ -791,6 +800,204 @@ async def _public_replace_claim(engine):
     return await claim_next_action(engine, "worker", lease_seconds=300)
 
 
+def _persisted_test_experiment() -> HookExperiment:
+    fixed = {
+        "audience": "declutterers",
+        "optimization": "LINK_CLICKS",
+        "format": "single_image",
+        "visual": "asset",
+        "delivery": "lowest_cost",
+    }
+    variants = []
+    for number in (1, 2, 3):
+        bundles = {
+            locale: {
+                "hook": f"hook-{number}-{locale}",
+                "body": f"body-{locale}",
+                "headline": f"headline-{locale}",
+                "description": f"description-{locale}",
+                "cta_label": "Learn More",
+            }
+            for locale in ("NL", "FR", "EN")
+        }
+        variants.append(
+            HookVariant(
+                f"exp:{number:02}",
+                "exp",
+                "10",
+                "20",
+                "https://peermarket.eu/",
+                "hook",
+                fixed,
+                bundles,
+            )
+        )
+    return HookExperiment(
+        "exp", "10", "20", "https://peermarket.eu/", "hook", fixed, tuple(variants)
+    )
+
+
+class _PersistedHookBuilder:
+    async def build(self, *, engine, source, **kwargs):
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO drafts(id,action_type_id,channel,language,status) SELECT 100,action_type_id,'meta','MULTI','approved' FROM drafts WHERE id=1 ON CONFLICT (id) DO NOTHING"
+                )
+            )
+        locales = {
+            locale: ReplacementLocale(
+                locale,
+                "ordinary-hook",
+                "ordinary-body",
+                "ordinary-head",
+                "ordinary-desc",
+                "Learn More",
+                "declutterers",
+                "prompt",
+                "/tmp/asset",
+            )
+            for locale in ("NL", "FR", "EN")
+        }
+        return ReplacementDraft(
+            100,
+            locales,
+            "hook",
+            1,
+            "10",
+            "exp",
+            "declutterers",
+            "prompt",
+            "/tmp/asset",
+            10,
+            "https://peermarket.eu/",
+            0,
+            {locale: 90 for locale in locales},
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_claim_persisted_hook_experiment_creates_and_activates_exact_3x3(
+    engine, monkeypatch
+):
+    claim = await _public_replace_claim(engine)
+    await record_experiment(engine, _persisted_test_experiment())
+    created_payloads = []
+    active_ads = set()
+    source_paused = False
+
+    def create_resource(**kwargs):
+        progress, locale, name = kwargs["progress"], kwargs["locale"], kwargs["name"]
+        if "campaign_id" not in progress:
+            return "campaign_id", "campaign-new"
+        if "ad_set_id" not in progress:
+            return "ad_set_id", "adset-new"
+        variant = name.split()[-1]
+        if f"creative_id:{locale}" not in progress:
+            created_payloads.append((variant, locale, kwargs["creative"].primary_text))
+            return f"creative_id:{locale}", f"cr-{variant}-{locale}"
+        return f"ad_id:{locale}", f"ad-{variant}-{locale}"
+
+    async def bundle_status(config, campaign_id, ad_set_id, ad_ids, **identity):
+        result = {
+            "campaign": {
+                "status": "ACTIVE" if active_ads else "PAUSED",
+                "effective_status": "ACTIVE" if active_ads else "PAUSED",
+            },
+            "ad_set": {
+                "status": "ACTIVE" if active_ads else "PAUSED",
+                "effective_status": "ACTIVE" if active_ads else "PAUSED",
+                "daily_budget": 1000,
+            },
+        }
+        for locale, ad_id in ad_ids.items():
+            status = "ACTIVE" if ad_id in active_ads else "PAUSED"
+            result[f"ad:{locale}"] = {"status": status, "effective_status": status}
+            result[f"creative:{locale}"] = {"object_story_spec": {}}
+        return result
+
+    async def statuses(config, ids):
+        status = "PAUSED" if source_paused else "ACTIVE"
+        return {
+            "campaign": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+            "ad_set": {"status": "ACTIVE", "effective_status": "ACTIVE"},
+            "ad": {"status": status, "effective_status": status},
+        }
+
+    async def budget(config, ids):
+        return {"ad_set": {"daily_budget": 1000}}
+
+    async def activate(config, ids):
+        active_ads.add(ids["ad_id"])
+        return {}
+
+    async def set_status(config, ad_id, status):
+        nonlocal source_paused
+        if ad_id == "31":
+            source_paused = status == "PAUSED"
+        elif status == "ACTIVE":
+            active_ads.add(ad_id)
+        return {"status": status}
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_resource)
+    monkeypatch.setattr(
+        "peermarket_agent.autonomy.executor.get_meta_replacement_bundle_statuses", bundle_status
+    )
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_ad_statuses", statuses)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.get_meta_budget_state", budget)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.activate_meta_ad", activate)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor.set_meta_ad_status", set_status)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+    settings = _settings(
+        meta_autonomy_experiment_id="exp",
+        meta_app_id="app",
+        meta_app_secret="secret",
+        meta_system_user_token="token",
+        meta_ad_account_id="act_1",
+        meta_page_id="page",
+    )
+    result = await execute_claim(
+        engine,
+        settings,
+        MetaExecutionAdapter(settings, object()),
+        _PersistedHookBuilder(),
+        claim,
+        NOW,
+    )
+    assert result.status is ExecutionStatus.SUCCEEDED
+    assert len(created_payloads) == 9
+    assert {item[:2] for item in created_payloads} == {
+        (f"exp:{number:02}", locale) for number in (1, 2, 3) for locale in ("NL", "FR", "EN")
+    }
+    assert all(
+        text.startswith("hook-") and "ordinary-hook" not in text for _, _, text in created_payloads
+    )
+    assert len(active_ads) == 9 and source_paused
+    async with engine.connect() as conn:
+        action = (
+            (
+                await conn.execute(
+                    text("SELECT status,after_state FROM autonomous_actions WHERE id=:id"),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        progress = await conn.scalar(
+            text("SELECT progress FROM autonomous_replacement_publications WHERE action_id=:id"),
+            {"id": claim.id},
+        )
+    assert action["status"] == "succeeded"
+    assert set(action["after_state"]["hook_experiment"]) == {"exp:01", "exp:02", "exp:03"}
+    assert all(
+        progress[f"variant:exp:{number:02}:{kind}_id:{locale}"]
+        for number in (1, 2, 3)
+        for kind in ("creative", "ad")
+        for locale in ("NL", "FR", "EN")
+    )
+
+
 @pytest.mark.asyncio
 async def test_public_replace_source_pause_unverified_rollback_persists_exact_audit(
     engine, monkeypatch
@@ -1141,7 +1348,7 @@ def _policy_limits():
 
 
 async def _canonical_policy_replace(engine, **limit_overrides):
-    source = _replace_claim().decision.evidence["source"]
+    source = thaw_json(_replace_claim().decision.evidence["source"])
     performance = {
         "meta": {
             "latest": {
