@@ -82,8 +82,9 @@ async def test_hook_experiment_adapter_shadow_mode_never_reaches_meta_matrix(mon
             experiment=experiment,
             daily_budget_eur=10,
             audience_profile_key="declutterers",
-            progress=None,
-            persist_progress=AsyncMock(),
+            engine=None,
+            claim=None,
+            draft=None,
         )
     meta.assert_not_awaited()
 

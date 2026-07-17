@@ -23,3 +23,18 @@ The new tests initially had no three-variant adapter. After the first implementa
 The matrix tests exercise the production async adapter while faking only `_sync_create_bundle_resource`, the external SDK boundary. They verify one parent hierarchy, all nine children, duplicate-free durable retry, immediate rate-limit propagation, and cross-variant resource-reuse drift rejection. The broader three-file clean-DB run progressed through all Meta adapter tests but encountered failures in the existing database-backed executor section; the focused Task 5 paths are green.
 
 No Meta call, deployment, workflow dispatch, or GitHub variable change was performed.
+
+## Saga-integration remediation
+
+Following review rejection, the production replacement path now recognizes the configured frozen experiment ID, reconstructs the exact `HookExperiment` from all nine append-only database rows, and dispatches the matrix through `_replace` rather than exposing only a low-level adapter.
+
+The production adapter first enters the established `publish_replacement_paused` path, thereby acquiring/reusing the durable replacement-publication record and its leases. Variant `:01` adopts the already-created NL/FR/EN children. Variants `:02` and `:03` persist namespaced progress through a SQL callback fenced by action ID, lease owner, lease token, and unexpired lease. Retries reconstruct variant `:01` from its durable base IDs and adopt namespaced IDs for later variants.
+
+The saga verifies all three paused bundles, performs guarded activation across all nine ads, verifies all three active bundles, and only then pauses the source. Failure after an external write enters reverse variant cleanup and requires all three bundles to reread paused; unproven cleanup is returned through `_SagaFailure`, causing the existing executor reconciliation block rather than a clean retry. Shadow mode still refuses before publication or Meta mutation.
+
+Remediation checks:
+
+- `ruff check` passed for executor, replacement, Meta adapter, and focused tests.
+- Hook matrix tests: `4 passed`.
+- Executor shadow-boundary tests: `2 passed`.
+- No external Meta boundary, deployment, dispatch, or GitHub variable was used.
