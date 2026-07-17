@@ -939,6 +939,61 @@ async def test_public_lease_loss_between_replacement_writes_prevents_stale_finis
     assert row["after_state"] == {}
 
 
+class BoundaryLeaseReplacementMeta(ReplacementMeta):
+    def __init__(self, engine, claim, steal_on_read):
+        super().__init__()
+        self.engine = engine
+        self.claim = claim
+        self.steal_on_read = steal_on_read
+        self.reads = 0
+
+    async def read_source(self, campaign_id, ids):
+        result = await super().read_source(campaign_id, ids)
+        self.reads += 1
+        if self.reads == self.steal_on_read:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE autonomous_actions SET lease_token='boundary-stolen' WHERE id=:id"
+                    ),
+                    {"id": self.claim.id},
+                )
+        return result
+
+
+@pytest.mark.parametrize(
+    ("steal_on_read", "expected_writes"),
+    [(1, []), (2, ["create_paused", "activate_replacement", "pause_source"])],
+)
+@pytest.mark.asyncio
+async def test_public_lease_loss_before_first_write_and_at_finalization_boundary(
+    engine, monkeypatch, steal_on_read, expected_writes
+):
+    claim = await _public_replace_claim(engine)
+    meta = BoundaryLeaseReplacementMeta(engine, claim, steal_on_read)
+    monkeypatch.setattr("peermarket_agent.autonomy.executor._policy_reason", lambda *args: None)
+    result = await execute_claim(engine, _settings(), meta, ReplacementBuilder(), claim, NOW)
+    assert result.status is ExecutionStatus.FAILED
+    assert result.reason == "lease_lost"
+    assert [call for call in meta.calls if call in expected_writes] == expected_writes
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT status,lease_token,after_state FROM autonomous_actions WHERE id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "executing"
+    assert row["lease_token"] == "boundary-stolen"
+    assert row["after_state"] == {}
+
+
 @pytest.mark.asyncio
 async def test_replacement_exact_success_order(monkeypatch):
     monkeypatch.setattr("peermarket_agent.autonomy.executor._renew_action", AsyncMock())
