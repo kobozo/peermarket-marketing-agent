@@ -1,13 +1,24 @@
 """Meta pipeline tests — approval → screenshot → brand-frame → paused Meta ad."""
 
 import asyncio
+import json
 import os
+from dataclasses import asdict
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from peermarket_agent.autonomy.contracts import DecisionKind, FrozenDecision
+from peermarket_agent.autonomy.replacements import (
+    LocaleCreative,
+    ReplacementDraft,
+    ReplacementLocale,
+    ReplacementSource,
+)
+from peermarket_agent.autonomy.store import claim_next_action, enqueue_action
 from peermarket_agent.config import Settings
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
@@ -17,12 +28,14 @@ from peermarket_agent.meta_ads import (
     MetaAdResult,
     MetaAdsDisabled,
     MetaAdsError,
+    MetaReplacementBundleResult,
 )
 from peermarket_agent.meta_pipeline import (
     TerminalReplacementOperationalError,
     _mark_published,
     _process_approved_meta_draft,
     process_approved_meta_draft,
+    publish_replacement_paused,
     replace_terminal_meta_draft,
 )
 from peermarket_agent.nano_banana import ImageEditDisabled
@@ -145,6 +158,281 @@ async def engine_with_meta_draft():
         )
     yield eng, draft_id, metadata
     await eng.dispose()
+
+
+async def _autonomous_bundle_context(engine, source_draft_id):
+    def item(locale, hook, body, headline, description):
+        return LocaleCreative(locale, hook, body, headline, description, "Learn More")
+
+    source = ReplacementSource(
+        draft_id=source_draft_id,
+        campaign_id="123",
+        experiment_id="experiment-1",
+        changed_dimension="copy",
+        locales={
+            "NL": item(
+                "NL",
+                "Koop veilig dichtbij",
+                "Vind geverifieerde mensen in je buurt.",
+                "Veilig lokaal kopen",
+                "Vertrouwde buren",
+            ),
+            "FR": item(
+                "FR",
+                "Achetez en sécurité",
+                "Trouvez des personnes vérifiées près de chez vous.",
+                "Achetez localement",
+                "Des voisins fiables",
+            ),
+            "EN": item(
+                "EN",
+                "Buy safely nearby",
+                "Find verified people in your neighbourhood.",
+                "Buy safely nearby",
+                "Trusted local people",
+            ),
+        },
+        audience_profile_key="declutterers",
+        image_prompt="Belgian neighbourhood market",
+        asset_path="assets/source.png",
+        daily_budget_eur=10,
+        landing_page_url="https://peermarket.eu/path?keep=1",
+    )
+    source_metadata = {
+        "experiment_id": source.experiment_id,
+        "changed_dimension": source.changed_dimension,
+        "locales": {key: asdict(value) for key, value in source.locales.items()},
+        "audience_profile_key": source.audience_profile_key,
+        "image_prompt": source.image_prompt,
+        "asset_path": source.asset_path,
+        "suggested_daily_budget_eur": 10,
+        "landing_page_url": source.landing_page_url,
+    }
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE drafts SET metadata=CAST(:metadata AS JSONB) WHERE id=:id"),
+            {"id": source_draft_id, "metadata": json.dumps(source_metadata)},
+        )
+    await upsert_meta_publication(
+        engine,
+        MetaPublication(
+            draft_id=source_draft_id,
+            state="active",
+            external_ids={
+                "campaign_id": "123",
+                "ad_set_id": "source-as",
+                "creative_id": "source-cr",
+                "ad_id": "source-ad",
+            },
+            approved_budget_cents=1000,
+        ),
+    )
+    decision = FrozenDecision(
+        DecisionKind.REPLACE,
+        "123",
+        source.frozen_evidence(),
+        "replace loser",
+        datetime(2026, 7, 16, tzinfo=UTC),
+        datetime(2026, 7, 17, tzinfo=UTC),
+        "replace-bundle-1",
+    )
+    await enqueue_action(engine, decision)
+    claim = await claim_next_action(engine, "worker-1", lease_seconds=300)
+    locales = {
+        key: ReplacementLocale(
+            key,
+            value.hook,
+            {
+                "NL": "Verkoop met vertrouwen aan geverifieerde kopers in je buurt.",
+                "FR": "Vendez en confiance à des acheteurs vérifiés près de chez vous.",
+                "EN": "Sell confidently to verified buyers in your neighbourhood.",
+            }[key],
+            value.headline,
+            value.description,
+            value.cta_label,
+            source.audience_profile_key,
+            source.image_prompt,
+            source.asset_path,
+        )
+        for key, value in source.locales.items()
+    }
+    metadata = {
+        "autonomous_replacement": True,
+        "source_draft_id": source_draft_id,
+        "source_campaign_id": "123",
+        "experiment_id": source.experiment_id,
+        "changed_dimension": "copy",
+        "locales": {key: asdict(value) for key, value in locales.items()},
+        "audience_profile_key": source.audience_profile_key,
+        "image_prompt": source.image_prompt,
+        "asset_path": source.asset_path,
+        "suggested_daily_budget_eur": 10,
+        "landing_page_url": "https://peermarket.eu/path?keep=1&utm_source=facebook&utm_medium=paid_social&utm_campaign=peermarket&utm_content=draft-999",
+    }
+    replacement_id = await persist_draft(
+        engine,
+        Draft(
+            "meta_ad_creative", "meta", "MULTI", "bundle", source.asset_path, 3, 91, True, metadata
+        ),
+    )
+    metadata["landing_page_url"] = metadata["landing_page_url"].replace(
+        "draft-999", f"draft-{replacement_id}"
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE drafts SET metadata=CAST(:metadata AS JSONB) WHERE id=:id"),
+            {"id": replacement_id, "metadata": json.dumps(metadata)},
+        )
+    draft = ReplacementDraft(
+        replacement_id,
+        locales,
+        "copy",
+        source_draft_id,
+        "123",
+        source.experiment_id,
+        source.audience_profile_key,
+        source.image_prompt,
+        source.asset_path,
+        10,
+        metadata["landing_page_url"],
+        3,
+        {key: 91 for key in locales},
+    )
+    return claim, draft
+
+
+async def test_autonomous_publication_persists_intention_then_creates_one_complete_bundle(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+
+    async def create_bundle(**kwargs):
+        async with engine.connect() as conn:
+            assert (
+                await conn.scalar(
+                    text(
+                        "SELECT count(*) FROM autonomous_replacement_publications WHERE action_id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+                == 1
+            )
+        values = {
+            "campaign_id": "new-c",
+            "ad_set_id": "new-as",
+            **{f"creative_id:{x}": f"cr-{x}" for x in ("NL", "FR", "EN")},
+            **{f"ad_id:{x}": f"ad-{x}" for x in ("NL", "FR", "EN")},
+        }
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        assert kwargs["daily_budget_eur"] == 10
+        assert set(kwargs["locales"]) == {"NL", "FR", "EN"}
+        return MetaReplacementBundleResult(
+            "new-c",
+            "new-as",
+            {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager",
+        )
+
+    create = AsyncMock(side_effect=create_bundle)
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create
+    )
+    publication = await publish_replacement_paused(
+        engine=engine, settings=_make_settings(), claim=claim, draft=draft
+    )
+    assert publication.campaign_id == "new-c" and publication.ad_set_id == "new-as"
+    assert set(publication.ad_ids) == {"NL", "FR", "EN"}
+    create.assert_awaited_once()
+    assert "locale" not in create.await_args.kwargs
+
+
+async def test_autonomous_publication_mismatch_makes_no_meta_call(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    object.__setattr__(draft, "daily_budget_eur", 11)
+    create = AsyncMock()
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused", create
+    )
+    with pytest.raises(ValueError, match="persisted replacement metadata"):
+        await publish_replacement_paused(
+            engine=engine, settings=_make_settings(), claim=claim, draft=draft
+        )
+    create.assert_not_awaited()
+
+
+async def test_autonomous_bundle_partial_failure_retry_reuses_structured_ids(
+    monkeypatch, engine_with_meta_draft
+):
+    engine, source_draft_id, _ = engine_with_meta_draft
+    claim, draft = await _autonomous_bundle_context(engine, source_draft_id)
+    _patch_replacement_preparation(monkeypatch)
+    calls = 0
+
+    async def flaky(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await kwargs["persist_progress"]("campaign_id", "new-c")
+            await kwargs["persist_progress"]("ad_set_id", "new-as")
+            await kwargs["persist_progress"]("creative_id:NL", "cr-NL")
+            raise MetaAdsError("partial", resource_ids={"campaign_id": "new-c"})
+        assert kwargs["progress"] == {
+            "campaign_id": "new-c",
+            "ad_set_id": "new-as",
+            "creative_id:NL": "cr-NL",
+        }
+        values = {
+            "ad_id:NL": "ad-NL",
+            "creative_id:FR": "cr-FR",
+            "ad_id:FR": "ad-FR",
+            "creative_id:EN": "cr-EN",
+            "ad_id:EN": "ad-EN",
+        }
+        for key, value in values.items():
+            await kwargs["persist_progress"](key, value)
+        return MetaReplacementBundleResult(
+            "new-c",
+            "new-as",
+            {x: f"cr-{x}" for x in ("NL", "FR", "EN")},
+            {x: f"ad-{x}" for x in ("NL", "FR", "EN")},
+            "https://business.facebook.com/adsmanager",
+        )
+
+    monkeypatch.setattr(
+        "peermarket_agent.meta_pipeline.create_meta_replacement_bundle_paused",
+        AsyncMock(side_effect=flaky),
+    )
+    with pytest.raises(MetaAdsError):
+        await publish_replacement_paused(
+            engine=engine, settings=_make_settings(), claim=claim, draft=draft
+        )
+    result = await publish_replacement_paused(
+        engine=engine, settings=_make_settings(), claim=claim, draft=draft
+    )
+    assert result.ad_ids == {x: f"ad-{x}" for x in ("NL", "FR", "EN")}
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT state, progress FROM autonomous_replacement_publications "
+                        "WHERE action_id=:id"
+                    ),
+                    {"id": claim.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["state"] == "paused"
+    assert row["progress"]["campaign_id"] == "new-c"
 
 
 async def test_full_happy_path(monkeypatch, engine_with_meta_draft):

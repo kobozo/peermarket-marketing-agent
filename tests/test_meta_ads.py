@@ -1,7 +1,7 @@
 """Meta Ads connector tests — no real API calls."""
 
 import traceback
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -9,13 +9,85 @@ from peermarket_agent.meta_ads import (
     MetaActivationResult,
     MetaAdsDisabled,
     MetaAdsError,
+    MetaBundleLocale,
     MetaConfig,
     activate_meta_ad,
     create_meta_ad_paused,
+    create_meta_replacement_bundle_paused,
     get_meta_budget_state,
     set_meta_ad_status,
     set_meta_adset_daily_budget,
 )
+
+
+async def test_replacement_bundle_creates_one_budget_hierarchy_and_three_locale_ads(monkeypatch):
+    created = []
+
+    def create_step(**kwargs):
+        progress = kwargs["progress"]
+        locale = kwargs["locale"]
+        if "campaign_id" not in progress:
+            result = ("campaign_id", "campaign-1")
+        elif "ad_set_id" not in progress:
+            result = ("ad_set_id", "adset-1")
+        elif f"creative_id:{locale}" not in progress:
+            result = (f"creative_id:{locale}", f"creative-{locale}")
+        else:
+            result = (f"ad_id:{locale}", f"ad-{locale}")
+        created.append(result[0])
+        return result
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_step)
+    persisted = AsyncMock()
+    locale = MetaBundleLocale("body", "head", "desc", "LEARN_MORE", None)
+    result = await create_meta_replacement_bundle_paused(
+        config=_FULL_CONFIG,
+        name="replacement",
+        locales={key: locale for key in ("NL", "FR", "EN")},
+        landing_page_url="https://peermarket.eu/",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        persist_progress=persisted,
+    )
+    assert created.count("campaign_id") == created.count("ad_set_id") == 1
+    assert result.ad_ids == {"NL": "ad-NL", "FR": "ad-FR", "EN": "ad-EN"}
+    assert persisted.await_count == 8
+
+
+async def test_replacement_bundle_retry_reuses_durable_progress(monkeypatch):
+    created = []
+
+    def create_step(**kwargs):
+        locale = kwargs["locale"]
+        progress = kwargs["progress"]
+        key = (
+            f"creative_id:{locale}"
+            if f"creative_id:{locale}" not in progress
+            else f"ad_id:{locale}"
+        )
+        created.append(key)
+        return key, key.replace(":", "-")
+
+    monkeypatch.setattr("peermarket_agent.meta_ads._sync_create_bundle_resource", create_step)
+    progress = {
+        "campaign_id": "campaign-1",
+        "ad_set_id": "adset-1",
+        "creative_id:NL": "creative-NL",
+        "ad_id:NL": "ad-NL",
+    }
+    locale = MetaBundleLocale("body", "head", "desc", "LEARN_MORE", None)
+    await create_meta_replacement_bundle_paused(
+        config=_FULL_CONFIG,
+        name="replacement",
+        locales={key: locale for key in ("NL", "FR", "EN")},
+        landing_page_url="https://peermarket.eu/",
+        audience_profile_key="declutterers",
+        daily_budget_eur=10,
+        progress=progress,
+        persist_progress=AsyncMock(),
+    )
+    assert created == ["creative_id:FR", "ad_id:FR", "creative_id:EN", "ad_id:EN"]
+
 
 _FULL_CONFIG = MetaConfig(
     app_id="111",
@@ -180,9 +252,7 @@ async def test_mutation_error_preserves_structured_rate_limit_diagnostics(
         expected_ids = {"ad_set_id": "123"}
     else:
         ad.api_get.side_effect = sdk_error
-        mutation = get_meta_budget_state(
-            _FULL_CONFIG, {"ad_id": "456", "ad_set_id": "123"}
-        )
+        mutation = get_meta_budget_state(_FULL_CONFIG, {"ad_id": "456", "ad_set_id": "123"})
         expected_phase = "get_budget_state"
         expected_ids = {"ad_id": "456", "ad_set_id": "123"}
 

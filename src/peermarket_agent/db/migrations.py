@@ -425,6 +425,20 @@ _STEPS: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_autonomous_budget_events_campaign_created "
     "ON autonomous_budget_events (campaign_id, created_at DESC)",
+    """CREATE TABLE IF NOT EXISTS autonomous_replacement_publications (
+        id BIGSERIAL PRIMARY KEY,
+        action_id BIGINT NOT NULL REFERENCES autonomous_actions(id),
+        replacement_draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        source_draft_id BIGINT NOT NULL REFERENCES drafts(id),
+        state TEXT NOT NULL DEFAULT 'creating'
+            CHECK (state IN ('creating','paused','reconciliation_required')),
+        frozen_budget_cents INT NOT NULL CHECK (frozen_budget_cents > 0),
+        progress JSONB NOT NULL DEFAULT '{}'::JSONB,
+        failure_category TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (action_id, replacement_draft_id)
+    )""",
     """CREATE OR REPLACE FUNCTION reject_autonomous_budget_event_mutation()
        RETURNS TRIGGER AS $$
        BEGIN

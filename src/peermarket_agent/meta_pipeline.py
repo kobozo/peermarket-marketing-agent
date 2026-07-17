@@ -1,7 +1,7 @@
 """Approved Meta draft to durable, activated publication."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import structlog
 from sqlalchemy import text
@@ -15,9 +15,11 @@ from peermarket_agent.config import Settings
 from peermarket_agent.meta_ads import (
     MetaAdsDisabled,
     MetaAdsError,
+    MetaBundleLocale,
     MetaConfig,
     activate_meta_ad,
     create_meta_ad_paused,
+    create_meta_replacement_bundle_paused,
     get_meta_ad_statuses,
     pause_meta_ad,
 )
@@ -62,13 +64,19 @@ class TerminalReplacementResult:
 
 
 @dataclass(frozen=True)
-class ReplacementPublication:
+class ReplacementBundlePublication:
     draft_id: int
     source_draft_id: int
-    locale: str
-    external_ids: dict[str, str]
+    campaign_id: str
+    ad_set_id: str
+    creative_ids: dict[str, str]
+    ad_ids: dict[str, str]
     ads_manager_url: str
     status: str = "PAUSED"
+
+
+# Compatibility name; autonomous callers receive the bundle-shaped type.
+ReplacementPublication = ReplacementBundlePublication
 
 
 @dataclass(frozen=True)
@@ -113,9 +121,12 @@ async def _require_live_replacement_claim(
             (
                 await conn.execute(
                     text(
-                        "SELECT a.status, a.campaign_id, d.decision_key, d.evidence, r.metadata "
+                        "SELECT a.status, a.campaign_id, d.kind, d.decision_key, d.evidence, "
+                        "r.metadata, s.metadata AS source_metadata, p.external_ids AS source_ids, "
+                        "p.approved_budget_cents AS source_budget_cents "
                         "FROM autonomous_actions a JOIN autonomous_decisions d ON d.id=a.decision_id "
-                        "JOIN drafts r ON r.id=:draft_id WHERE a.id=:action_id "
+                        "JOIN drafts r ON r.id=:draft_id JOIN drafts s ON s.id=(r.metadata->>'source_draft_id')::BIGINT "
+                        "JOIN publications p ON p.draft_id=s.id WHERE a.id=:action_id "
                         "AND a.decision_id=:decision_id AND a.lease_owner=:owner "
                         "AND a.lease_token=:token AND a.lease_expires_at>NOW()"
                     ),
@@ -134,23 +145,26 @@ async def _require_live_replacement_claim(
     if row is None or row["status"] not in {"leased", "executing"}:
         raise ValueError("autonomous replacement requires a live persisted worker claim")
     if (
-        row["campaign_id"] != claim.campaign_id
+        row["kind"] != "replace"
+        or row["campaign_id"] != claim.campaign_id
         or row["decision_key"] != claim.decision.idempotency_key
         or row["evidence"] != claim.decision.evidence
     ):
         raise ValueError("persisted autonomous decision differs from frozen claim")
     metadata = row["metadata"] or {}
-    expected_locales = {
-        key: {
-            "locale": item.locale,
-            "primary_text": item.primary_text,
-            "headline": item.headline,
-            "description": item.description,
-            "cta_label": item.cta_label,
-            "audience_profile_key": item.audience_profile_key,
-        }
-        for key, item in draft.locales.items()
+    expected_locales = {key: asdict(item) for key, item in draft.locales.items()}
+    frozen_source = row["evidence"].get("source", {})
+    expected_source_metadata = {
+        "experiment_id": frozen_source.get("experiment_id"),
+        "changed_dimension": frozen_source.get("changed_dimension"),
+        "locales": frozen_source.get("locales"),
+        "audience_profile_key": frozen_source.get("audience_profile_key"),
+        "image_prompt": frozen_source.get("image_prompt"),
+        "asset_path": frozen_source.get("asset_path"),
+        "suggested_daily_budget_eur": frozen_source.get("daily_budget_eur"),
+        "landing_page_url": frozen_source.get("landing_page_url"),
     }
+    persisted_source_metadata = row["source_metadata"] or {}
     if (
         metadata.get("source_draft_id") != draft.source_draft_id
         or metadata.get("experiment_id") != draft.experiment_id
@@ -158,6 +172,16 @@ async def _require_live_replacement_claim(
         or metadata.get("suggested_daily_budget_eur") != draft.daily_budget_eur
         or metadata.get("landing_page_url") != draft.landing_page_url
         or metadata.get("locales") != expected_locales
+        or metadata.get("source_campaign_id") != draft.source_campaign_id
+        or metadata.get("audience_profile_key") != draft.audience_profile_key
+        or metadata.get("image_prompt") != draft.image_prompt
+        or metadata.get("asset_path") != draft.asset_path
+        or (row["source_ids"] or {}).get("campaign_id") != draft.source_campaign_id
+        or row["source_budget_cents"] != draft.daily_budget_eur * 100
+        or any(
+            persisted_source_metadata.get(key) != value
+            for key, value in expected_source_metadata.items()
+        )
     ):
         raise ValueError("persisted replacement metadata differs from frozen draft")
 
@@ -168,13 +192,51 @@ async def publish_replacement_paused(
     settings: Settings,
     claim: ClaimedAction,
     draft: ReplacementDraft,
-    locale: str = "NL",
-) -> ReplacementPublication:
-    """Create only paused replacement resources; lifecycle ordering belongs to executor."""
+    locale: str | None = None,
+) -> ReplacementBundlePublication:
+    """Durably create one paused multilingual bundle; never activate or pause its source."""
+    if locale is not None:
+        raise ValueError("single-locale autonomous publication is forbidden")
     await _require_live_replacement_claim(engine, claim, draft)
-    if set(draft.locales) != {"NL", "FR", "EN"} or locale not in draft.locales:
+    if set(draft.locales) != {"NL", "FR", "EN"}:
         raise ValueError("replacement must contain exact NL/FR/EN locales")
-    creative = draft.locales[locale]
+    async with engine.begin() as conn:
+        attempt = (
+            (
+                await conn.execute(
+                    text(
+                        "INSERT INTO autonomous_replacement_publications (action_id, replacement_draft_id, source_draft_id, frozen_budget_cents) VALUES (:action, :draft, :source, :budget) ON CONFLICT (action_id, replacement_draft_id) DO UPDATE SET updated_at=NOW() RETURNING id, state, progress"
+                    ),
+                    {
+                        "action": claim.id,
+                        "draft": draft.id,
+                        "source": draft.source_draft_id,
+                        "budget": draft.daily_budget_eur * 100,
+                    },
+                )
+            )
+            .mappings()
+            .one()
+        )
+    if attempt["state"] == "paused":
+        progress = attempt["progress"]
+        return ReplacementBundlePublication(
+            draft.id,
+            draft.source_draft_id,
+            progress["campaign_id"],
+            progress["ad_set_id"],
+            {
+                key.split(":", 1)[1]: value
+                for key, value in progress.items()
+                if key.startswith("creative_id:")
+            },
+            {
+                key.split(":", 1)[1]: value
+                for key, value in progress.items()
+                if key.startswith("ad_id:")
+            },
+            progress["ads_manager_url"],
+        )
     screenshot = await screenshot_url(
         draft.landing_page_url, viewport_width=1080, viewport_height=1080
     )
@@ -185,50 +247,89 @@ async def publish_replacement_paused(
         )
     except (ImageEditDisabled, ImageEditError):
         image = screenshot
-    cta_type = {
+    ctas = {
         "Learn More": "LEARN_MORE",
         "Sign Up": "SIGN_UP",
         "Shop Now": "SHOP_NOW",
         "Get Started": "GET_STARTED",
-    }[creative.cta_label]
-    result = await create_meta_ad_paused(
-        config=_meta_config(settings),
-        name=f"PeerMarket autonomous draft #{draft.id} {locale}",
-        primary_text=creative.primary_text,
-        headline=creative.headline,
-        description=creative.description,
-        cta_type=cta_type,
-        landing_page_url=draft.landing_page_url,
-        image_bytes=image,
-        audience_profile_key=creative.audience_profile_key,
-        daily_budget_eur=draft.daily_budget_eur,
-    )
-    if result.status != "PAUSED":
-        raise RuntimeError("Meta replacement creation did not return PAUSED")
-    ids = {
-        "campaign_id": result.campaign_id,
-        "ad_set_id": result.ad_set_id,
-        "creative_id": result.creative_id,
-        "ad_id": result.ad_id,
     }
+
+    async def persist_progress(key: str, value: str) -> None:
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text(
+                    "UPDATE autonomous_replacement_publications SET progress=jsonb_set(progress, ARRAY[:key], to_jsonb(CAST(:value AS TEXT)), TRUE), updated_at=NOW() WHERE id=:id AND state IN ('creating','reconciliation_required')"
+                ),
+                {"id": attempt["id"], "key": key, "value": value},
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("replacement publication progress persistence failed")
+
+    try:
+        result = await create_meta_replacement_bundle_paused(
+            config=_meta_config(settings),
+            name=f"PeerMarket autonomous draft #{draft.id}",
+            locales={
+                locale: MetaBundleLocale(
+                    item.primary_text, item.headline, item.description, ctas[item.cta_label], image
+                )
+                for locale, item in draft.locales.items()
+            },
+            landing_page_url=draft.landing_page_url,
+            audience_profile_key=draft.audience_profile_key,
+            daily_budget_eur=draft.daily_budget_eur,
+            progress=attempt["progress"],
+            persist_progress=persist_progress,
+        )
+    except Exception as exc:
+        recovered_ids = exc.resource_ids if isinstance(exc, MetaAdsError) else {}
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE autonomous_replacement_publications SET "
+                    "state='reconciliation_required', progress=progress || CAST(:ids AS JSONB), "
+                    "failure_category='meta_bundle_creation', updated_at=NOW() WHERE id=:id"
+                ),
+                {"id": attempt["id"], "ids": json.dumps(recovered_ids)},
+            )
+        raise
+    if result.status != "PAUSED":
+        raise RuntimeError("Meta replacement bundle did not return PAUSED")
+    await persist_progress("ads_manager_url", result.ads_manager_url)
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "INSERT INTO creatives_archive (asset_path, prompt, model, cost_cents, performance_summary) "
-                "VALUES (:path, :prompt, 'autonomous-replacement', 0, CAST(:summary AS JSONB))"
+                "UPDATE autonomous_replacement_publications SET state='paused', failure_category=NULL, updated_at=NOW() WHERE id=:id"
             ),
-            {
-                "path": f"autonomous:draft-{draft.id}:{locale}",
-                "prompt": _BRAND_FRAME_PROMPT,
-                "summary": json.dumps({"source_draft_id": draft.source_draft_id, "meta_ids": ids}),
-            },
+            {"id": attempt["id"]},
         )
-    return ReplacementPublication(
-        draft_id=draft.id,
-        source_draft_id=draft.source_draft_id,
-        locale=locale,
-        external_ids=ids,
-        ads_manager_url=result.ads_manager_url,
+        for locale in ("NL", "FR", "EN"):
+            await conn.execute(
+                text(
+                    "INSERT INTO creatives_archive (asset_path, prompt, model, cost_cents, performance_summary) VALUES (:path, :prompt, 'autonomous-replacement', 0, CAST(:summary AS JSONB))"
+                ),
+                {
+                    "path": f"autonomous:draft-{draft.id}:{locale}",
+                    "prompt": draft.image_prompt,
+                    "summary": json.dumps(
+                        {
+                            "source_draft_id": draft.source_draft_id,
+                            "campaign_id": result.campaign_id,
+                            "ad_set_id": result.ad_set_id,
+                            "creative_id": result.creative_ids[locale],
+                            "ad_id": result.ad_ids[locale],
+                        }
+                    ),
+                },
+            )
+    return ReplacementBundlePublication(
+        draft.id,
+        draft.source_draft_id,
+        result.campaign_id,
+        result.ad_set_id,
+        dict(result.creative_ids),
+        dict(result.ad_ids),
+        result.ads_manager_url,
     )
 
 

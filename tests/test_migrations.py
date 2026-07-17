@@ -30,6 +30,7 @@ REQUIRED_TABLES = {
     "autonomous_decisions",
     "autonomous_actions",
     "autonomous_budget_events",
+    "autonomous_replacement_publications",
 }
 
 
@@ -58,6 +59,8 @@ def test_autonomy_migration_has_durable_constraints_and_audit_fields():
     assert "created_at timestamptz not null default now()" in migration_sql
     assert "autonomous_decisions_append_only" in migration_sql
     assert "autonomous_budget_events_append_only" in migration_sql
+    assert "create table if not exists autonomous_replacement_publications" in migration_sql
+    assert "unique (action_id, replacement_draft_id)" in migration_sql
 
 
 def test_publications_migration_adds_reconciliation_columns_and_unique_draft_index():

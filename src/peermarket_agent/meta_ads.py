@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import re
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -38,6 +39,25 @@ class MetaAdResult:
     creative_id: str
     ads_manager_url: str
     status: str
+
+
+@dataclass(frozen=True)
+class MetaBundleLocale:
+    primary_text: str
+    headline: str
+    description: str
+    cta_type: str
+    image_bytes: bytes | None
+
+
+@dataclass(frozen=True)
+class MetaReplacementBundleResult:
+    campaign_id: str
+    ad_set_id: str
+    creative_ids: Mapping[str, str]
+    ad_ids: Mapping[str, str]
+    ads_manager_url: str
+    status: str = "PAUSED"
 
 
 @dataclass(frozen=True)
@@ -322,6 +342,150 @@ async def create_meta_ad_paused(
         image_bytes=image_bytes,
         audience_profile_key=audience_profile_key,
         daily_budget_eur=daily_budget_eur,
+    )
+
+
+def _sync_create_bundle_resource(
+    *,
+    config: MetaConfig,
+    name: str,
+    audience_profile_key: str,
+    daily_budget_eur: int,
+    landing_page_url: str,
+    locale: str | None,
+    creative: MetaBundleLocale | None,
+    progress: dict,
+) -> tuple[str, str]:
+    """Create exactly one missing bundle resource and return its durable progress key/value."""
+    _ensure_enabled(config)
+    if audience_profile_key not in _TARGETING_TEMPLATES:
+        raise MetaAdsError("unknown audience profile", phase="validate_bundle")
+    api = _init_api(config)
+    account = AdAccount(config.ad_account_id, api=api)
+    if "campaign_id" not in progress:
+        item = account.create_campaign(
+            params={
+                Campaign.Field.name: f"{name} — campaign",
+                Campaign.Field.objective: "OUTCOME_TRAFFIC",
+                Campaign.Field.status: Campaign.Status.paused,
+                Campaign.Field.special_ad_categories: [],
+                "is_adset_budget_sharing_enabled": False,
+            },
+            fields=[Campaign.Field.id],
+        )
+        return "campaign_id", item["id"]
+    if "ad_set_id" not in progress:
+        item = account.create_ad_set(
+            params={
+                AdSet.Field.name: f"{name} — adset",
+                AdSet.Field.campaign_id: progress["campaign_id"],
+                AdSet.Field.daily_budget: daily_budget_eur * 100,
+                AdSet.Field.billing_event: "IMPRESSIONS",
+                AdSet.Field.optimization_goal: "LINK_CLICKS",
+                AdSet.Field.bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+                AdSet.Field.targeting: _TARGETING_TEMPLATES[audience_profile_key],
+                AdSet.Field.status: AdSet.Status.paused,
+            },
+            fields=[AdSet.Field.id],
+        )
+        return "ad_set_id", item["id"]
+    if locale is None or creative is None:
+        raise MetaAdsError("locale required for bundle child", phase="validate_bundle")
+    image_key = f"image_hash:{locale}"
+    creative_key = f"creative_id:{locale}"
+    ad_key = f"ad_id:{locale}"
+    if creative.image_bytes and image_key not in progress:
+        image = account.create_ad_image(
+            params={"bytes": base64.b64encode(creative.image_bytes).decode("ascii")},
+            fields=["hash"],
+        )
+        return image_key, image["hash"]
+    if creative_key not in progress:
+        if creative.cta_type not in _ALLOWED_CTA_TYPES:
+            raise MetaAdsError("invalid bundle CTA", phase="validate_bundle")
+        link_data = {
+            "message": creative.primary_text,
+            "link": landing_page_url,
+            "name": creative.headline,
+            "description": creative.description,
+            "call_to_action": {"type": creative.cta_type},
+        }
+        if image_key in progress:
+            link_data["image_hash"] = progress[image_key]
+        item = account.create_ad_creative(
+            params={
+                AdCreative.Field.name: f"{name} {locale} — creative",
+                AdCreative.Field.object_story_spec: {
+                    "page_id": config.page_id,
+                    "link_data": link_data,
+                },
+            },
+            fields=[AdCreative.Field.id],
+        )
+        return creative_key, item["id"]
+    item = account.create_ad(
+        params={
+            Ad.Field.name: f"{name} {locale}",
+            Ad.Field.adset_id: progress["ad_set_id"],
+            Ad.Field.creative: {"creative_id": progress[creative_key]},
+            Ad.Field.status: Ad.Status.paused,
+        },
+        fields=[Ad.Field.id],
+    )
+    return ad_key, item["id"]
+
+
+async def create_meta_replacement_bundle_paused(
+    *,
+    config: MetaConfig,
+    name: str,
+    locales: Mapping[str, MetaBundleLocale],
+    landing_page_url: str,
+    audience_profile_key: str,
+    daily_budget_eur: int,
+    progress: Mapping[str, str] | None = None,
+    persist_progress: Callable[[str, str], Awaitable[None]],
+) -> MetaReplacementBundleResult:
+    """Idempotently create one paused campaign/adset and exactly NL/FR/EN ads."""
+    if set(locales) != {"NL", "FR", "EN"}:
+        raise ValueError("Meta replacement bundle requires exact NL/FR/EN locales")
+    current = dict(progress or {})
+    for locale in (None, None, "NL", "FR", "EN"):
+        child = locales.get(locale) if locale else None
+        while (locale is None and ("campaign_id" not in current or "ad_set_id" not in current)) or (
+            locale is not None and f"ad_id:{locale}" not in current
+        ):
+            try:
+                key, value = await asyncio.to_thread(
+                    _sync_create_bundle_resource,
+                    config=config,
+                    name=name,
+                    audience_profile_key=audience_profile_key,
+                    daily_budget_eur=daily_budget_eur,
+                    landing_page_url=landing_page_url,
+                    locale=locale,
+                    creative=child,
+                    progress=current,
+                )
+                current[key] = value
+                await persist_progress(key, value)
+            except MetaAdsError:
+                raise
+            except Exception:
+                raise MetaAdsError(
+                    "Meta bundle creation failed",
+                    phase="create_bundle",
+                    resource_ids={
+                        key: value for key, value in current.items() if "hash" not in key
+                    },
+                ) from None
+    ad_ids = {locale: current[f"ad_id:{locale}"] for locale in ("NL", "FR", "EN")}
+    return MetaReplacementBundleResult(
+        campaign_id=current["campaign_id"],
+        ad_set_id=current["ad_set_id"],
+        creative_ids={locale: current[f"creative_id:{locale}"] for locale in ("NL", "FR", "EN")},
+        ad_ids=ad_ids,
+        ads_manager_url=_build_ads_manager_url(config.ad_account_id, ad_ids["NL"]),
     )
 
 
