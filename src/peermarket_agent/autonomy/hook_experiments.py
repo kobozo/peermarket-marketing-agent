@@ -41,6 +41,8 @@ _HOOK_CONCEPTS = (
         "EN": "Know who you sell to before the first message",
     },
 )
+HOOK_CATALOG_VERSION = "hook-catalog-v1"
+_NON_HOOK_FIELDS = ("body", "headline", "description", "cta_label")
 
 
 def _read(draft: Mapping[str, Any] | object, name: str) -> Any:
@@ -50,14 +52,26 @@ def _read(draft: Mapping[str, Any] | object, name: str) -> Any:
 def _stable_digest(draft: Mapping[str, Any] | object, brand_voice: str, seed: Any) -> str:
     if not isinstance(brand_voice, str) or not brand_voice.strip():
         raise ValueError("brand_voice must be non-empty")
+    baseline = _read(draft, "language_bundles")
+    if not isinstance(baseline, Mapping) or set(baseline) != set(LOCALES):
+        raise ValueError("draft requires exact NL/FR/EN baseline bundles")
+    canonical_baseline = {
+        locale: {field: baseline[locale][field] for field in _NON_HOOK_FIELDS} for locale in LOCALES
+    }
+    catalog_digest = hashlib.sha256(
+        json.dumps(_HOOK_CONCEPTS, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
     stable = {
         "draft_id": _read(draft, "id"),
         "campaign_id": _read(draft, "campaign_id"),
         "ad_set_id": _read(draft, "ad_set_id"),
         "landing_page_url": _read(draft, "landing_page_url"),
-        "fixed_identity": _read(draft, "fixed_identity"),
-        "seed": str(seed),
+        "fixed_identity": thaw_json(_read(draft, "fixed_identity")),
+        "baseline_non_hook_bundles": canonical_baseline,
+        "seed": {"type": type(seed).__name__, "value": str(seed)},
         "brand_voice_sha256": hashlib.sha256(brand_voice.encode()).hexdigest(),
+        "hook_catalog_version": HOOK_CATALOG_VERSION,
+        "hook_catalog_sha256": catalog_digest,
     }
     return hashlib.sha256(
         json.dumps(stable, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -101,14 +115,23 @@ def build_hook_experiment(
             )
         )
     experiment = HookExperiment(variants=tuple(variants), **common)
-    validate_hook_experiment(experiment, common["fixed_identity"])
+    validate_hook_experiment(experiment, draft, brand_voice, seed)
     return experiment
 
 
-def validate_hook_experiment(experiment: HookExperiment, fixed_identity: Mapping[str, Any]) -> None:
+def validate_hook_experiment(
+    experiment: HookExperiment,
+    draft: Mapping[str, Any] | object,
+    brand_voice: str,
+    seed: Any,
+) -> None:
     """Validate deterministic order, native language hooks, and frozen delivery identity."""
-    if thaw_json(experiment.fixed_identity) != thaw_json(fixed_identity):
+    if thaw_json(experiment.fixed_identity) != thaw_json(_read(draft, "fixed_identity")):
         raise ValueError("hook experiment fixed identity does not match expected controls")
+    digest = _stable_digest(draft, brand_voice, seed)
+    expected_experiment_id = f"draft-{_read(draft, 'id')}-hook-{digest[:16]}"
+    if experiment.experiment_id != expected_experiment_id:
+        raise ValueError("hook experiment ID derivation does not match its input commitment")
     expected_ids = tuple(f"{experiment.experiment_id}:{number:02d}" for number in range(1, 4))
     if tuple(item.variant_id for item in experiment.variants) != expected_ids:
         raise ValueError("hook experiment variant ordering or stable IDs changed")
@@ -116,3 +139,7 @@ def validate_hook_experiment(experiment: HookExperiment, fixed_identity: Mapping
         validate_native_hook_bundle(
             {locale: variant.language_bundles[locale]["hook"] for locale in LOCALES}
         )
+    for locale in LOCALES:
+        hooks = [variant.language_bundles[locale]["hook"] for variant in experiment.variants]
+        if len(set(hooks)) != 3:
+            raise ValueError(f"hook experiment requires three distinct {locale} hooks")
