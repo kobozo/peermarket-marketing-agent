@@ -170,7 +170,9 @@ jobs:
             cd /opt/peermarket-agent
             /opt/peermarket-agent/.venv/bin/peermarket-migrate
             if [[ -n "${META_AUTONOMY_EXPERIMENT_ID:-}" ]]; then
-              /opt/peermarket-agent/.venv/bin/peermarket-performance prepare-hook-experiment --draft-id 156 --seed draft-156-shadow-v1
+            if ! /opt/peermarket-agent/.venv/bin/peermarket-performance prepare-hook-experiment --draft-id 156 --seed draft-156-shadow-v1; then
+              echo 'hook experiment preparation pending draft controls'
+            fi
             fi
           '
           sudo systemctl restart marketing-agent.service slack-bridge.service
