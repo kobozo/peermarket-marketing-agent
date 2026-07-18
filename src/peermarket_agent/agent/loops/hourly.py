@@ -16,6 +16,8 @@ from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
 from peermarket_agent.performance import classify_delivery, derive_performance
 from peermarket_agent.publications import save_performance_snapshot
+from peermarket_agent.slack_blocks import hourly_alert_blocks
+from peermarket_agent.slack_routing import report_channel_id
 
 log = structlog.get_logger(__name__)
 _ALERT_CLAIM_LEASE = timedelta(minutes=5)
@@ -85,11 +87,14 @@ async def _publications(engine: AsyncEngine) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def _deliver(notifier, message: str) -> bool:
+async def _deliver(notifier, message: str, *, channel_id: str | None = None, blocks=None) -> bool:
     if notifier is None:
         return False
     try:
-        return bool(await notifier.notify_founder(message))
+        if channel_id:
+            await notifier.send_message(message, channel_id=channel_id, blocks=blocks)
+            return True
+        return bool(await notifier.notify_founder(message, blocks=blocks))
     except Exception:
         log.warning("hourly_meta.alert_failed")
         return False
@@ -223,6 +228,7 @@ async def _send_claimed_alert(
     observed_state: dict,
     active: bool,
     now: datetime,
+    channel_id: str | None = None,
 ) -> None:
     claimed = await _claim_alert(
         engine,
@@ -236,7 +242,10 @@ async def _send_claimed_alert(
     if claimed is None:
         return
     token, message = claimed
-    delivered = await _deliver(notifier, f"Draft #{draft_id}: {message}")
+    alert_text = f"Draft #{draft_id}: {message}"
+    delivered = await _deliver(
+        notifier, alert_text, channel_id=channel_id, blocks=hourly_alert_blocks(alert_text)
+    )
     await _finish_alert(
         engine,
         draft_id,
@@ -347,13 +356,20 @@ async def _finish_operational_alert(
 
 
 async def _send_attribution_availability_alert(
-    engine: AsyncEngine, notifier, *, unavailable: bool, now: datetime
+    engine: AsyncEngine,
+    notifier,
+    *,
+    unavailable: bool,
+    now: datetime,
+    channel_id: str | None = None,
 ) -> None:
     claimed = await _claim_operational_alert(engine, active=unavailable, now=now)
     if claimed is None:
         return
     token, message = claimed
-    delivered = await _deliver(notifier, message)
+    delivered = await _deliver(
+        notifier, message, channel_id=channel_id, blocks=hourly_alert_blocks(message)
+    )
     await _finish_operational_alert(engine, token=token, delivered=delivered, now=now)
 
 
@@ -373,6 +389,7 @@ async def collect_meta_performance(
     ).astimezone(UTC)
     attribution_start = utc_start.date()
     attribution_stop = (utc_stop_exclusive - timedelta(microseconds=1)).date()
+    report_channel = report_channel_id(settings, "meta")
     publications = await _publications(engine)
     attribution = None
     attribution_error = False
@@ -452,6 +469,7 @@ async def collect_meta_performance(
                 observed_state=_observed_state(statuses),
                 active=condition in {"no_delivery", "rejected_or_error"},
                 now=now,
+                channel_id=report_channel,
             )
         except Exception as error:
             log.warning(
@@ -475,7 +493,7 @@ async def collect_meta_performance(
 
     if settings.peermarket_attribution_enabled:
         await _send_attribution_availability_alert(
-            engine, notifier, unavailable=attribution_error, now=now
+            engine, notifier, unavailable=attribution_error, now=now, channel_id=report_channel
         )
     await _collect_hook_experiment_metrics(
         engine,

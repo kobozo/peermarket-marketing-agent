@@ -19,6 +19,8 @@ from peermarket_agent.learnings import (
     EvidenceVariant,
     eligible_learning,
 )
+from peermarket_agent.slack_blocks import daily_summary_blocks
+from peermarket_agent.slack_routing import report_channel_id
 
 log = structlog.get_logger(__name__)
 _SUMMARY_CLAIM_LEASE = timedelta(minutes=5)
@@ -467,14 +469,17 @@ async def _finish_summary(
             )
 
 
-async def _drain_summaries(engine: AsyncEngine, notifier, now: datetime) -> None:
+async def _drain_summaries(
+    engine: AsyncEngine, notifier, now: datetime, *, channel_id: str | None = None
+) -> None:
     while claimed := await _claim_next_summary(engine, now):
         token, message = claimed
         failure = None
         try:
-            delivered = bool(await notifier.notify_founder(message))
-            if not delivered:
-                failure = "notification_not_confirmed"
+            await notifier.send_message(
+                message, channel_id=channel_id, blocks=daily_summary_blocks(message)
+            )
+            delivered = True
         except Exception:
             delivered = False
             failure = "notification_exception"
@@ -617,6 +622,6 @@ async def run_daily_performance(
         await _enqueue_summary(conn, rows, all_observations)
         await _enqueue_unavailable_diagnostics(conn, rows, now.astimezone(UTC).date())
 
-    await _drain_summaries(engine, notifier, now)
+    await _drain_summaries(engine, notifier, now, channel_id=report_channel_id(settings, "meta"))
     log.info("daily_performance.complete", observations_inserted=len(inserted))
     return len(inserted)

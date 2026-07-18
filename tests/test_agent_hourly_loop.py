@@ -21,6 +21,7 @@ from peermarket_agent.autonomy.snapshot import build_policy_decision
 from peermarket_agent.config import Settings
 from peermarket_agent.db.migrations import run_migrations
 from peermarket_agent.db.seed import seed
+from peermarket_agent.slack_blocks import hourly_alert_blocks
 
 
 @pytest.fixture
@@ -495,6 +496,48 @@ async def test_no_delivery_alert_is_deduplicated_and_recovers_once(engine, monke
     assert "recovered" in notifier.notify_founder.await_args.args[0].lower()
 
 
+async def test_claimed_alert_routes_to_report_channel_with_blocks(engine, monkeypatch):
+    await _publication(engine, 156, "ad-1")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses", AsyncMock(return_value=ACTIVE)
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1", impressions=0)),
+    )
+    notifier = AsyncMock()
+    settings = _settings(slack_report_channel_meta="C0BJ0PUURRR")
+
+    await collect_meta_performance(engine, settings, AsyncMock(), notifier, now=NOW)
+
+    notifier.send_message.assert_awaited_once()
+    notifier.notify_founder.assert_not_awaited()
+    args, kwargs = notifier.send_message.await_args
+    assert kwargs["channel_id"] == "C0BJ0PUURRR"
+    assert kwargs["blocks"] == hourly_alert_blocks(args[0])
+    assert kwargs["blocks"][0]["type"] == "section"
+
+
+async def test_claimed_alert_falls_back_to_founder_with_blocks_when_unrouted(engine, monkeypatch):
+    await _publication(engine, 156, "ad-1")
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.get_meta_ad_statuses", AsyncMock(return_value=ACTIVE)
+    )
+    monkeypatch.setattr(
+        "peermarket_agent.agent.loops.hourly.fetch_meta_insights",
+        AsyncMock(return_value=_snapshot("ad-1", impressions=0)),
+    )
+    notifier = AsyncMock()
+    notifier.notify_founder.return_value = True
+
+    await collect_meta_performance(engine, _settings(), AsyncMock(), notifier, now=NOW)
+
+    notifier.notify_founder.assert_awaited_once()
+    notifier.send_message.assert_not_awaited()
+    args, kwargs = notifier.notify_founder.await_args
+    assert kwargs["blocks"] == hourly_alert_blocks(args[0])
+
+
 async def test_feature_flags_default_false_and_disabled_pulse_does_not_collect(engine, monkeypatch):
     assert Settings.model_fields["meta_insights_enabled"].default is False
     assert Settings.model_fields["peermarket_attribution_enabled"].default is False
@@ -568,7 +611,7 @@ async def test_concurrent_collectors_claim_one_problem_sender(engine, monkeypatc
     )
     notifier = AsyncMock()
 
-    async def delivered(message):
+    async def delivered(message, **_kwargs):
         await asyncio.sleep(0.05)
         return True
 
@@ -722,7 +765,7 @@ async def test_concurrent_collectors_claim_one_attribution_sender(engine, monkey
     )
     notifier = AsyncMock()
 
-    async def delivered(message):
+    async def delivered(message, **_kwargs):
         await asyncio.sleep(0.05)
         return True
 

@@ -3,7 +3,8 @@ import json
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock, call
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
@@ -233,7 +234,6 @@ async def test_daily_run_is_idempotent_and_sanitizes_unavailable_summary(databas
         },
     )
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
     now = datetime(2026, 7, 16, 9, tzinfo=UTC)
 
     assert await run_daily_performance(database_engine, notifier, object(), now=now) == 1
@@ -244,7 +244,7 @@ async def test_daily_run_is_idempotent_and_sanitizes_unavailable_summary(databas
             await conn.execute(text("SELECT performance FROM publications WHERE draft_id=501"))
         ).scalar_one()
     assert len(performance["daily_observations"]) == 1
-    message = notifier.notify_founder.await_args_list[0].args[0]
+    message = notifier.send_message.await_args_list[0].args[0]
     assert "unavailable" in message
     assert "account dates 2026-07-15 → 2026-07-16 (Europe/Brussels)" in message
     assert "https://business.facebook.com/adsmanager/manage/ads" in message
@@ -372,13 +372,12 @@ async def test_equal_metrics_never_persist_directional_learning(database_engine)
 async def test_summary_labels_account_dates_and_explicit_utc_interval(database_engine):
     await _prepared_summary_publication(database_engine)
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
 
     await run_daily_performance(
         database_engine, notifier, object(), now=datetime(2026, 7, 17, 9, tzinfo=UTC)
     )
 
-    message = notifier.notify_founder.await_args.args[0]
+    message = notifier.send_message.await_args.args[0]
     assert "account dates 2026-07-14 → 2026-07-16 (Europe/Brussels)" in message
     assert "UTC interval 2026-07-13T22:00:00+00:00 → 2026-07-16T22:00:00+00:00" in message
     assert "2026-07-14 → 2026-07-16 UTC" not in message
@@ -406,7 +405,7 @@ async def test_daily_slack_contains_complete_design_metrics_and_samples(database
         database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
     )
 
-    message = notifier.notify_founder.await_args.args[0]
+    message = notifier.send_message.await_args.args[0]
     for fragment in (
         "approved budget",
         "spend 2000 cents",
@@ -475,7 +474,10 @@ async def test_missing_or_invalid_source_window_creates_no_completed_observation
             await conn.execute(text("SELECT performance FROM publications WHERE draft_id=701"))
         ).scalar_one()
     assert "daily_observations" not in performance
-    notifier.notify_founder.assert_awaited_once_with("Publication #1 — source window unavailable")
+    notifier.send_message.assert_awaited_once()
+    assert (
+        notifier.send_message.await_args.args[0] == "Publication #1 — source window unavailable"
+    )
     rows = await _summary_outbox(database_engine)
     assert len(rows) == 1
     assert rows[0]["summary_kind"] == "source_window_unavailable"
@@ -692,7 +694,7 @@ async def _prepared_summary_publication(database_engine, draft_id=1101):
 async def test_false_delivery_stays_pending_after_persisting_sanitized_summary(database_engine):
     await _prepared_summary_publication(database_engine)
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = False
+    notifier.send_message.side_effect = RuntimeError("slack unavailable")
 
     await run_daily_performance(
         database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
@@ -705,7 +707,7 @@ async def test_false_delivery_stays_pending_after_persisting_sanitized_summary(d
     assert row["sent_at"] is None
     assert row["claim_token"] is None
     assert row["claim_expires_at"] is None
-    assert row["last_failure"] == "notification_not_confirmed"
+    assert row["last_failure"] == "notification_exception"
     assert row["publication_ids"] == [1]
     assert row["evidence_ids"][0].startswith(
         "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days:Europe/Brussels:"
@@ -725,17 +727,19 @@ async def test_unavailable_window_false_delivery_retries_same_diagnostic(databas
     )
     now = datetime(2026, 7, 16, 9, tzinfo=UTC)
     failed = AsyncMock()
-    failed.notify_founder.return_value = False
+    failed.send_message.side_effect = RuntimeError("slack unavailable")
     await run_daily_performance(database_engine, failed, object(), now=now)
     pending = (await _summary_outbox(database_engine))[0]
     assert pending["status"] == "pending"
     assert pending["attempt_count"] == 1
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
 
     await run_daily_performance(database_engine, notifier, object(), now=now)
 
-    notifier.notify_founder.assert_awaited_once_with("Publication #1 — source window unavailable")
+    notifier.send_message.assert_awaited_once()
+    assert (
+        notifier.send_message.await_args.args[0] == "Publication #1 — source window unavailable"
+    )
     rows = await _summary_outbox(database_engine)
     assert len(rows) == 1
     assert rows[0]["status"] == "sent"
@@ -753,13 +757,12 @@ async def test_unavailable_window_same_day_idempotent_and_next_day_reports_again
         performance={"meta": {"latest": {}}, "attribution": {"available": False}},
     )
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
     day_one = datetime(2026, 7, 16, 9, tzinfo=UTC)
 
     await run_daily_performance(database_engine, notifier, object(), now=day_one)
     await run_daily_performance(database_engine, notifier, object(), now=day_one)
 
-    assert notifier.notify_founder.await_count == 1
+    assert notifier.send_message.await_count == 1
     assert len(await _summary_outbox(database_engine)) == 1
     await run_daily_performance(
         database_engine,
@@ -767,7 +770,7 @@ async def test_unavailable_window_same_day_idempotent_and_next_day_reports_again
         object(),
         now=datetime(2026, 7, 17, 9, tzinfo=UTC),
     )
-    assert notifier.notify_founder.await_count == 2
+    assert notifier.send_message.await_count == 2
     rows = await _summary_outbox(database_engine)
     assert [row["run_day"].isoformat() for row in rows] == ["2026-07-16", "2026-07-17"]
     assert {row["summary_key"] for row in rows} == {
@@ -786,7 +789,7 @@ async def test_unavailable_window_same_day_idempotent_and_next_day_reports_again
 async def test_delivery_exception_stays_pending_without_persisting_exception_text(database_engine):
     await _prepared_summary_publication(database_engine)
     notifier = AsyncMock()
-    notifier.notify_founder.side_effect = RuntimeError("password=super-secret")
+    notifier.send_message.side_effect = RuntimeError("password=super-secret")
 
     await run_daily_performance(
         database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
@@ -801,7 +804,7 @@ async def test_delivery_exception_stays_pending_without_persisting_exception_tex
 async def test_next_day_retries_old_pending_before_sending_new_summary(database_engine):
     await _prepared_summary_publication(database_engine)
     first_notifier = AsyncMock()
-    first_notifier.notify_founder.return_value = False
+    first_notifier.send_message.side_effect = RuntimeError("slack unavailable")
     await run_daily_performance(
         database_engine, first_notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
     )
@@ -814,14 +817,13 @@ async def test_next_day_retries_old_pending_before_sending_new_summary(database_
             )
         )
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
 
     await run_daily_performance(
         database_engine, notifier, object(), now=datetime(2026, 7, 17, 9, tzinfo=UTC)
     )
 
-    assert notifier.notify_founder.await_count == 2
-    old_message, new_message = [item.args[0] for item in notifier.notify_founder.await_args_list]
+    assert notifier.send_message.await_count == 2
+    old_message, new_message = [item.args[0] for item in notifier.send_message.await_args_list]
     assert "2026-07-14 → 2026-07-16" in old_message
     assert "2026-07-15 → 2026-07-17" in new_message
     rows = await _summary_outbox(database_engine)
@@ -834,13 +836,13 @@ async def test_concurrent_runs_claim_one_summary_sender(database_engine):
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def deliver(_message):
+    async def deliver(_message, **_kwargs):
         entered.set()
         await release.wait()
         return True
 
     notifier = AsyncMock()
-    notifier.notify_founder.side_effect = deliver
+    notifier.send_message.side_effect = deliver
     first = asyncio.create_task(
         run_daily_performance(
             database_engine, notifier, object(), now=datetime(2026, 7, 16, 9, tzinfo=UTC)
@@ -856,7 +858,7 @@ async def test_concurrent_runs_claim_one_summary_sender(database_engine):
     release.set()
     await asyncio.gather(first, second)
 
-    notifier.notify_founder.assert_awaited_once()
+    notifier.send_message.assert_awaited_once()
     row = (await _summary_outbox(database_engine))[0]
     assert row["status"] == "sent"
     assert row["attempt_count"] == 1
@@ -865,7 +867,7 @@ async def test_concurrent_runs_claim_one_summary_sender(database_engine):
 async def test_stale_claim_is_retried(database_engine):
     await _prepared_summary_publication(database_engine)
     first = AsyncMock()
-    first.notify_founder.return_value = False
+    first.send_message.side_effect = RuntimeError("slack unavailable")
     now = datetime(2026, 7, 16, 9, tzinfo=UTC)
     await run_daily_performance(database_engine, first, object(), now=now)
     async with database_engine.begin() as conn:
@@ -877,11 +879,10 @@ async def test_stale_claim_is_retried(database_engine):
             {"expired": datetime(2026, 7, 16, 8, tzinfo=UTC)},
         )
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
 
     await run_daily_performance(database_engine, notifier, object(), now=now)
 
-    notifier.notify_founder.assert_awaited_once()
+    notifier.send_message.assert_awaited_once()
     row = (await _summary_outbox(database_engine))[0]
     assert row["status"] == "sent"
     assert row["attempt_count"] == 2
@@ -890,14 +891,13 @@ async def test_stale_claim_is_retried(database_engine):
 async def test_successful_summary_is_idempotent_across_daily_replay(database_engine):
     await _prepared_summary_publication(database_engine)
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
     now = datetime(2026, 7, 16, 9, tzinfo=UTC)
 
     await run_daily_performance(database_engine, notifier, object(), now=now)
     await run_daily_performance(database_engine, notifier, object(), now=now)
 
-    notifier.notify_founder.assert_has_awaits([call(notifier.notify_founder.await_args.args[0])])
-    assert notifier.notify_founder.await_count == 1
+    notifier.send_message.assert_awaited_once()
+    assert notifier.send_message.await_count == 1
     rows = await _summary_outbox(database_engine)
     assert len(rows) == 1
     assert rows[0]["status"] == "sent"
@@ -907,19 +907,55 @@ async def test_successful_summary_is_idempotent_across_daily_replay(database_eng
 async def test_existing_immutable_observation_without_outbox_is_recovered(database_engine):
     await _prepared_summary_publication(database_engine)
     failed = AsyncMock()
-    failed.notify_founder.return_value = False
+    failed.send_message.side_effect = RuntimeError("slack unavailable")
     now = datetime(2026, 7, 16, 9, tzinfo=UTC)
     await run_daily_performance(database_engine, failed, object(), now=now)
     async with database_engine.begin() as conn:
         await conn.execute(text("DELETE FROM daily_performance_summary_outbox"))
     notifier = AsyncMock()
-    notifier.notify_founder.return_value = True
 
     assert await run_daily_performance(database_engine, notifier, object(), now=now) == 0
 
-    notifier.notify_founder.assert_awaited_once()
+    notifier.send_message.assert_awaited_once()
     row = (await _summary_outbox(database_engine))[0]
     assert row["status"] == "sent"
     assert row["evidence_ids"][0].startswith(
         "publication:1:2026-07-14:2026-07-16:rolling-3-inclusive-calendar-days:Europe/Brussels:"
     )
+
+
+async def test_daily_summary_routes_to_report_channel_with_header_blocks(database_engine):
+    await _prepared_summary_publication(database_engine)
+    notifier = AsyncMock()
+    settings = SimpleNamespace(slack_report_channel_meta="C0BJ0PUURRR")
+
+    await run_daily_performance(
+        database_engine, notifier, settings, now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+
+    notifier.send_message.assert_awaited_once()
+    notifier.notify_founder.assert_not_awaited()
+    args, kwargs = notifier.send_message.await_args
+    assert kwargs["channel_id"] == "C0BJ0PUURRR"
+    assert kwargs["blocks"][0]["type"] == "header"
+    assert args[0].splitlines()[0] == kwargs["blocks"][0]["text"]["text"].removeprefix("📊 ")
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "sent"
+
+
+async def test_daily_summary_falls_back_to_founder_channel_when_unrouted(database_engine):
+    await _prepared_summary_publication(database_engine)
+    notifier = AsyncMock()
+    settings = SimpleNamespace(slack_report_channel_meta=None)
+
+    await run_daily_performance(
+        database_engine, notifier, settings, now=datetime(2026, 7, 16, 9, tzinfo=UTC)
+    )
+
+    notifier.send_message.assert_awaited_once()
+    notifier.notify_founder.assert_not_awaited()
+    _, kwargs = notifier.send_message.await_args
+    assert kwargs["channel_id"] is None
+    assert kwargs["blocks"][0]["type"] == "header"
+    row = (await _summary_outbox(database_engine))[0]
+    assert row["status"] == "sent"
