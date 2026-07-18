@@ -198,8 +198,8 @@ def test_hook_verifier_uses_project_venv_and_src_layout_import():
     assert "REPORT=\"$report\" /opt/peermarket-agent/.venv/bin/python - <<'PY'" in workflow
     verifier = workflow.split("- name: Verify hook experiment shadow canary", 1)[1]
     assert 'REPORT="$report" python3' not in verifier
-    assert 'proposal_pending' in verifier
-    assert 'variant_ids_mismatch' in verifier
+    assert "proposal_pending" in verifier
+    assert "variant_ids_mismatch" in verifier
 
     root = DEPLOY_WORKFLOW.parents[2]
     result = subprocess.run(
