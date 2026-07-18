@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     slack_signing_secret: str = ""
     slack_founder_user_id: str = ""  # DM target for credit-low + other founder alerts
 
+    # Per-platform report channels (empty falls back to the founder DM)
+    slack_report_channel_tiktok: str = ""
+    slack_report_channel_meta: str = ""
+    slack_report_channel_email: str = ""
+
     # Uploaded video processing
     video_media_root: Path = Path("data/video-media")
     video_max_file_bytes: int = 209715200
