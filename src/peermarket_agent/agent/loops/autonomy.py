@@ -654,7 +654,7 @@ async def _audit(
                 "draft": draft_id,
                 "channel": channel_id,
                 "campaign": decision.campaign_id,
-                "payload": json.dumps(payload),
+                "payload": json.dumps(payload, ensure_ascii=False),
             },
         )
 
