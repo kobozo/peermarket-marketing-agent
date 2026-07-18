@@ -320,6 +320,72 @@ async def test_real_candidate_cycle_uses_collected_hook_metrics_for_neutral_and_
     )
 
 
+@pytest.mark.asyncio
+async def test_audit_routes_to_report_channel_and_renders_blocks(engine):
+    await test_real_single_collected_publication_persists_canonical_input_and_observe(engine)
+    decision = FrozenDecision(
+        DecisionKind.OBSERVE,
+        "10",
+        {"snapshot_id": "routed"},
+        "observe",
+        NOW - timedelta(days=1),
+        NOW,
+        "routed-decision",
+    )
+    settings = SimpleNamespace(slack_report_channel_meta="C0BJ0PUURRR")
+    await _audit(
+        engine,
+        draft_id=156,
+        decision=decision,
+        outcome="shadow",
+        detail="routed detail",
+        settings=settings,
+    )
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT channel_id, payload FROM slack_outbox "
+                    "WHERE idempotency_key='autonomy:routed-decision:shadow'"
+                )
+            )
+        ).one()
+    assert row[0] == "C0BJ0PUURRR"
+    assert row[1]["blocks"][0]["type"] == "header"
+    assert row[1]["detail"] == "routed detail"
+
+
+@pytest.mark.asyncio
+async def test_audit_without_report_channel_leaves_channel_null(engine):
+    await test_real_single_collected_publication_persists_canonical_input_and_observe(engine)
+    decision = FrozenDecision(
+        DecisionKind.OBSERVE,
+        "10",
+        {"snapshot_id": "unrouted"},
+        "observe",
+        NOW - timedelta(days=1),
+        NOW,
+        "unrouted-decision",
+    )
+    settings = SimpleNamespace(slack_report_channel_meta="")
+    await _audit(
+        engine,
+        draft_id=156,
+        decision=decision,
+        outcome="shadow",
+        detail="unrouted detail",
+        settings=settings,
+    )
+    async with engine.connect() as conn:
+        channel_id = await conn.scalar(
+            text(
+                "SELECT channel_id FROM slack_outbox "
+                "WHERE idempotency_key='autonomy:unrouted-decision:shadow'"
+            )
+        )
+    assert channel_id is None
+
+
 @pytest.fixture
 async def engine():
     value = create_async_engine(os.environ["AGENT_DB_URL"], future=True)

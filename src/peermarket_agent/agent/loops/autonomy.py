@@ -26,7 +26,9 @@ from peermarket_agent.autonomy.store import (
     record_decision,
     record_experiment,
 )
+from peermarket_agent.slack_blocks import autonomy_audit_blocks
 from peermarket_agent.slack_outbox import deliver_pending_outbox
+from peermarket_agent.slack_routing import report_channel_id
 
 log = structlog.get_logger(__name__)
 _EXECUTABLE = {
@@ -532,6 +534,7 @@ async def _audit(
     rollback_result: Any = None,
     next_evaluation_at: datetime | None = None,
     after_state: Any = None,
+    settings: Any = None,
 ) -> None:
     """Persist a sanitized immutable Slack payload for retry by the outbox worker."""
     key = f"autonomy:{decision.idempotency_key}:{outcome}"
@@ -608,6 +611,7 @@ async def _audit(
         "rollback": rollback,
         "next_evaluation_at": next_evaluation,
         "replacement_result": replacement_result,
+        "detail": detail,
         "text": (
             f"Autonomy {outcome}: campaign {decision.campaign_id}; "
             f"decision {decision.kind.value}; reason {decision.reason}; "
@@ -623,6 +627,8 @@ async def _audit(
             f"detail {detail}"
         ),
     }
+    payload["blocks"] = autonomy_audit_blocks(payload)
+    channel_id = report_channel_id(settings, "meta") if settings is not None else None
     async with engine.begin() as conn:
         await conn.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:campaign, 7))"),
@@ -639,13 +645,14 @@ async def _audit(
         )
         await conn.execute(
             text(
-                "INSERT INTO slack_outbox(idempotency_key,draft_id,message_kind,payload,autonomy_campaign_id) "
-                "VALUES (:key,:draft,'autonomy_audit',CAST(:payload AS JSONB),:campaign) "
+                "INSERT INTO slack_outbox(idempotency_key,draft_id,channel_id,message_kind,payload,autonomy_campaign_id) "
+                "VALUES (:key,:draft,:channel,'autonomy_audit',CAST(:payload AS JSONB),:campaign) "
                 "ON CONFLICT (idempotency_key) DO NOTHING"
             ),
             {
                 "key": key,
                 "draft": draft_id,
+                "channel": channel_id,
                 "campaign": decision.campaign_id,
                 "payload": json.dumps(payload),
             },
@@ -681,6 +688,7 @@ async def run_autonomy_cycle(
                     decision=decision,
                     outcome="shadow",
                     detail="decision persisted; no action queued",
+                    settings=settings,
                 )
             elif decision.kind in _EXECUTABLE:
                 queued = await enqueue_action(engine, decision)
@@ -692,6 +700,7 @@ async def run_autonomy_cycle(
                     decision=decision,
                     outcome="observe",
                     detail="next evaluation retained",
+                    settings=settings,
                 )
         except Exception as error:
             summary["failed"] += 1
@@ -704,6 +713,7 @@ async def run_autonomy_cycle(
                     decision=decision,
                     outcome="failure",
                     detail=with_exception,
+                    settings=settings,
                 )
             except Exception:
                 log.exception("autonomy.audit_failed", campaign_id=decision.campaign_id)
@@ -745,6 +755,7 @@ async def run_autonomy_cycle(
                     ),
                     next_evaluation_at=result.retry_at,
                     after_state=result.after_state,
+                    settings=settings,
                 )
         except Exception as error:
             summary["failed"] += 1
@@ -757,6 +768,7 @@ async def run_autonomy_cycle(
                         decision=claim.decision,
                         outcome="failure",
                         detail=type(error).__name__,
+                        settings=settings,
                     )
                 except Exception:
                     log.exception("autonomy.audit_failed", campaign_id=claim.campaign_id)

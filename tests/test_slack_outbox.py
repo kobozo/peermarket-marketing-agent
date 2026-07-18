@@ -1,6 +1,7 @@
 """Transactional Slack approval outbox tests."""
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
@@ -122,7 +123,7 @@ async def test_thread_delivery_uses_stored_channel_and_root(prepared_db):
     assert await deliver_pending_outbox(prepared_db, notifier) == 1
 
     notifier.send_message.assert_awaited_once_with(
-        "frozen revision", channel_id="D9", thread_ts="200.02"
+        "frozen revision", channel_id="D9", thread_ts="200.02", blocks=None
     )
 
 
@@ -347,6 +348,42 @@ async def test_stale_revised_outbox_is_obsoleted_without_slack_call(prepared_db,
     async with prepared_db.connect() as connection:
         status = (await connection.execute(text("SELECT status FROM slack_outbox"))).scalar_one()
     assert status == "obsolete"
+
+
+async def test_payload_blocks_are_forwarded_to_send_message(prepared_db):
+    draft_id = await _draft(prepared_db)
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": "Hi"}}]
+    async with prepared_db.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO slack_outbox (idempotency_key, draft_id, message_kind, payload) "
+                "VALUES (:key, :draft, 'root_approval', CAST(:payload AS JSONB))"
+            ),
+            {
+                "key": "blocks-1",
+                "draft": draft_id,
+                "payload": json.dumps({"text": "frozen root", "blocks": blocks}),
+            },
+        )
+    notifier = AsyncMock()
+    notifier.send_message = AsyncMock(return_value=SlackMessageResult("D1", "1.0"))
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 1
+    notifier.send_message.assert_awaited_once_with(
+        "frozen root", channel_id=None, thread_ts=None, blocks=blocks
+    )
+
+
+async def test_legacy_payload_without_blocks_delivers_with_none(prepared_db):
+    draft_id = await _draft(prepared_db)
+    await enqueue_root_approval(prepared_db, draft_id=draft_id, text="frozen root")
+    notifier = AsyncMock()
+    notifier.send_message = AsyncMock(return_value=SlackMessageResult("D1", "1.0"))
+
+    assert await deliver_pending_outbox(prepared_db, notifier) == 1
+    notifier.send_message.assert_awaited_once_with(
+        "frozen root", channel_id=None, thread_ts=None, blocks=None
+    )
 
 
 async def test_ambiguous_root_success_then_ack_becomes_terminal_without_repost(prepared_db):
