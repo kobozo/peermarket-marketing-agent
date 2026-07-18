@@ -13,10 +13,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from peermarket_agent.agent.loops.autonomy import prepare_hook_experiment
+from peermarket_agent.autonomy.hook_experiments import build_hook_proposal
 from peermarket_agent.config import get_settings
 from peermarket_agent.mcp_servers.peermarket_readonly import PeermarketReadonly
 from peermarket_agent.meta_ads import MetaConfig, get_meta_ad_statuses
 from peermarket_agent.meta_insights import fetch_meta_insights
+from peermarket_agent.slack_notifier import SlackNotifier
 
 _CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 _NEUTRAL_EXPERIMENT_REASONS = {
@@ -556,9 +558,27 @@ async def prepare_hook_experiment_command(draft_id: int, seed: str) -> dict[str,
             "fixed_identity": metadata.get("fixed_identity"),
             "language_bundles": metadata.get("language_bundles"),
         }
-        experiment = await prepare_hook_experiment(
-            engine, settings, draft, str(row["voice_rules_md"]), seed
-        )
+        try:
+            experiment = await prepare_hook_experiment(
+                engine, settings, draft, str(row["voice_rules_md"]), seed
+            )
+        except ValueError as exc:
+            if str(exc) != "draft requires exact NL/FR/EN baseline bundles":
+                raise
+            proposal = build_hook_proposal(draft, str(row["voice_rules_md"]))
+            message = format_hook_proposal_slack(draft_id, proposal, str(exc))
+            notifier = SlackNotifier(
+                bot_token=settings.slack_bot_token,
+                founder_user_id=settings.slack_founder_user_id,
+            )
+            await notifier.notify_founder(message)
+            return {
+                "draft_id": draft_id,
+                "status": "proposal_required",
+                "reason": str(exc),
+                "proposal": proposal,
+                "shadow": True,
+            }
         return {
             "draft_id": draft_id,
             "experiment_id": experiment.experiment_id,
@@ -568,6 +588,27 @@ async def prepare_hook_experiment_command(draft_id: int, seed: str) -> dict[str,
         }
     finally:
         await engine.dispose()
+
+
+def format_hook_proposal_slack(
+    draft_id: int, proposal: dict[str, dict[str, str]], reason: str
+) -> str:
+    """Format a sanitized founder-facing proposal with an explicit next step."""
+    lines = [
+        f"📝 Jarvis voorstel voor draft {draft_id}",
+        f"Reden: {reason}",
+        "De draft mist een volledige NL/FR/EN-baseline. Ik stel deze hooks voor:",
+    ]
+    for locale in ("NL", "FR", "EN"):
+        lines.append(f"{locale}: {proposal[locale]['hook']}")
+    lines.extend(
+        [
+            "Reply `✅ 156` om dit voorstel klaar te zetten voor review.",
+            "Reply met je wijzigingen in deze thread als je eerst wilt aanpassen.",
+            "Reply `❌ 156` om het voorstel te verwerpen.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 @click.group()

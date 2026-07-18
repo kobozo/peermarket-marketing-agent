@@ -45,6 +45,45 @@ HOOK_CATALOG_VERSION = "hook-catalog-v1"
 _NON_HOOK_FIELDS = ("body", "headline", "description", "cta_label")
 
 
+def build_hook_proposal(
+    draft: Mapping[str, Any] | object, brand_voice: str
+) -> dict[str, dict[str, str]]:
+    """Return an idiomatic 3-locale baseline proposal when a draft is incomplete.
+
+    This is deliberately pure: it only proposes copy and never persists or calls
+    Meta. The caller can present it for founder approval before adding it to a
+    draft's frozen language bundles.
+    """
+    if not isinstance(brand_voice, str) or not brand_voice.strip():
+        raise ValueError("brand_voice must be non-empty")
+    title = str(_read(draft, "title") or _read(draft, "name") or "Peermarket")
+    copy = {
+        "NL": {
+            "body": f"{title}: verkoop eenvoudig en veilig aan betrouwbare kopers.",
+            "headline": "Verkoop veilig aan echte kopers",
+            "description": "Meer vertrouwen, minder gedoe.",
+            "cta_label": "Meer informatie",
+            "hook": _HOOK_CONCEPTS[0]["NL"],
+        },
+        "FR": {
+            "body": f"{title} : vendez facilement et en sécurité à des acheteurs fiables.",
+            "headline": "Vendez en sécurité à de vrais acheteurs",
+            "description": "Plus de confiance, moins de tracas.",
+            "cta_label": "En savoir plus",
+            "hook": _HOOK_CONCEPTS[0]["FR"],
+        },
+        "EN": {
+            "body": f"{title}: sell easily and safely to trusted buyers.",
+            "headline": "Sell safely to real buyers",
+            "description": "More trust, less hassle.",
+            "cta_label": "Learn more",
+            "hook": _HOOK_CONCEPTS[0]["EN"],
+        },
+    }
+    validate_native_hook_bundle({locale: copy[locale]["hook"] for locale in LOCALES})
+    return copy
+
+
 def _read(draft: Mapping[str, Any] | object, name: str) -> Any:
     return draft.get(name) if isinstance(draft, Mapping) else getattr(draft, name)
 

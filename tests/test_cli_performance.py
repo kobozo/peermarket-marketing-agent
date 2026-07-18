@@ -324,6 +324,24 @@ def test_verifier_source_has_no_meta_mutation_surface():
     assert 'text("UPDATE ' not in source
 
 
+def test_hook_proposal_slack_message_contains_all_locales_and_approval_command():
+    from peermarket_agent.cli_performance import format_hook_proposal_slack
+
+    message = format_hook_proposal_slack(
+        156,
+        {
+            "NL": {"hook": "Verkoop veilig aan echte kopers"},
+            "FR": {"hook": "Vendez en sécurité à de vrais acheteurs"},
+            "EN": {"hook": "Sell safely to real buyers"},
+        },
+        "missing baseline",
+    )
+
+    assert "draft 156" in message.casefold()
+    assert "NL" in message and "FR" in message and "EN" in message
+    assert "✅ 156" in message
+
+
 def test_autonomy_command_accepts_draft_id_and_emits_sanitized_json(monkeypatch):
     report = {
         "draft_id": 156,
