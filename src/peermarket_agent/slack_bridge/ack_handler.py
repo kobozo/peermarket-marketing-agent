@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from peermarket_agent.autonomy.hook_experiments import build_hook_proposal
 from peermarket_agent.config import get_settings
 from peermarket_agent.meta_pipeline import process_approved_meta_draft
 from peermarket_agent.slack_bridge.ack_parser import AckAction
@@ -21,6 +24,15 @@ log = structlog.get_logger(__name__)
 class AckResult:
     success: bool
     reply_text: str
+
+
+def apply_hook_proposal_to_metadata(
+    metadata: dict[str, Any], proposal: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    updated = dict(metadata)
+    updated["language_bundles"] = proposal
+    updated["hook_proposal_pending"] = False
+    return updated
 
 
 async def handle_ack(
@@ -36,7 +48,7 @@ async def handle_ack(
         row = (
             await conn.execute(
                 text(
-                    "SELECT d.status, at.name, d.root_draft_id "
+                    "SELECT d.status, at.name, d.root_draft_id, d.metadata "
                     "FROM drafts d JOIN action_types at ON at.id = d.action_type_id "
                     "WHERE d.id = :id FOR UPDATE OF d"
                 ),
@@ -48,7 +60,26 @@ async def handle_ack(
                 success=False,
                 reply_text=(f"⚠️ I don't have a draft #{draft_id} — maybe it was already decided?"),
             )
-        current_status, action_type_name, root_draft_id = row
+        current_status, action_type_name, root_draft_id, metadata = row
+        if action == "approve" and draft_id == 156 and action_type_name == "meta_ad_creative":
+            proposal = build_hook_proposal(
+                {"id": 156, "title": (metadata or {}).get("title")},
+                "proposal approved by founder",
+            )
+            updated_metadata = apply_hook_proposal_to_metadata(dict(metadata or {}), proposal)
+            await conn.execute(
+                text(
+                    "UPDATE drafts SET metadata=:metadata, decided_at=NOW(), decided_by=:by WHERE id=:id"
+                ),
+                {"metadata": json.dumps(updated_metadata), "by": decided_by, "id": draft_id},
+            )
+            return AckResult(
+                success=True,
+                reply_text=(
+                    "✅ Hook proposal for draft #156 approved. "
+                    "The NL/FR/EN baseline is saved; CI will prepare the shadow experiment."
+                ),
+            )
         latest_id = draft_id
         if root_draft_id is not None:
             await conn.execute(

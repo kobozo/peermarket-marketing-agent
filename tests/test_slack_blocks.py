@@ -44,6 +44,9 @@ def test_autonomy_blocks_start_with_header_and_contain_no_json_dumps() -> None:
     assert "11,303" in rendered  # formatted numbers
     assert "not_comparable" in rendered
     assert "2026-07-18" in rendered
+    assert "0.37% LPV rate" in rendered
+    assert "attributed registrations" in rendered
+    assert "not registrations directly reported by Meta" in rendered
 
 
 def test_autonomy_blocks_show_variant_metrics_as_fields() -> None:

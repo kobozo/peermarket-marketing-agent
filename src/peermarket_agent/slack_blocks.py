@@ -30,6 +30,15 @@ def _euros(cents) -> str:
         return "–"
 
 
+def _rate(numerator, denominator) -> str:
+    try:
+        if int(denominator) <= 0:
+            return "–"
+        return f"{100 * int(numerator) / int(denominator):.2f}%"
+    except (TypeError, ValueError):
+        return "–"
+
+
 def autonomy_audit_blocks(payload: dict) -> list[dict]:
     payload = payload or {}
     outcome = payload.get("outcome") or "audit"
@@ -53,7 +62,8 @@ def autonomy_audit_blocks(payload: dict) -> list[dict]:
                 f"*Variant {sample.get('variant_id') or '?'}*\n"
                 f"{_count(sample.get('impressions'))} impressions\n"
                 f"{_count(sample.get('landing_page_views'))} landing-page views\n"
-                f"{_count(sample.get('registrations'))} registrations"
+                f"{_rate(sample.get('landing_page_views'), sample.get('impressions'))} LPV rate\n"
+                f"{_count(sample.get('registrations'))} attributed registrations"
             ),
         }
         for sample in payload.get("evidence") or []
@@ -86,6 +96,12 @@ def autonomy_audit_blocks(payload: dict) -> list[dict]:
             f"{replacement.get('source_status') or 'paused'}"
         )
     blocks.append(_section("\n".join(state)))
+    blocks.append(
+        _context(
+            "Attributed registrations are Peermarket UTM/attribution events, "
+            "not registrations directly reported by Meta."
+        )
+    )
 
     thresholds = payload.get("thresholds") or {}
     footer = (
