@@ -71,7 +71,11 @@ async def handle_ack(
                 text(
                     "UPDATE drafts SET metadata=:metadata, decided_at=NOW(), decided_by=:by WHERE id=:id"
                 ),
-                {"metadata": json.dumps(updated_metadata), "by": decided_by, "id": draft_id},
+                {
+                    "metadata": json.dumps(updated_metadata, ensure_ascii=False),
+                    "by": decided_by,
+                    "id": draft_id,
+                },
             )
             return AckResult(
                 success=True,
