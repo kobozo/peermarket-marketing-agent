@@ -50,19 +50,23 @@ def is_authorized_user(user_id: str, founder_user_id: str | None = None) -> bool
 
 
 async def _chat_reply(text_msg: str, claude: ClaudeClient) -> str:
-    response = await claude.complete(
-        system=(
-            "You are Jarvis, the PeerMarket marketing operations agent. "
-            "Treat the user's message as feedback or a request for investigation. "
-            "Reply in Dutch unless the user writes another language. State what "
-            "you understood, propose concrete investigative steps, and mark any "
-            "action needing explicit approval. Never claim a change happened unless executed."
-        ),
-        user=text_msg,
-        temperature=0.2,
-        max_tokens=800,
-    )
-    return response.text.strip() or "Ik heb je feedback ontvangen en maak een onderzoeksplan."
+    try:
+        response = await claude.complete(
+            system=(
+                "You are Jarvis, the PeerMarket marketing operations agent. "
+                "Treat the user's message as feedback or a request for investigation. "
+                "Reply in Dutch unless the user writes another language. State what "
+                "you understood, propose concrete investigative steps, and mark any "
+                "action needing explicit approval. Never claim a change happened unless executed."
+            ),
+            user=text_msg,
+            temperature=0.2,
+            max_tokens=800,
+        )
+        return response.text.strip() or "Ik heb je feedback ontvangen en maak een onderzoeksplan."
+    except Exception:
+        log.exception("slack_bridge.chat_reply_failed")
+        return "👋 PeerMarket marketing agent is online, maar de analyse-service is tijdelijk niet beschikbaar."
 
 
 async def handle_app_mention(event: dict, say) -> None:
