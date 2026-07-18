@@ -175,7 +175,7 @@ jobs:
             prepare_status=$?
             set -e
             if [[ "$prepare_status" -ne 0 ]]; then
-              echo 'hook experiment preparation pending draft controls'
+              echo "hook experiment preparation pending draft controls"
             fi
             fi
           '
