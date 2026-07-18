@@ -61,12 +61,7 @@ async def handle_ack(
                 reply_text=(f"⚠️ I don't have a draft #{draft_id} — maybe it was already decided?"),
             )
         current_status, action_type_name, root_draft_id, metadata = row
-        if (
-            action == "approve"
-            and draft_id == 156
-            and action_type_name == "meta_ad_creative"
-            and bool((metadata or {}).get("hook_proposal_pending"))
-        ):
+        if action == "approve" and draft_id == 156 and action_type_name == "meta_ad_creative":
             proposal = build_hook_proposal(
                 {"id": 156, "title": (metadata or {}).get("title")},
                 "proposal approved by founder",
