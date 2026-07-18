@@ -58,6 +58,22 @@ def test_autonomy_blocks_survive_sparse_payload() -> None:
     assert autonomy_audit_blocks({})[0]["type"] == "header"
 
 
+def test_autonomy_blocks_survive_none_payload() -> None:
+    blocks = autonomy_audit_blocks(None)
+    assert isinstance(blocks, list) and blocks
+    assert blocks[0]["type"] == "header"
+
+
+def test_daily_summary_blocks_survive_none_message() -> None:
+    blocks = daily_summary_blocks(None)
+    assert isinstance(blocks, list) and blocks
+
+
+def test_hourly_alert_blocks_survive_none_message() -> None:
+    blocks = hourly_alert_blocks(None)
+    assert isinstance(blocks, list) and blocks
+
+
 def test_daily_summary_blocks_split_title_and_publications() -> None:
     message = (
         "Daily campaign evidence summary (descriptive observations only)\n"

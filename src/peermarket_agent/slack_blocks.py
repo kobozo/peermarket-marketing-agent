@@ -31,6 +31,7 @@ def _euros(cents) -> str:
 
 
 def autonomy_audit_blocks(payload: dict) -> list[dict]:
+    payload = payload or {}
     outcome = payload.get("outcome") or "audit"
     decision = payload.get("decision") or "unknown"
     blocks = [_header(f"🤖 Autonomy {outcome} — {decision}")]
@@ -99,6 +100,7 @@ def autonomy_audit_blocks(payload: dict) -> list[dict]:
 
 
 def daily_summary_blocks(message: str) -> list[dict]:
+    message = message or ""
     lines = [line for line in message.splitlines() if line.strip()]
     if not lines:
         return [_section(message or " ")]
@@ -118,5 +120,6 @@ def daily_summary_blocks(message: str) -> list[dict]:
 
 
 def hourly_alert_blocks(message: str) -> list[dict]:
+    message = message or ""
     emoji = "✅" if "recovered" in message.lower() else "⚠️"
     return [_section(f"{emoji} *Meta delivery*\n{message}")]
