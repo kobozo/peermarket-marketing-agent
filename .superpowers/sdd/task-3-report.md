@@ -1,139 +1,52 @@
-# Task 3 Report: Block Kit builders (`slack_blocks.py`)
+# Task 3 report: Performance snapshots and delivery classification
 
-## Status: Complete — all tests green, ruff clean, committed.
+## Status
 
-## Files changed
-- `src/peermarket_agent/slack_blocks.py` (new) — pure Block Kit builders: `autonomy_audit_blocks`, `daily_summary_blocks`, `hourly_alert_blocks`.
-- `tests/test_slack_blocks.py` (new) — 5 tests transcribed verbatim from the brief.
+Complete. Implemented deterministic performance derivation, delivery classification, and atomic publication performance persistence. Review findings were fixed in a second strict-TDD pass. No push, production access, scheduler change, alert change, or Meta API mutation was performed.
 
-Neither file existed before this task; no conflicts with prior work.
+Initial commit: `137eed0 feat: persist Meta delivery performance`
 
-## TDD evidence
+## Initial TDD evidence
 
-### RED (module absent)
-```
-$ uv run pytest tests/test_slack_blocks.py -v
-...
-ERROR collecting tests/test_slack_blocks.py
-ImportError while importing test module '.../tests/test_slack_blocks.py'.
-E   ModuleNotFoundError: No module named 'peermarket_agent.slack_blocks'
-=========================== short test summary info ============================
-ERROR tests/test_slack_blocks.py
-!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
-=============================== 1 error in 0.53s ===============================
-```
+- RED: the focused suite failed during collection because `peermarket_agent.performance` and `save_performance_snapshot` did not exist.
+- GREEN: `tests/test_performance.py tests/test_publications.py` reported `34 passed` against the disposable PostgreSQL database.
+- A second RED/GREEN cycle proved partial fields within an existing namespace were initially replaced, then retained after the merge fix.
 
-### GREEN (module implemented)
-```
-$ uv run pytest tests/test_slack_blocks.py -v
-tests/test_slack_blocks.py::test_autonomy_blocks_start_with_header_and_contain_no_json_dumps PASSED [ 20%]
-tests/test_slack_blocks.py::test_autonomy_blocks_show_variant_metrics_as_fields PASSED [ 40%]
-tests/test_slack_blocks.py::test_autonomy_blocks_survive_sparse_payload PASSED [ 60%]
-tests/test_slack_blocks.py::test_daily_summary_blocks_split_title_and_publications PASSED [ 80%]
-tests/test_slack_blocks.py::test_hourly_alert_blocks_wrap_message PASSED [100%]
-============================== 5 passed in 0.06s ===============================
-```
+## Implemented contract
 
-## Ruff
+- `derive_performance` retains current/previous snapshots, derives non-negative metric deltas, and marks Meta restatements.
+- `classify_delivery` deterministically distinguishes healthy, reviewing, no-delivery, rejected/error, terminal, and unknown states.
+- Grace-period comparisons require timezone-aware timestamps and correctly compare different offsets.
+- A configured-active hierarchy is unknown when any effective status is missing or empty.
+- `save_performance_snapshot` rejects absent publications and locks the publication row with `SELECT ... FOR UPDATE`.
+- Performance updates recursively merge dictionaries at every depth; lists and scalar values replace prior values.
+- Concurrent hourly/daily namespace updates therefore retain both namespaces and nested sibling fields.
+- Persistence normalization recursively converts `Mapping`/`MappingProxyType` to dictionaries, tuples/lists to JSON arrays, `Decimal` to lossless strings, dates to ISO dates, and aware datetimes to UTC ISO timestamps.
+- Unsupported values, non-string mapping keys, non-finite floats, and naive datetimes are rejected before database serialization.
+- JSON serialization is deterministic (`sort_keys`, compact separators, and non-finite values disabled).
+- The migration reasserts the JSONB default, repairs legacy null performance values, and enforces `NOT NULL`.
 
-Repo has `ruff.toml` at the root (`select = ["E", "F", "I", "B", "UP", "ASYNC"]`, line-length 100), so ruff is configured and was run per instructions.
+## Review-finding TDD evidence
 
-First run flagged one real issue — not a test failure, but a mechanical style fix under the repo's existing lint config:
-```
-UP034 [*] Avoid extraneous parentheses
-  --> src/peermarket_agent/slack_blocks.py:81:36
-   |
-81 |         locales = ", ".join(sorted((replacement.get("ad_ids") or {})))
-   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-help: Remove extraneous parentheses
-```
-Deviation from the brief's verbatim code: changed
-```python
-locales = ", ".join(sorted((replacement.get("ad_ids") or {})))
-```
-to
-```python
-locales = ", ".join(sorted(replacement.get("ad_ids") or {}))
-```
-(dropped the redundant inner parens). Purely cosmetic — `sorted(X)` and `sorted((X))` are semantically identical; ruff's UP034 rule (unnecessary-parentheses) flags this under the repo's existing config. No other lines were touched.
+The review regressions first reported `5 failed`:
 
-```
-$ uv run ruff check src/peermarket_agent/slack_blocks.py tests/test_slack_blocks.py
-All checks passed!
-```
+- configured-active resources with missing/empty effective status were incorrectly classified healthy;
+- nested `meta.latest` updates replaced sibling metrics;
+- a real `MetaInsightSnapshot` payload failed on `date` serialization;
+- unsupported objects leaked the generic encoder failure;
+- the explicit nested tuple/list regression subsequently failed with `unsupported performance value: list` before its minimal fix.
 
-Re-ran pytest after the fix — still 5/5 passing (shown above, post-fix output).
+After implementation, all individual regression tests passed.
 
-## Self-review
+The database round-trip test builds the payload from an actual `MetaInsightSnapshot` via `derive_performance`, including `Decimal`, `date`, aware `datetime`, and `MappingProxyType` values, persists it, and verifies the normalized JSONB values read back.
 
-- **Purity:** module has zero imports, no I/O, no settings access — confirmed by reading the final file top to bottom.
-- **Sparse/missing-field tolerance:** every payload read goes through `.get(...)` with `or` fallbacks; `_count`/`_euros` catch `TypeError`/`ValueError` so `None`/garbage values never raise. `autonomy_audit_blocks({})` is covered directly by `test_autonomy_blocks_survive_sparse_payload`.
-- **Slack limits respected:**
-  - header text sliced to `[:150]` in `_header`.
-  - section/context text sliced to `[:3000]` in `_section`/`_context`.
-  - fields section capped at `_MAX_SECTION_FIELDS` (10) via `fields[:_MAX_SECTION_FIELDS]`.
-  - both `autonomy_audit_blocks` and `daily_summary_blocks` cap total blocks at `_MAX_BLOCKS` (50); `daily_summary_blocks` also reserves 2 slots for header + "…and N more" overflow context block.
-- **No raw JSON/dict dumps in copy:** verified by the test asserting `"{'"` and `'{\\"'` are absent from `json.dumps(blocks)` — all payload values are interpolated into formatted strings, never `str()`'d as a dict/list directly.
-- **Scope discipline:** did not touch `.superpowers/sdd/task-2-report.md`, which had unrelated uncommitted changes present before I started (from a prior task's session) — left untouched and unstaged; only my two new files were staged and committed.
+## Final verification
 
-## Concerns
+- `AGENT_DB_URL=postgresql+asyncpg://postgres:test@localhost:55432/agent_test uv run pytest -q tests/test_migrations.py tests/test_performance.py tests/test_publications.py tests/test_meta_insights.py` -> `59 passed in 5.15s`
+- `uv run ruff check src tests` -> all checks passed
+- `uv run ruff format --check src tests` -> 93 files already formatted
+- `git diff --check` -> clean
 
-- This report file (`task-3-report.md`) previously contained a stale report titled "Performance snapshots and delivery classification" from an unrelated earlier task — that content has been replaced with this Task 3 (Block Kit builders) report as instructed. Flagging in case that stale content needs to be preserved elsewhere.
-- Only other deviation from the brief was the one-line ruff formatting fix (documented above), required because the repo's `ruff.toml` (not `pyproject.toml`) enables the `UP` rule set — brief said "if ruff is configured in pyproject," but the actual config lives in `ruff.toml` at repo root; treated that as "ruff is configured" per the spirit of the instruction.
-- `daily_summary_blocks` assumes the "• Publication #N — a; b; c" line format from the brief; any future message format changes (e.g., nested bullets or different separators) would need corresponding logic updates — out of scope here, purely noting for whoever wires this into the daily/hourly report senders (later tasks).
+## Scope review
 
----
-
-## Follow-up fix: harden against `None` inputs (reviewer findings)
-
-### Status: Complete — all tests green, ruff clean, committed.
-
-### Findings addressed
-1. `daily_summary_blocks(None)` raised `AttributeError` at `message.splitlines()`; `hourly_alert_blocks(None)` raised `AttributeError` at `message.lower()`.
-2. `autonomy_audit_blocks(None)` raised `AttributeError` at `payload.get(...)`.
-
-### Fix
-Added a normalization guard at the top of each function:
-- `autonomy_audit_blocks`: `payload = payload or {}`
-- `daily_summary_blocks`: `message = message or ""`
-- `hourly_alert_blocks`: `message = message or ""`
-
-No other logic changed. `daily_summary_blocks("")`/`(None)` still return the single `_section(" ")`-style fallback (unchanged existing behavior for empty messages).
-
-### TDD evidence
-
-RED — added 3 new tests to `tests/test_slack_blocks.py` (`test_autonomy_blocks_survive_none_payload`, `test_daily_summary_blocks_survive_none_message`, `test_hourly_alert_blocks_survive_none_message`) and ran:
-
-```
-$ uv run pytest tests/test_slack_blocks.py -v
-...
-FAILED tests/test_slack_blocks.py::test_autonomy_blocks_survive_none_payload - AttributeError: 'NoneType' object has no attribute 'get'
-FAILED tests/test_slack_blocks.py::test_daily_summary_blocks_survive_none_message - AttributeError: 'NoneType' object has no attribute 'splitlines'
-FAILED tests/test_slack_blocks.py::test_hourly_alert_blocks_survive_none_message - AttributeError: 'NoneType' object has no attribute 'lower'
-3 failed, 5 passed in 0.10s
-```
-
-GREEN — after adding the three guards:
-
-```
-$ uv run pytest tests/test_slack_blocks.py -v
-tests/test_slack_blocks.py::test_autonomy_blocks_start_with_header_and_contain_no_json_dumps PASSED [ 12%]
-tests/test_slack_blocks.py::test_autonomy_blocks_show_variant_metrics_as_fields PASSED [ 25%]
-tests/test_slack_blocks.py::test_autonomy_blocks_survive_sparse_payload PASSED [ 37%]
-tests/test_slack_blocks.py::test_autonomy_blocks_survive_none_payload PASSED [ 50%]
-tests/test_slack_blocks.py::test_daily_summary_blocks_survive_none_message PASSED [ 62%]
-tests/test_slack_blocks.py::test_hourly_alert_blocks_survive_none_message PASSED [ 75%]
-tests/test_slack_blocks.py::test_daily_summary_blocks_split_title_and_publications PASSED [ 87%]
-tests/test_slack_blocks.py::test_hourly_alert_blocks_wrap_message PASSED [100%]
-8 passed in 0.04s
-```
-
-### Ruff
-
-```
-$ uv run ruff check src/peermarket_agent/slack_blocks.py tests/test_slack_blocks.py
-All checks passed!
-```
-
-### Scope discipline
-Only the three `payload/message` normalization lines were added to `slack_blocks.py`; no restructuring. Left `.superpowers/sdd/task-2-report.md` and other unrelated pre-existing uncommitted changes in the working tree untouched.
+Changes are restricted to performance derivation/classification, publication JSONB persistence, its idempotent migration hardening, and focused tests/reporting. No scheduler, notification, external API, deployment, or production state was changed.
