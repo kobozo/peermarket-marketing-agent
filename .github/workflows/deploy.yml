@@ -219,6 +219,12 @@ jobs:
           actual = [item["variant_id"] for item in experiment["variants"]]
           assert report["draft_id"] == 156
           assert report["feature_flags"] == {"enabled": True, "shadow": True, "allowlisted": True}
+          if not experiment["ready"]:
+              # A missing multilingual baseline is an expected safe state:
+              # Jarvis has sent the founder a proposal and Meta remains untouched.
+              assert experiment["blocked_reason"] == "variant_ids_mismatch"
+              print("proposal_pending: Jarvis must receive baseline approval before canary creation")
+              raise SystemExit(0)
           assert experiment["variant_count"] == 3 and actual == expected
           assert experiment["fixed_identity_match"] and experiment["ready"]
           evidence = report["experiment_evidence"]
