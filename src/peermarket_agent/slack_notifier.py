@@ -19,7 +19,7 @@ class SlackNotifier:
         self._client = AsyncWebClient(token=bot_token)
         self._founder_user_id = founder_user_id
 
-    async def notify_founder(self, text: str) -> bool:
+    async def notify_founder(self, text: str, *, blocks: list[dict] | None = None) -> bool:
         """DM the founder. Returns True if sent, False if no founder configured."""
         if not self._founder_user_id:
             log.warning(
@@ -28,10 +28,10 @@ class SlackNotifier:
             )
             return False
         try:
-            await self._client.chat_postMessage(
-                channel=self._founder_user_id,
-                text=text,
-            )
+            kwargs = {"channel": self._founder_user_id, "text": text}
+            if blocks:
+                kwargs["blocks"] = blocks
+            await self._client.chat_postMessage(**kwargs)
             return True
         except Exception:
             log.exception("slack_notifier.send_failed")
@@ -58,6 +58,7 @@ class SlackNotifier:
         *,
         channel_id: str | None = None,
         thread_ts: str | None = None,
+        blocks: list[dict] | None = None,
     ) -> SlackMessageResult:
         """Post a message and expose Slack's authoritative message identity.
 
@@ -70,6 +71,8 @@ class SlackNotifier:
         kwargs = {"channel": channel, "text": text}
         if thread_ts is not None:
             kwargs["thread_ts"] = thread_ts
+        if blocks:
+            kwargs["blocks"] = blocks
         response = await self._client.chat_postMessage(**kwargs)
         return SlackMessageResult(
             channel_id=str(response["channel"]),
