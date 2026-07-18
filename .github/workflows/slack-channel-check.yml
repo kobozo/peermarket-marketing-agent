@@ -1,0 +1,43 @@
+name: slack-channel-check
+
+# Manual smoke test: verify the bot can post styled messages to the
+# per-platform report channels (rights + membership check).
+on:
+  workflow_dispatch:
+
+jobs:
+  post-test-messages:
+    runs-on: [self-hosted, agent-peermarket]
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+    steps:
+      - name: Post a Block Kit test message to each report channel
+        run: |
+          set -u
+          failed=0
+          for entry in "tiktok:C0BJ71Z4YFL" "facebook:C0BJ0PUURRR" "email:C0BHRLPM3QX"; do
+            name="${entry%%:*}"; channel="${entry##*:}"
+            payload=$(cat <<JSON
+          {
+            "channel": "$channel",
+            "text": "Reporting channel check — peermarket-agent can post here.",
+            "blocks": [
+              {"type": "header", "text": {"type": "plain_text", "text": "✅ Reporting channel check", "emoji": true}},
+              {"type": "section", "text": {"type": "mrkdwn", "text": "peermarket-agent can post *styled* report messages to *#$name*."}},
+              {"type": "context", "elements": [{"type": "mrkdwn", "text": "Triggered manually via the slack-channel-check workflow."}]}
+            ]
+          }
+          JSON
+          )
+            response=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+              -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+              -H "Content-type: application/json; charset=utf-8" \
+              --data "$payload")
+            if echo "$response" | grep -q '"ok":true'; then
+              echo "#$name ($channel): ok"
+            else
+              echo "#$name ($channel): FAILED -> $response"
+              failed=1
+            fi
+          done
+          exit $failed
