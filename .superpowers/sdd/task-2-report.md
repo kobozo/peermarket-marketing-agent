@@ -1,79 +1,137 @@
-# Task 2 report: Read-only Meta Insights client
+# Task 2 Report: `SlackNotifier` blocks passthrough
 
-## Status
+## Status: DONE
 
-Complete. Implemented and committed the read-only Meta Insights adapter without pushing or touching production.
+## What was implemented
 
-Commit: `3f2d7e7 feat: collect normalized Meta Insights`
+- `src/peermarket_agent/slack_notifier.py`
+  - `send_message(text, *, channel_id=None, thread_ts=None, blocks: list[dict] | None = None)`:
+    added `blocks` kwarg; `kwargs["blocks"] = blocks` only appended when `blocks` is
+    truthy, alongside the existing `channel`/`text`/optional `thread_ts` kwargs.
+  - `notify_founder(text, *, blocks: list[dict] | None = None) -> bool`: added `blocks`
+    kwarg; builds `kwargs = {"channel": ..., "text": text}` and conditionally adds
+    `blocks` the same way, then calls `chat_postMessage(**kwargs)` (previously called
+    with fixed `channel=`/`text=` args directly).
+  - `text` is unconditionally included in both call sites in all cases (fallback
+    notification always sent). `blocks` never appears in the outgoing kwargs when
+    falsy (`None` or `[]`).
+
+- `tests/test_slack_notifier.py`
+  - Added `_notifier_with_recorder(monkeypatch)` helper: builds a `SlackNotifier` whose
+    `AsyncWebClient` is monkeypatched (matching the file's existing pattern) with a
+    `chat_postMessage` `AsyncMock(side_effect=...)` that records the actual call kwargs
+    into a dict and returns a realistic Slack response. This lets new tests assert on
+    kwarg *presence/absence* (`"blocks" not in recorded`) rather than only exact-call
+    equality, which the existing `assert_awaited_once_with` style can't express cleanly
+    for "kwarg omitted."
+  - Added 4 tests (brief listed 3; a 4th was added for symmetry/coverage):
+    - `test_send_message_forwards_blocks`
+    - `test_send_message_omits_blocks_kwarg_when_absent`
+    - `test_notify_founder_forwards_blocks`
+    - `test_notify_founder_omits_blocks_kwarg_when_absent` (added beyond the brief's
+      sketch, mirroring the `send_message` omission test for full symmetry between
+      the two public methods)
 
 ## TDD evidence
 
-- RED: `uv run pytest -q tests/test_meta_insights.py` failed during collection with the expected `ModuleNotFoundError: No module named 'peermarket_agent.meta_insights'`.
-- GREEN: after the minimum implementation, the focused suite reported `8 passed in 0.11s`.
-- Post-format GREEN: the focused suite again reported `8 passed in 0.11s`.
+### RED — before implementation
 
-## Implemented contract
+Command: `uv run pytest tests/test_slack_notifier.py -v`
 
-- Frozen `MetaInsightSnapshot` with exact date window and UTC `retrieved_at`.
-- `async fetch_meta_insights(...)` delegates Meta SDK initialization, the read-only `Ad.get_insights` call, and paginated cursor consumption to `asyncio.to_thread`.
-- Exact delivery fields requested; paginated counters and action arrays normalized and summed.
-- Missing fields/actions normalize to zero; ratio fields use denominator guards.
-- Spend and derived currency metrics use `Decimal` and half-up cent rounding.
-- Transient/rate-limit failures use bounded exponential backoff with at most three attempts.
-- Permanent failures are not retried.
-- `MetaInsightsError.transient` is exposed while messages contain only sanitized code/type/status metadata, never raw SDK messages or credentials.
-- No Meta mutation API is imported or called.
+```
+tests/test_slack_notifier.py::test_send_message_returns_slack_channel_and_timestamp PASSED [ 10%]
+tests/test_slack_notifier.py::test_send_message_posts_thread_reply_to_explicit_root PASSED [ 20%]
+tests/test_slack_notifier.py::test_notify_founder_posts_dm PASSED        [ 30%]
+tests/test_slack_notifier.py::test_notify_founder_no_id_does_nothing PASSED [ 40%]
+tests/test_slack_notifier.py::test_notify_founder_handles_slack_errors PASSED [ 50%]
+tests/test_slack_notifier.py::test_post_draft_thread_returns_root_message_reference PASSED [ 60%]
+tests/test_slack_notifier.py::test_send_message_forwards_blocks FAILED   [ 70%]
+tests/test_slack_notifier.py::test_send_message_omits_blocks_kwarg_when_absent PASSED [ 80%]
+tests/test_slack_notifier.py::test_notify_founder_forwards_blocks FAILED [ 90%]
+tests/test_slack_notifier.py::test_notify_founder_omits_blocks_kwarg_when_absent PASSED [100%]
 
-## Tests
+FAILED tests/test_slack_notifier.py::test_send_message_forwards_blocks - TypeError: SlackNotifier.send_message() got an unexpected keyword argument 'blocks'
+FAILED tests/test_slack_notifier.py::test_notify_founder_forwards_blocks - TypeError: SlackNotifier.notify_founder() got an unexpected keyword argument 'blocks'
+2 failed, 8 passed in 1.65s
+```
 
-SDK-boundary mocks prove:
+(The two "omits blocks kwarg" tests pass trivially pre-implementation since blocks
+was never sent anyway — the forwarding tests are the ones that correctly fail with
+`TypeError: unexpected keyword argument 'blocks'`, confirming the parameter didn't
+exist yet.)
 
-- missing-field/action and Decimal normalization;
-- multi-page aggregation and per-action summing;
-- exact fields, date window, UTC retrieval timestamp, and frozen snapshot;
-- transient recovery on the third attempt;
-- rate-limit exhaustion at exactly three attempts;
-- permanent no-retry and credential redaction;
-- denominator guards for ratios;
-- rejection of attempt counts above the hard bound before SDK access.
+### GREEN — after implementation
 
-## Verification
+Command: `uv run pytest tests/test_slack_notifier.py -v`
 
-- `uv run pytest -q tests/test_meta_insights.py` -> `8 passed`
-- `uv run ruff format --check src/peermarket_agent/meta_insights.py tests/test_meta_insights.py` -> 2 files already formatted
-- `uv run ruff check src/peermarket_agent/meta_insights.py tests/test_meta_insights.py` -> all checks passed
-- `git diff --check` -> clean
-- staged diff before commit contained exactly the two requested source/test files
+```
+tests/test_slack_notifier.py::test_send_message_returns_slack_channel_and_timestamp PASSED [ 10%]
+tests/test_slack_notifier.py::test_send_message_posts_thread_reply_to_explicit_root PASSED [ 20%]
+tests/test_slack_notifier.py::test_notify_founder_posts_dm PASSED        [ 30%]
+tests/test_slack_notifier.py::test_notify_founder_no_id_does_nothing PASSED [ 40%]
+tests/test_slack_notifier.py::test_notify_founder_handles_slack_errors PASSED [ 50%]
+tests/test_slack_notifier.py::test_post_draft_thread_returns_root_message_reference PASSED [ 60%]
+tests/test_slack_notifier.py::test_send_message_forwards_blocks PASSED   [ 70%]
+tests/test_slack_notifier.py::test_send_message_omits_blocks_kwarg_when_absent PASSED [ 80%]
+tests/test_slack_notifier.py::test_notify_founder_forwards_blocks PASSED [ 90%]
+tests/test_slack_notifier.py::test_notify_founder_omits_blocks_kwarg_when_absent PASSED [100%]
+
+10 passed in 1.37s
+```
+
+All 6 pre-existing tests remain green (no regression to thread replies, founder-not-
+configured, or Slack error handling).
+
+## Full-suite sanity check
+
+Ran `uv run pytest -q` (whole repo). Result: `3 failed, 578 passed, 10 skipped, 332 errors`.
+Verified this is pre-existing and unrelated to this change:
+
+- All 332 errors are `KeyError: 'AGENT_DB_URL'` in `tests/test_slack_outbox.py` and
+  `tests/test_video_events.py` — DB-backed tests that need an env var not set in this
+  environment.
+- The 3 failures (`test_ack_handler.py::test_handle_approve_meta_draft_schedules_pipeline`,
+  `test_meta_pipeline.py::test_non_meta_draft_is_skipped_silently`,
+  `test_meta_pipeline.py::test_empty_metadata_legacy_draft_dms_founder`) reproduce
+  identically with my changes `git stash`ed out — confirmed by running the same 3
+  tests against the pre-change tree, same failures.
+
+None of these touch `slack_notifier.py` or are affected by this change.
+
+## Files changed
+
+- `src/peermarket_agent/slack_notifier.py` (+7/-5 lines)
+- `tests/test_slack_notifier.py` (+55/-0 lines)
+
+## Commit
+
+`7fc06e4 feat: forward Block Kit blocks through SlackNotifier`
 
 ## Self-review
 
-No blocking findings. Scope is restricted to collection/normalization, credentials are passed only to SDK initialization, cursor iteration remains off the event loop, and retry classification does not retry permanent permission/configuration errors.
+- Interface matches the brief verbatim: `blocks: list[dict] | None = None` as a
+  keyword-only param on both `send_message` and `notify_founder`.
+- `text` is always present in `kwargs` in both methods, unconditionally — satisfies
+  "text always sent" requirement.
+- `blocks` is only added via `if blocks:` (truthy check), so `None` and `[]` are both
+  correctly excluded from the `chat_postMessage` call — satisfies "must NOT appear
+  when falsy."
+- `notify_founder`'s conditional-kwargs pattern now mirrors `send_message`'s existing
+  style (`kwargs = {...}; if cond: kwargs[...] = ...; client.chat_postMessage(**kwargs)`)
+  rather than diverging patterns between the two methods — consistent with "match
+  existing code style."
+- Did not touch `post_draft_thread` or `post_thread_reply` (out of scope per brief;
+  they don't take `blocks` and the brief didn't ask for it — later tasks will plumb
+  blocks through the outbox/report loops per the task context).
+- No unrelated refactors; diff is scoped to exactly the two methods named in the brief
+  plus their tests.
+- Note: this file (`task-2-report.md`) previously held an unrelated stale report from
+  a different "Task 2" (a Meta Insights client), evidently left over from an earlier
+  planning iteration on this branch/worktree. It has been overwritten with this task's
+  actual report per the report-format instructions; the stale content is preserved in
+  git history if needed.
 
-## Important review findings follow-up
+## Concerns
 
-All three Important findings were fixed with regression-first TDD.
-
-### RED evidence
-
-After adding the three regression cases, `uv run pytest -q tests/test_meta_insights.py` reported `3 failed, 7 passed`:
-
-- caller mutation changed `snapshot.actions`;
-- deterministic concurrent initialization cross-bound the first ad to the second token through the SDK global default;
-- attacker-controlled `api_error_type` content surfaced credentials in `MetaInsightsError`.
-
-### Fixes
-
-- `MetaInsightSnapshot.actions` is now an immutable `Mapping`; `__post_init__` takes a defensive `dict` copy and wraps it in `MappingProxyType`.
-- The worker captures the concrete API returned by `FacebookAdsApi.init` and injects it into `Ad(ad_id, api=api)`. The installed SDK implementation was inspected to confirm `init` returns that API instance.
-- Error messages now contain only a closed, normalized category and integer code. Arbitrary SDK type/message metadata is never interpolated.
-- Sanitized errors are raised after leaving the `except` handler, preventing the credential-bearing source exception from being retained as `__context__`; tests also prove no `__cause__` remains.
-
-### GREEN evidence
-
-- Focused suite after implementation: `10 passed in 0.12s`.
-- Fresh suite after formatting/import fixes: `10 passed in 0.13s`.
-- Ruff format check: both files already formatted.
-- Ruff lint: all checks passed.
-- `git diff --check`: clean.
-
-No API, production, push, or Meta mutation action was performed.
+None. Implementation is a straightforward, low-risk additive change with full test
+coverage for both the forwarding and omission cases on both public methods.

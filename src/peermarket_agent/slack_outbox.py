@@ -21,6 +21,7 @@ class OutboxMessage:
     root_ts: str | None
     message_kind: str
     text: str
+    blocks: list | None = None
 
 
 async def enqueue_root_approval(
@@ -93,6 +94,7 @@ async def deliver_pending_outbox(
                 row.text,
                 channel_id=row.channel_id,
                 thread_ts=row.root_ts,
+                blocks=row.blocks,
             )
             if await _finalize_success(engine, row, owner=owner, result=result):
                 delivered += 1
@@ -170,6 +172,7 @@ async def _claim_pending_outbox(
             root_ts=row["root_ts"],
             message_kind=str(row["message_kind"]),
             text=str(row["payload"]["text"]),
+            blocks=row["payload"].get("blocks") or None,
         )
         for row in rows
     )
