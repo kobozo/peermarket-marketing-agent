@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from peermarket_agent.slack_bridge.app import build_app, handle_app_mention, handle_im
+from peermarket_agent.slack_bridge.app import (
+    build_app,
+    handle_app_mention,
+    handle_im,
+    is_authorized_user,
+)
 
 
 @pytest.fixture
@@ -30,6 +35,37 @@ async def test_handle_im_ignores_bot_messages(fake_say):
     event = {"text": "hi", "user": "U999", "bot_id": "B000", "channel_type": "im"}
     await handle_im(event=event, say=fake_say, founder_user_id="U999")
     fake_say.assert_not_called()
+
+
+def test_slack_chat_authorizes_founder_and_configured_members(monkeypatch):
+    monkeypatch.setenv("SLACK_FOUNDER_USER_ID", "UFOUNDER")
+    monkeypatch.setenv("SLACK_AGENT_ALLOWED_USER_IDS", "UTEAM1,UTEAM2")
+    assert is_authorized_user("UFOUNDER")
+    assert is_authorized_user("UTEAM2")
+    assert not is_authorized_user("UOTHER")
+
+
+async def test_handle_im_routes_natural_feedback_to_jarvis(monkeypatch, fake_say):
+    from peermarket_agent.slack_bridge import app as bridge_app
+
+    claude = AsyncMock()
+    claude.complete.return_value = type(
+        "Response", (), {"text": "Ik onderzoek dit en kom met een plan."}
+    )()
+    monkeypatch.setattr(bridge_app, "is_authorized_user", lambda *args: True)
+    event = {
+        "text": "Ik ben niet blij met de conversie; zoek uit hoe dit beter kan.",
+        "user": "U0B5K95BRFV",
+        "channel_type": "im",
+        "ts": "1.0",
+    }
+    await bridge_app.handle_im(
+        event=event, say=fake_say, founder_user_id="U0B5K95BRFV", claude=claude
+    )
+
+    claude.complete.assert_awaited_once()
+    args, kwargs = fake_say.await_args
+    assert "onderzoek" in (kwargs.get("text") or args[0])
 
 
 def test_build_app_returns_async_app(monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from functools import partial
 
 import click
@@ -33,10 +34,44 @@ _HELLO_TEXT = (
 _UNAUTHORIZED_TEXT = "This Slack user is not authorized to manage marketing drafts."
 
 
+def is_authorized_user(user_id: str, founder_user_id: str | None = None) -> bool:
+    founder = founder_user_id or os.getenv("SLACK_FOUNDER_USER_ID", "")
+    allowed = {
+        item.strip()
+        for item in os.getenv("SLACK_AGENT_ALLOWED_USER_IDS", "").split(",")
+        if item.strip()
+    }
+    return (not founder and not allowed) or user_id == founder or user_id in allowed
+
+
+async def _chat_reply(text_msg: str, claude: ClaudeClient) -> str:
+    response = await claude.complete(
+        system=(
+            "You are Jarvis, the PeerMarket marketing operations agent. "
+            "Treat the user's message as feedback or a request for investigation. "
+            "Reply in Dutch unless the user writes another language. State what "
+            "you understood, propose concrete investigative steps, and mark any "
+            "action needing explicit approval. Never claim a change happened unless executed."
+        ),
+        user=text_msg,
+        temperature=0.2,
+        max_tokens=800,
+    )
+    return response.text.strip() or "Ik heb je feedback ontvangen en maak een onderzoeksplan."
+
+
 async def handle_app_mention(event: dict, say) -> None:
     if event.get("bot_id"):
         return
-    await say(text=_HELLO_TEXT)
+    if not is_authorized_user(event.get("user", "unknown")):
+        await say(text=_UNAUTHORIZED_TEXT)
+        return
+    try:
+        claude = ClaudeClient(get_settings().anthropic_api_key)
+    except Exception:
+        await say(text=_HELLO_TEXT)
+        return
+    await say(text=await _chat_reply(event.get("text") or "", claude))
 
 
 async def handle_im(
@@ -45,6 +80,7 @@ async def handle_im(
     body: dict | None = None,
     *,
     founder_user_id: str,
+    claude: ClaudeClient | None = None,
 ) -> None:
     upload = extract_video_upload(event)
     if upload is not None:
@@ -66,7 +102,7 @@ async def handle_im(
         return
     text_msg = event.get("text") or ""
     user_id = event.get("user", "unknown")
-    if not founder_user_id or user_id != founder_user_id:
+    if not is_authorized_user(user_id, founder_user_id):
         kwargs = {"text": _UNAUTHORIZED_TEXT}
         if event.get("thread_ts"):
             kwargs["thread_ts"] = event["thread_ts"]
@@ -98,7 +134,13 @@ async def handle_im(
                     failure_category=type(error).__name__,
                 )
         return
-    await say(text=_HELLO_TEXT)
+    if claude is None:
+        try:
+            claude = ClaudeClient(get_settings().anthropic_api_key)
+        except Exception:
+            await say(text=_HELLO_TEXT)
+            return
+    await say(text=await _chat_reply(text_msg, claude))
 
 
 async def _route_video_upload(engine, upload: VideoUpload) -> None:
