@@ -44,7 +44,9 @@ def is_authorized_user(user_id: str, founder_user_id: str | None = None) -> bool
     # A Slack event is already authenticated by Slack. When no explicit
     # allowlist is configured, permit workspace members; deployments can opt
     # into a narrower list with SLACK_AGENT_ALLOWED_USER_IDS.
-    return (not founder and not allowed) or "*" in allowed or user_id == founder or user_id in allowed
+    return (
+        (not founder and not allowed) or "*" in allowed or user_id == founder or user_id in allowed
+    )
 
 
 async def _chat_reply(text_msg: str, claude: ClaudeClient) -> str:
