@@ -9,8 +9,25 @@ from peermarket_agent.autonomy import hook_experiments
 from peermarket_agent.autonomy.contracts import HookVariant, thaw_json
 from peermarket_agent.autonomy.hook_experiments import (
     build_hook_experiment,
+    build_hook_proposal,
     validate_hook_experiment,
 )
+
+
+def test_build_hook_proposal_fills_missing_multilingual_baseline():
+    draft = {
+        "id": 156,
+        "campaign_id": "120249125021520342",
+        "ad_set_id": "adset-1",
+        "landing_page_url": "https://peermarket.eu/",
+        "fixed_identity": {"audience": "same"},
+        "title": "Sell safely on Peermarket",
+    }
+    proposal = build_hook_proposal(draft, "warm and practical")
+
+    assert set(proposal) == {"NL", "FR", "EN"}
+    assert all(len(proposal[locale]["hook"]) > 10 for locale in proposal)
+    assert len({proposal[locale]["hook"] for locale in proposal}) == 3
 
 
 def _draft():
