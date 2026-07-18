@@ -475,9 +475,7 @@ async def test_missing_or_invalid_source_window_creates_no_completed_observation
         ).scalar_one()
     assert "daily_observations" not in performance
     notifier.send_message.assert_awaited_once()
-    assert (
-        notifier.send_message.await_args.args[0] == "Publication #1 — source window unavailable"
-    )
+    assert notifier.send_message.await_args.args[0] == "Publication #1 — source window unavailable"
     rows = await _summary_outbox(database_engine)
     assert len(rows) == 1
     assert rows[0]["summary_kind"] == "source_window_unavailable"
@@ -691,7 +689,7 @@ async def _prepared_summary_publication(database_engine, draft_id=1101):
     )
 
 
-async def test_false_delivery_stays_pending_after_persisting_sanitized_summary(database_engine):
+async def test_delivery_exception_stays_pending_after_persisting_sanitized_summary(database_engine):
     await _prepared_summary_publication(database_engine)
     notifier = AsyncMock()
     notifier.send_message.side_effect = RuntimeError("slack unavailable")
@@ -737,9 +735,7 @@ async def test_unavailable_window_false_delivery_retries_same_diagnostic(databas
     await run_daily_performance(database_engine, notifier, object(), now=now)
 
     notifier.send_message.assert_awaited_once()
-    assert (
-        notifier.send_message.await_args.args[0] == "Publication #1 — source window unavailable"
-    )
+    assert notifier.send_message.await_args.args[0] == "Publication #1 — source window unavailable"
     rows = await _summary_outbox(database_engine)
     assert len(rows) == 1
     assert rows[0]["status"] == "sent"

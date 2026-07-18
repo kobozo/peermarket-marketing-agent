@@ -21,7 +21,7 @@ class OutboxMessage:
     root_ts: str | None
     message_kind: str
     text: str
-    blocks: list | None = None
+    blocks: list[dict] | None = None
 
 
 async def enqueue_root_approval(
