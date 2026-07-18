@@ -566,6 +566,13 @@ async def prepare_hook_experiment_command(draft_id: int, seed: str) -> dict[str,
             if str(exc) != "draft requires exact NL/FR/EN baseline bundles":
                 raise
             proposal = build_hook_proposal(draft, str(row["voice_rules_md"]))
+            metadata["hook_proposal_pending"] = True
+            metadata["hook_proposal"] = proposal
+            async with engine.begin() as write_connection:
+                await write_connection.execute(
+                    text("UPDATE drafts SET metadata=:metadata WHERE id=:draft_id"),
+                    {"metadata": json.dumps(metadata), "draft_id": draft_id},
+                )
             message = format_hook_proposal_slack(draft_id, proposal, str(exc))
             notifier = SlackNotifier(
                 bot_token=settings.slack_bot_token,

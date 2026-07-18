@@ -20,7 +20,21 @@ from peermarket_agent.revisions import (
     persist_revision_and_supersede,
     record_revision_feedback,
 )
-from peermarket_agent.slack_bridge.ack_handler import handle_ack
+from peermarket_agent.slack_bridge.ack_handler import apply_hook_proposal_to_metadata, handle_ack
+
+
+def test_apply_hook_proposal_to_metadata_marks_baseline_approved():
+    metadata = {"title": "Sell safely", "hook_proposal_pending": True}
+    proposal = {
+        "NL": {"hook": "Veilig verkopen"},
+        "FR": {"hook": "Vendez en sécurité"},
+        "EN": {"hook": "Sell safely"},
+    }
+
+    updated = apply_hook_proposal_to_metadata(metadata, proposal)
+
+    assert updated["language_bundles"] == proposal
+    assert updated["hook_proposal_pending"] is False
 
 
 @pytest.fixture
