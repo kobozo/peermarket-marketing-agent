@@ -19,12 +19,12 @@ from uvicorn import Config, Server
 from peermarket_agent.claude import ClaudeClient
 from peermarket_agent.config import get_settings
 from peermarket_agent.db.engine import get_engine
+from peermarket_agent.mixpanel_mcp import MixpanelMCPClient, MixpanelMCPError
 from peermarket_agent.slack_bridge.ack_handler import handle_ack
 from peermarket_agent.slack_bridge.ack_parser import parse_ack
 from peermarket_agent.slack_bridge.revision_handler import handle_revision_reply
 from peermarket_agent.slack_bridge.video_events import VideoUpload, extract_video_upload
 from peermarket_agent.video_workflow import process_video_upload
-from peermarket_agent.mixpanel_mcp import MixpanelMCPClient, MixpanelMCPError
 
 log = structlog.get_logger(__name__)
 
