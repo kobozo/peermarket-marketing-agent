@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     meta_app_secret: str = ""
     meta_system_user_token: str = ""
     meta_ad_account_id: str = ""  # 'act_<numeric>'
+
+    # Mixpanel MCP (optional; enables Slack analytics queries)
+    mixpanel_mcp_username: str = ""
+    mixpanel_mcp_secret: str = ""
+    mixpanel_mcp_url: str = "https://mcp.mixpanel.com/mcp"
+    mixpanel_project_token: str = ""
+    mixpanel_project_secret: str = ""
     meta_auto_activate: bool = False
     meta_page_id: str = ""
     meta_insights_enabled: bool = False
