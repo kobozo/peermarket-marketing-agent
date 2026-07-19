@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from functools import partial
 
@@ -23,6 +24,7 @@ from peermarket_agent.slack_bridge.ack_parser import parse_ack
 from peermarket_agent.slack_bridge.revision_handler import handle_revision_reply
 from peermarket_agent.slack_bridge.video_events import VideoUpload, extract_video_upload
 from peermarket_agent.video_workflow import process_video_upload
+from peermarket_agent.mixpanel_mcp import MixpanelMCPClient, MixpanelMCPError
 
 log = structlog.get_logger(__name__)
 
@@ -67,6 +69,30 @@ async def _chat_reply(text_msg: str, claude: ClaudeClient) -> str:
     except Exception:
         log.exception("slack_bridge.chat_reply_failed")
         return "👋 PeerMarket marketing agent is online, maar de analyse-service is tijdelijk niet beschikbaar."
+
+
+async def _mixpanel_reply(text_msg: str) -> str:
+    """Run a safe discovery check; detailed analysis remains conversational."""
+    settings = get_settings()
+    if not settings.mixpanel_mcp_username or not settings.mixpanel_mcp_secret:
+        return "Mixpanel is nog niet geconfigureerd in Jarvis."
+    client = MixpanelMCPClient(
+        settings.mixpanel_mcp_username, settings.mixpanel_mcp_secret, settings.mixpanel_mcp_url
+    )
+    try:
+        context = await client.business_context()
+        projects = await client.list_projects()
+        # Keep the Slack response compact and do not expose raw event/user data.
+        project_text = json.dumps(projects, ensure_ascii=False)[:1200]
+        context_text = json.dumps(context, ensure_ascii=False)[:1200]
+        return (
+            "📊 Mixpanel-verbinding werkt. Jarvis kan nu projecten, events, funnels en "
+            "dashboards analyseren.\n\n"
+            f"Projecten: {project_text}\nBusiness context: {context_text}"
+        )
+    except (MixpanelMCPError, Exception):
+        log.exception("slack_bridge.mixpanel_failed")
+        return "Mixpanel is geconfigureerd, maar de testquery faalde. Controleer projectrechten."
 
 
 async def handle_app_mention(event: dict, say) -> None:
@@ -142,6 +168,9 @@ async def handle_im(
                     event_id=routed_event.get("event_id"),
                     failure_category=type(error).__name__,
                 )
+        return
+    if text_msg.strip().lower().startswith(("mixpanel", "/mixpanel")):
+        await say(text=await _mixpanel_reply(text_msg))
         return
     if claude is None:
         try:
