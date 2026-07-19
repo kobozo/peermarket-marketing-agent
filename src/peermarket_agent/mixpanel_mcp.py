@@ -65,7 +65,4 @@ class MixpanelMCPClient:
         return await self._request("tools/call", {"name": "Get-Projects", "arguments": {}})
 
     async def business_context(self) -> Any:
-        return await self._request(
-            "tools/call", {"name": "Get-Business-Context", "arguments": {}}
-        )
-
+        return await self._request("tools/call", {"name": "Get-Business-Context", "arguments": {}})
